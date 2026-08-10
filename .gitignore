@@ -1,0 +1,31 @@
+# Machine-specific Compose configuration. Commit only the example variants below.
+.env
+.env.*
+!.env.example
+!.env.linux.example
+!.env.wsl.example
+
+# Secret values never belong in Git; keep the tracked usage notes.
+secrets/*
+!secrets/README.md
+
+# Rust build output.
+target/
+backend/target/
+
+# Frontend dependencies, build output, test coverage, and TypeScript caches.
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+# Local tool and editor artifacts.
+.cache/
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.tmp
+*.log

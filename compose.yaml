@@ -1,0 +1,75 @@
+name: remote-file-browser
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        FFMPEG_VERSION: "8.1.2"
+        FFMPEG_SHA256: "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
+    user: "${RFB_UID:-1000}:${RFB_GID:-1000}"
+    working_dir: /fs-root
+    environment:
+      RFB_ROOT: /fs-root
+      RFB_ADMIN_USERNAME: "${RFB_ADMIN_USERNAME:-admin}"
+      RFB_ADMIN_PASSWORD_FILE: /run/secrets/admin_password
+      RFB_SECURE_COOKIES: "${RFB_SECURE_COOKIES:-true}"
+      RFB_CACHE_MAX_BYTES: "${RFB_CACHE_MAX_BYTES:-10737418240}"
+      RFB_CACHE_MAX_AGE_DAYS: "${RFB_CACHE_MAX_AGE_DAYS:-30}"
+      RFB_EDITOR_MAX_BYTES: "${RFB_EDITOR_MAX_BYTES:-5242880}"
+      RFB_UPLOAD_MAX_BYTES: "${RFB_UPLOAD_MAX_BYTES:-21474836480}"
+      RUST_LOG: "${RUST_LOG:-remote_file_browser=info,tower_http=info}"
+    volumes:
+      - type: bind
+        source: "${RFB_ROOT_PATH:-${HOME}}"
+        target: /fs-root
+        read_only: false
+        bind:
+          create_host_path: false
+    secrets:
+      - admin_password
+    expose:
+      - "8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/rfb-healthcheck"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      RFB_TLS_MODE: "${RFB_TLS_MODE:-https}"
+      RFB_PUBLIC_HTTPS_PORT: "${RFB_HTTPS_PORT:-443}"
+    volumes:
+      - "${RFB_TLS_CERT_PATH:-./secrets/tls.crt}:/run/tls/tls.crt:ro"
+      - "${RFB_TLS_KEY_PATH:-./secrets/tls.key}:/run/tls/tls.key:ro"
+    ports:
+      - "${RFB_BIND_ADDRESS:-0.0.0.0}:${RFB_HTTP_PORT:-80}:8080"
+      - "${RFB_BIND_ADDRESS:-0.0.0.0}:${RFB_HTTPS_PORT:-443}:8443"
+    depends_on:
+      backend:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+secrets:
+  admin_password:
+    file: "${RFB_ADMIN_PASSWORD_PATH:-./secrets/admin_password}"

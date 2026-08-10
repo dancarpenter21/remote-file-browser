@@ -1,0 +1,12 @@
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+upstream backend { server backend:8080; keepalive 16; }
+
+server {
+    listen 8080;
+    server_name _;
+    location = /healthz { access_log off; return 200 'ok'; add_header Content-Type text/plain; }
+    ${HTTP_SERVER_BODY}
+}
+
+${TLS_SERVER}
