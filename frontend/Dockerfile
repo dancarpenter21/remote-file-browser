@@ -10,7 +10,7 @@ RUN npm run build
 FROM nginx:1.29-alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
 COPY nginx/default.conf.template /etc/nginx/templates/default.conf.template
-COPY nginx/15-tls-mode.sh /docker-entrypoint.d/15-tls-mode.sh
-RUN chmod 0755 /docker-entrypoint.d/15-tls-mode.sh && \
+COPY nginx/15-tls-mode.sh /docker-entrypoint.d/15-tls-mode.envsh
+RUN chmod 0755 /docker-entrypoint.d/15-tls-mode.envsh && \
     mkdir -p /var/cache/nginx /var/run && chown -R nginx:nginx /var/cache/nginx /var/run
 EXPOSE 8080 8443

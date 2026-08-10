@@ -107,6 +107,29 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     if (!clipboard) return
     mutate(async () => { await api.operate(clipboard.operation, clipboard.ids, currentDir); if (clipboard.operation === 'move') setClipboard(null) }, currentDir, async () => { await api.operate(clipboard.operation, clipboard.ids, currentDir, undefined, true); if (clipboard.operation === 'move') setClipboard(null) })
   }
+  const moveByDrag = async (ids: string[], destinationId: string) => {
+    const movableIds = ids.filter(id => findEntry(id, root, expanded)?.parentId !== destinationId)
+    if (!movableIds.length) return
+    const destination = findEntry(destinationId, root, expanded)
+    if (destination && movableIds.some(id => {
+      const source = findEntry(id, root, expanded)
+      return source?.kind === 'directory' && destination.path.startsWith(`${source.path}/`)
+    })) { setError('A directory cannot be moved inside itself.'); return }
+    const sourceParents = new Set(movableIds.map(id => findEntry(id, root, expanded)?.parentId ?? ''))
+    const perform = (replace = false) => api.operate('move', movableIds, destinationId, undefined, replace)
+    setError('')
+    try {
+      await perform()
+    } catch (e) {
+      if (!(e instanceof ApiFailure) || e.code !== 'already_exists' ||
+          !confirm(`${e.message}. Replace it and move the old item to Trash?`)) {
+        setError(messageOf(e)); return
+      }
+      try { await perform(true) } catch (retryError) { setError(messageOf(retryError)); return }
+    }
+    setSelected(new Set())
+    await Promise.all(Array.from(new Set([...sourceParents, destinationId])).map(id => refresh(id)))
+  }
   const openTrash = async () => { try { setTrash(await api.listTrash()) } catch (e) { setError(messageOf(e)) } }
   const logout = async () => { try { await api.logout() } finally { onLogout() } }
 
@@ -143,12 +166,12 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         <div className="location"><button onClick={() => { setCurrentDir(''); setSelected(new Set()) }}>/ fs-root</button><span>{flat.length} visible</span></div>
         {error && <div className="banner error"><span>{error}</span><button onClick={() => setError('')}><X size={15} /></button></div>}
         {!root ? <div className="center"><span className="spinner" /></div> : flat.length === 0 ? <Empty /> :
-          <FileList rows={flat} view={view} open={open} selected={selected} setSelected={setSelected} activate={activate} toggle={toggleDirectory} setCurrentDir={setCurrentDir} deleteEntry={entry => mutate(() => api.trash([entry.id]), entry.parentId)} setError={setError} />}
+          <FileList rows={flat} view={view} open={open} selected={selected} setSelected={setSelected} activate={activate} toggle={toggleDirectory} setCurrentDir={setCurrentDir} moveEntries={moveByDrag} deleteEntry={entry => mutate(() => api.trash([entry.id]), entry.parentId)} setError={setError} />}
       </main>
     </div>
     {editor && <EditorWindow document={editor} onClose={() => setEditor(null)} onSaved={setEditor} />}
     {viewer && <ViewerWindow {...viewer} onClose={() => setViewer(null)} />}
-    {trash && <TrashWindow items={trash} onClose={() => setTrash(null)} onChanged={async () => setTrash(await api.listTrash())} setError={setError} />}
+    {trash && <TrashWindow items={trash} onClose={() => setTrash(null)} onChanged={async () => setTrash(await api.listTrash())} onRestored={entry => refresh(entry.parentId)} setError={setError} />}
   </div>
 }
 
@@ -157,12 +180,15 @@ function flatten(entries: Entry[], open: Set<string>, pages: Record<string, Entr
   return entries.flatMap(entry => [{ entry, depth }, ...(entry.kind === 'directory' && open.has(entry.id) ? flatten(pages[entry.id]?.entries ?? [], open, pages, depth + 1) : [])])
 }
 
-function FileList({ rows, view, open, selected, setSelected, activate, toggle, setCurrentDir, deleteEntry, setError }: {
+function FileList({ rows, view, open, selected, setSelected, activate, toggle, setCurrentDir, moveEntries, deleteEntry, setError }: {
   rows: Row[]; view: ViewMode; open: Set<string>; selected: Set<string>; setSelected: (value: Set<string>) => void
   activate: (entry: Entry) => void; toggle: (entry: Entry) => void; setCurrentDir: (id: string) => void
+  moveEntries: (ids: string[], destinationId: string) => Promise<void>
   deleteEntry: (entry: Entry) => Promise<void>; setError: (message: string) => void
 }) {
   const [menu, setMenu] = useState<{ entry: Entry; x: number; y: number } | null>(null)
+  const [dropTarget, setDropTarget] = useState<string | null>(null)
+  const draggedIds = useRef<string[]>([])
   useEffect(() => {
     if (!menu) return
     const close = () => setMenu(null)
@@ -175,10 +201,36 @@ function FileList({ rows, view, open, selected, setSelected, activate, toggle, s
     setMenu({ entry, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 140) })
   }
   const choose = (entry: Entry, checked: boolean) => { const next = new Set(selected); checked ? next.add(entry.id) : next.delete(entry.id); setSelected(next); if (entry.kind === 'directory') setCurrentDir(entry.id) }
+  const dragProps = (entry: Entry) => ({
+    draggable: true,
+    onDragStart: (event: React.DragEvent) => {
+      const ids = selected.has(entry.id) ? Array.from(selected) : [entry.id]
+      draggedIds.current = ids
+      if (!selected.has(entry.id)) setSelected(new Set([entry.id]))
+      event.dataTransfer.effectAllowed = 'move'
+      event.dataTransfer.setData('application/x-remote-file-browser', ids.join(','))
+      event.dataTransfer.setData('text/plain', entry.name)
+    },
+    onDragEnd: () => { draggedIds.current = []; setDropTarget(null) },
+    onDragOver: (event: React.DragEvent) => {
+      if (entry.kind !== 'directory' || !draggedIds.current.length || draggedIds.current.includes(entry.id)) return
+      event.preventDefault(); event.stopPropagation()
+      event.dataTransfer.dropEffect = 'move'; setDropTarget(entry.id)
+    },
+    onDragLeave: (event: React.DragEvent) => {
+      if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(current => current === entry.id ? null : current)
+    },
+    onDrop: (event: React.DragEvent) => {
+      if (entry.kind !== 'directory' || !draggedIds.current.length || draggedIds.current.includes(entry.id)) return
+      event.preventDefault(); event.stopPropagation()
+      const ids = draggedIds.current; draggedIds.current = []; setDropTarget(null)
+      void moveEntries(ids, entry.id)
+    },
+  })
   const contextMenu = menu && <ContextMenu {...menu} close={() => setMenu(null)} open={() => activate(menu.entry)} deleteEntry={deleteEntry} setError={setError} />
   if (view === 'details') return <><div className="details-table" role="treegrid">
     <div className="details-head"><span>Name</span><span>Permissions</span><span>Owner</span><span>Size</span><span>Modified</span></div>
-    {rows.map(({ entry, depth }) => <div className={`file-row ${selected.has(entry.id) ? 'selected' : ''}`} key={entry.id} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} role="row">
+    {rows.map(({ entry, depth }) => <div className={`file-row ${selected.has(entry.id) ? 'selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} key={entry.id} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} role="row" {...dragProps(entry)}>
       <div className="name-cell" style={{ paddingLeft: 12 + depth * 22 }}>
         <input type="checkbox" checked={selected.has(entry.id)} onChange={e => choose(entry, e.target.checked)} />
         {entry.kind === 'directory' ? <button className="disclosure" onClick={() => toggle(entry)}>{open.has(entry.id) ? <ChevronDown /> : <ChevronRight />}</button> : <span className="disclosure" />}
@@ -188,7 +240,7 @@ function FileList({ rows, view, open, selected, setSelected, activate, toggle, s
     </div>)}
   </div>{contextMenu}</>
   return <div className={`preview-list ${view}`}>
-    {rows.map(({ entry, depth }) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)}>
+    {rows.map(({ entry, depth }) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
       <input type="checkbox" checked={selected.has(entry.id)} onChange={e => choose(entry, e.target.checked)} />
       <button className="card-menu" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>
       {entry.kind === 'directory' ? <button className="preview-image folder-preview" onClick={() => toggle(entry)}>{open.has(entry.id) ? <FolderOpen /> : <Folder />}</button> : isPreviewable(entry) ? <button className="preview-image" onClick={() => activate(entry)}><img src={thumbnailUrl(entry.id, view)} loading="lazy" /></button> : <button className="preview-image" onClick={() => activate(entry)}><FileGlyph entry={entry} /></button>}
@@ -265,11 +317,23 @@ function VideoPlayer({ entry }: { entry: Entry }) {
   return <div className="video-stage"><video ref={videoRef} src={mediaUrl(entry.id)} controls autoPlay onError={fallback} /><div className="video-message">{message}</div></div>
 }
 
-function TrashWindow({ items, onClose, onChanged, setError }: { items: TrashEntry[]; onClose: () => void; onChanged: () => Promise<void>; setError: (s: string) => void }) {
+function TrashWindow({ items, onClose, onChanged, onRestored, setError }: { items: TrashEntry[]; onClose: () => void; onChanged: () => Promise<void>; onRestored: (entry: Entry) => Promise<void>; setError: (s: string) => void }) {
   const act = async (fn: () => Promise<unknown>) => { try { await fn(); await onChanged() } catch (e) { setError(messageOf(e)) } }
+  const restore = async (item: TrashEntry) => {
+    try {
+      let entry: Entry
+      try {
+        entry = await api.restore(item.info.id)
+      } catch (e) {
+        if (!(e instanceof ApiFailure) || e.code !== 'already_exists' || !confirm(`${e.message}. Replace it and move the old item to Trash?`)) throw e
+        entry = await api.restore(item.info.id, undefined, true)
+      }
+      await Promise.all([onChanged(), onRestored(entry)])
+    } catch (e) { setError(messageOf(e)) }
+  }
   return <FloatingWindow title="Trash" onClose={onClose} className="trash-window">
     <div className="window-toolbar"><span>{items.length} item{items.length === 1 ? '' : 's'}</span><span className="toolbar-spacer" /><button disabled={!items.length} onClick={() => confirm('Permanently delete everything in Trash? This cannot be undone.') && act(api.emptyTrash)}><Trash2 /> Empty Trash</button></div>
-    <div className="trash-list">{items.length === 0 ? <Empty label="Trash is empty" /> : items.map(item => <div className="trash-row" key={item.info.id}><FileGlyph entry={{ kind: item.kind } as Entry} /><div><strong>{item.info.originalName}</strong><small>Deleted {formatDate(item.info.deletedAt)}</small></div><span>{formatBytes(item.size)}</span><button onClick={() => act(() => api.restore(item.info.id))}>Restore</button><button className="danger" onClick={() => confirm(`Permanently delete ${item.info.originalName}?`) && act(() => api.purge(item.info.id))}><Trash2 /></button></div>)}</div>
+    <div className="trash-list">{items.length === 0 ? <Empty label="Trash is empty" /> : items.map(item => <div className="trash-row" key={item.info.id}><FileGlyph entry={{ kind: item.kind } as Entry} /><div><strong>{item.info.originalName}</strong><small>Deleted {formatDate(item.info.deletedAt)}</small></div><span>{formatBytes(item.size)}</span><button onClick={() => restore(item)}>Restore</button><button className="danger" onClick={() => confirm(`Permanently delete ${item.info.originalName}?`) && act(() => api.purge(item.info.id))}><Trash2 /></button></div>)}</div>
   </FloatingWindow>
 }
 
@@ -277,7 +341,7 @@ function FloatingWindow({ title, onClose, className = '', children }: { title: s
   const [position, setPosition] = useState({ x: Math.max(20, innerWidth * .12), y: 90 })
   const drag = useRef<{ x: number; y: number } | null>(null)
   return <div className={`floating ${className}`} style={{ left: position.x, top: position.y }}>
-    <div className="window-title" onPointerDown={e => { drag.current = { x: e.clientX - position.x, y: e.clientY - position.y }; e.currentTarget.setPointerCapture(e.pointerId) }} onPointerMove={e => { if (drag.current) setPosition({ x: Math.max(0, e.clientX - drag.current.x), y: Math.max(0, e.clientY - drag.current.y) }) }} onPointerUp={() => { drag.current = null }}><span>{title}</span><button onClick={onClose}><X /></button></div>
+    <div className="window-title" onPointerDown={e => { drag.current = { x: e.clientX - position.x, y: e.clientY - position.y }; e.currentTarget.setPointerCapture(e.pointerId) }} onPointerMove={e => { if (drag.current) setPosition({ x: Math.max(0, e.clientX - drag.current.x), y: Math.max(0, e.clientY - drag.current.y) }) }} onPointerUp={() => { drag.current = null }}><span>{title}</span><button aria-label={`Close ${title}`} onPointerDown={e => e.stopPropagation()} onClick={onClose}><X /></button></div>
     {children}
   </div>
 }
