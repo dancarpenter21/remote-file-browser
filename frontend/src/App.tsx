@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import CodeMirror from '@uiw/react-codemirror'
 import { markdown } from '@codemirror/lang-markdown'
 import ReactMarkdown from 'react-markdown'
@@ -6,8 +6,8 @@ import remarkGfm from 'remark-gfm'
 import rehypeSanitize from 'rehype-sanitize'
 import Hls from 'hls.js'
 import {
-  ChevronDown, ChevronRight, Copy, Download, Edit3, Eye, File, FileImage, FileText,
-  Film, Folder, FolderOpen, Grid2X2, Image, List, LogOut, Maximize2, Menu, MoreHorizontal,
+  ChevronRight, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
+  Film, Folder, FolderOpen, Grid2X2, LogOut, Maximize2, Menu, MoreHorizontal,
   Move, Plus, RefreshCw, RotateCw, Save, Search, Trash2, Upload, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import { api, ApiFailure, contentUrl, DocumentFile, Entry, EntryPage, mediaUrl, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
@@ -47,8 +47,9 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
 function FileManager({ session, onLogout }: { session: Session; onLogout: () => void }) {
   const [root, setRoot] = useState<EntryPage | null>(null)
   const [expanded, setExpanded] = useState<Record<string, EntryPage>>({})
-  const [open, setOpen] = useState<Set<string>>(new Set())
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [primary, setPrimary] = useState<Entry | null>(null)
+  const [columnPath, setColumnPath] = useState<Entry[]>([])
   const [currentDir, setCurrentDir] = useState('')
   const [view, setView] = useState<ViewMode>(() => (localStorage.getItem('rfb-view') as ViewMode) || 'details')
   const [hidden, setHidden] = useState(() => localStorage.getItem('rfb-hidden') === 'true')
@@ -58,12 +59,16 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [viewer, setViewer] = useState<{ entry: Entry; type: 'image' | 'video' } | null>(null)
   const [trash, setTrash] = useState<TrashEntry[] | null>(null)
   const [error, setError] = useState('')
+  const [showPreview, setShowPreview] = useState(() => localStorage.getItem('rfb-column-preview') !== 'false')
+  const [columnWidth, setColumnWidth] = useState(() => Math.min(480, Math.max(180, Number(localStorage.getItem('rfb-column-width')) || 240)))
   const inputRef = useRef<HTMLInputElement>(null)
 
-  const loadRoot = async () => { try { setRoot(await api.list('', hidden)); setExpanded({}); setOpen(new Set()); setSelected(new Set()) } catch (e) { setError(messageOf(e)) } }
+  const loadRoot = async () => { try { setRoot(await api.list('', hidden)); setExpanded({}); setSelected(new Set()); setPrimary(null); setColumnPath([]); setCurrentDir('') } catch (e) { setError(messageOf(e)) } }
   useEffect(() => { loadRoot() }, [hidden])
   useEffect(() => { localStorage.setItem('rfb-view', view) }, [view])
   useEffect(() => { localStorage.setItem('rfb-hidden', String(hidden)) }, [hidden])
+  useEffect(() => { localStorage.setItem('rfb-column-preview', String(showPreview)) }, [showPreview])
+  useEffect(() => { localStorage.setItem('rfb-column-width', String(columnWidth)) }, [columnWidth])
 
   const refresh = async (id = currentDir) => {
     try {
@@ -71,14 +76,37 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       if (id === '') setRoot(page); else setExpanded(previous => ({ ...previous, [id]: page }))
     } catch (e) { setError(messageOf(e)) }
   }
-  const toggleDirectory = async (entry: Entry) => {
-    setCurrentDir(entry.id)
-    if (open.has(entry.id)) { setOpen(previous => { const next = new Set(previous); next.delete(entry.id); return next }); return }
-    if (!expanded[entry.id]) { try { const page = await api.list(entry.id, hidden); setExpanded(previous => ({ ...previous, [entry.id]: page })) } catch (e) { setError(messageOf(e)); return } }
-    setOpen(previous => new Set(previous).add(entry.id))
+  const navigateGrid = async (entry: Entry) => {
+    setSelected(new Set()); setPrimary(null); setCurrentDir(entry.id)
+    setColumnPath(previous => {
+      const parentIndex = previous.findIndex(item => item.id === entry.parentId)
+      const parentPath = entry.parentId === '' ? [] : parentIndex >= 0 ? previous.slice(0, parentIndex + 1) : previous
+      return [...parentPath, entry]
+    })
+    if (!expanded[entry.id]) {
+      try { const page = await api.list(entry.id, hidden); setExpanded(previous => ({ ...previous, [entry.id]: page })) }
+      catch (e) { setError(messageOf(e)) }
+    }
+  }
+  const navigateColumn = async (entry: Entry, columnIndex: number) => {
+    setSelected(new Set([entry.id])); setPrimary(entry); setCurrentDir(entry.id)
+    setColumnPath(previous => [...previous.slice(0, columnIndex), entry])
+    if (!expanded[entry.id]) {
+      try { const page = await api.list(entry.id, hidden); setExpanded(previous => ({ ...previous, [entry.id]: page })) }
+      catch (e) { setError(messageOf(e)) }
+    }
+  }
+  const selectColumnItems = (ids: Set<string>, entry: Entry | null, columnIndex: number, directoryId: string) => {
+    setSelected(ids); setPrimary(entry); setCurrentDir(directoryId)
+    setColumnPath(previous => previous.slice(0, columnIndex))
+  }
+  const selectParentColumn = (columnIndex: number) => {
+    const parent = columnPath[columnIndex - 1]
+    if (!parent) { setSelected(new Set()); setPrimary(null); setColumnPath([]); setCurrentDir(''); return }
+    setSelected(new Set([parent.id])); setPrimary(parent); setColumnPath(previous => previous.slice(0, columnIndex)); setCurrentDir(parent.id)
   }
   const activate = async (entry: Entry) => {
-    if (entry.kind === 'directory') return toggleDirectory(entry)
+    if (entry.kind === 'directory') return navigateGrid(entry)
     if (entry.mime.startsWith('image/')) return setViewer({ entry, type: 'image' })
     if (entry.mime.startsWith('video/')) return setViewer({ entry, type: 'video' })
     try { setEditor(await api.readDocument(entry.id)) } catch { window.location.href = contentUrl(entry.id) }
@@ -93,15 +121,37 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     const name = prompt(`New ${kind} name`); if (!name) return
     mutate(() => api.create(currentDir, name, kind), currentDir, () => api.create(currentDir, name, kind, true))
   }
-  const rename = () => {
+  const rename = async () => {
     const entry = findEntry(first(selected), root, expanded); if (!entry) return
     const name = prompt('Rename item', entry.name); if (!name || name === entry.name) return
-    mutate(() => api.operate('rename', [entry.id], entry.parentId, name), entry.parentId, () => api.operate('rename', [entry.id], entry.parentId, name, true))
+    const perform = (replace = false) => api.operate('rename', [entry.id], entry.parentId, name, replace)
+    setError('')
+    let renamed: Entry
+    try { [renamed] = await perform() } catch (e) {
+      if (!(e instanceof ApiFailure) || e.code !== 'already_exists' || !confirm(`${e.message}. Replace it and move the old item to Trash?`)) { setError(messageOf(e)); return }
+      try { [renamed] = await perform(true) } catch (retryError) { setError(messageOf(retryError)); return }
+    }
+    await refresh(entry.parentId)
+    const pathIndex = columnPath.findIndex(item => item.id === entry.id)
+    if (entry.kind === 'directory' && pathIndex >= 0) {
+      try {
+        const page = await api.list(renamed.id, hidden)
+        setExpanded(previous => { const next = { ...previous }; delete next[entry.id]; next[renamed.id] = page; return next })
+        setColumnPath(previous => [...previous.slice(0, pathIndex), renamed]); setCurrentDir(renamed.id)
+      } catch (e) { setError(messageOf(e)); setColumnPath(previous => previous.slice(0, pathIndex)); setCurrentDir(entry.parentId) }
+    } else setCurrentDir(renamed.parentId)
+    setSelected(new Set([renamed.id])); setPrimary(renamed)
   }
   const deleteSelected = async () => {
     if (!selected.size || !confirm(`Move ${selected.size} selected item${selected.size === 1 ? '' : 's'} to Trash?`)) return
     const parents = new Set(Array.from(selected).map(id => findEntry(id, root, expanded)?.parentId ?? ''))
-    try { await api.trash(Array.from(selected)); setSelected(new Set()); await Promise.all(Array.from(parents).map(refresh)) } catch (e) { setError(messageOf(e)) }
+    try { await api.trash(Array.from(selected)); const pathIndex = columnPath.findIndex(entry => selected.has(entry.id)); if (pathIndex >= 0) { setColumnPath(previous => previous.slice(0, pathIndex)); setCurrentDir(columnPath[pathIndex]?.parentId ?? '') } setSelected(new Set()); setPrimary(null); await Promise.all(Array.from(parents).map(refresh)) } catch (e) { setError(messageOf(e)) }
+  }
+  const deleteEntry = async (entry: Entry) => {
+    await api.trash([entry.id])
+    const pathIndex = columnPath.findIndex(item => item.id === entry.id)
+    if (pathIndex >= 0) { setColumnPath(previous => previous.slice(0, pathIndex)); setCurrentDir(entry.parentId) }
+    setSelected(new Set()); setPrimary(null); await refresh(entry.parentId)
   }
   const paste = () => {
     if (!clipboard) return
@@ -127,13 +177,18 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       }
       try { await perform(true) } catch (retryError) { setError(messageOf(retryError)); return }
     }
-    setSelected(new Set())
+    const pathIndex = columnPath.findIndex(entry => movableIds.includes(entry.id))
+    if (pathIndex >= 0) { setColumnPath(previous => previous.slice(0, pathIndex)); setCurrentDir(columnPath[pathIndex]?.parentId ?? '') }
+    setSelected(new Set()); setPrimary(null)
     await Promise.all(Array.from(new Set([...sourceParents, destinationId])).map(id => refresh(id)))
   }
   const openTrash = async () => { try { setTrash(await api.listTrash()) } catch (e) { setError(messageOf(e)) } }
   const logout = async () => { try { await api.logout() } finally { onLogout() } }
 
-  const flat = useMemo(() => flatten(root?.entries ?? [], open, expanded, 0).filter(row => row.entry.name.toLowerCase().includes(filter.toLowerCase())), [root, open, expanded, filter])
+  const activePage = currentDir === '' ? root : expanded[currentDir]
+  const gridRows = (activePage?.entries ?? []).filter(entry => entry.name.toLowerCase().includes(filter.toLowerCase())).map(entry => ({ entry, depth: 0 }))
+  const visibleCount = gridRows.length
+  const previewEntries = Array.from(selected).map(id => findEntry(id, root, expanded)).filter((entry): entry is Entry => Boolean(entry))
   return <div className="app-shell">
     <header className="topbar">
       <div className="brand"><FolderOpen size={20} /><strong>Remote Files</strong><span>/fs-root</span></div>
@@ -146,7 +201,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         <button className="nav-item" onClick={openTrash}><Trash2 size={17} /> Trash</button>
         <div className="aside-note"><span>Signed in as</span><strong>{session.username}</strong></div>
       </aside>
-      <main className="browser">
+      <main className={`browser ${view === 'details' ? 'column-view' : ''}`}>
         <div className="toolbar">
           <button onClick={() => createItem('directory')}><Plus size={16} /> Folder</button>
           <button onClick={() => createItem('file')}><File size={16} /> File</button>
@@ -161,12 +216,16 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
           <div className="toolbar-spacer" />
           <label className="hidden-toggle"><input type="checkbox" checked={hidden} onChange={e => setHidden(e.target.checked)} /> Hidden</label>
           <button className="icon-button" title="Refresh" onClick={() => refresh()}><RefreshCw size={16} /></button>
+          <button className={`icon-button ${showPreview ? 'active' : ''}`} title={`${showPreview ? 'Hide' : 'Show'} preview`} aria-pressed={showPreview} onClick={() => setShowPreview(value => !value)}><Eye size={16} /></button>
           <ViewSelector view={view} setView={setView} />
         </div>
-        <div className="location"><button onClick={() => { setCurrentDir(''); setSelected(new Set()) }}>/ fs-root</button><span>{flat.length} visible</span></div>
+        <div className="location"><nav className="breadcrumbs" aria-label="Current directory"><button onClick={() => { setCurrentDir(''); setSelected(new Set()); setPrimary(null); setColumnPath([]) }}>fs-root</button>{columnPath.map((entry, index) => <span key={entry.id}><ChevronRight /><button onClick={() => { setCurrentDir(entry.id); setSelected(new Set()); setPrimary(null); setColumnPath(previous => previous.slice(0, index + 1)) }}>{entry.name}</button></span>)}</nav><span>{visibleCount} visible</span></div>
         {error && <div className="banner error"><span>{error}</span><button onClick={() => setError('')}><X size={15} /></button></div>}
-        {!root ? <div className="center"><span className="spinner" /></div> : flat.length === 0 ? <Empty /> :
-          <FileList rows={flat} view={view} open={open} selected={selected} setSelected={setSelected} activate={activate} toggle={toggleDirectory} setCurrentDir={setCurrentDir} moveEntries={moveByDrag} deleteEntry={entry => mutate(() => api.trash([entry.id]), entry.parentId)} setError={setError} />}
+        <div className="browser-body"><div className="browser-view">
+          {!root ? <div className="center"><span className="spinner" /></div> : view === 'details' ?
+            <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} primary={primary} columnWidth={columnWidth} setColumnWidth={setColumnWidth} navigate={navigateColumn} selectItems={selectColumnItems} selectParent={selectParentColumn} activate={activate} moveEntries={moveByDrag} deleteEntry={deleteEntry} setError={setError} /> :
+            !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view={view} selected={selected} setSelected={setSelected} setPrimary={setPrimary} activate={activate} moveEntries={moveByDrag} deleteEntry={deleteEntry} setError={setError} />}
+        </div>{showPreview && <ColumnPreview entries={previewEntries} primary={primary} />}</div>
       </main>
     </div>
     {editor && <EditorWindow document={editor} onClose={() => setEditor(null)} onSaved={setEditor} />}
@@ -175,20 +234,125 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   </div>
 }
 
-type Row = { entry: Entry; depth: number }
-function flatten(entries: Entry[], open: Set<string>, pages: Record<string, EntryPage>, depth: number): Row[] {
-  return entries.flatMap(entry => [{ entry, depth }, ...(entry.kind === 'directory' && open.has(entry.id) ? flatten(pages[entry.id]?.entries ?? [], open, pages, depth + 1) : [])])
+type BrowserColumn = { directoryId: string; page?: EntryPage; label: string }
+function ColumnBrowser({ root, path, pages, filter, selected, primary, columnWidth, setColumnWidth, navigate, selectItems, selectParent, activate, moveEntries, deleteEntry, setError }: {
+  root: EntryPage; path: Entry[]; pages: Record<string, EntryPage>; filter: string; selected: Set<string>; primary: Entry | null
+  columnWidth: number; setColumnWidth: (width: number) => void
+  navigate: (entry: Entry, columnIndex: number) => Promise<void>; selectItems: (ids: Set<string>, primary: Entry | null, columnIndex: number, directoryId: string) => void
+  selectParent: (columnIndex: number) => void; activate: (entry: Entry) => void; moveEntries: (ids: string[], destinationId: string) => Promise<void>
+  deleteEntry: (entry: Entry) => Promise<void>; setError: (message: string) => void
+}) {
+  const columns: BrowserColumn[] = [{ directoryId: '', page: root, label: 'fs-root' }, ...path.map(entry => ({ directoryId: entry.id, page: pages[entry.id], label: entry.name }))]
+  const [activeColumn, setActiveColumn] = useState(0)
+  const [menu, setMenu] = useState<{ entry: Entry; columnIndex: number; x: number; y: number } | null>(null)
+  const [dropTarget, setDropTarget] = useState<string | null>(null)
+  const anchor = useRef<{ column: number; index: number } | null>(null)
+  const draggedIds = useRef<string[]>([])
+  const scroller = useRef<HTMLDivElement>(null)
+  const columnRefs = useRef<Array<HTMLDivElement | null>>([])
+  useEffect(() => {
+    setActiveColumn(Math.min(path.length, columns.length - 1))
+    requestAnimationFrame(() => scroller.current?.scrollTo({ left: scroller.current.scrollWidth, behavior: 'smooth' }))
+  }, [path.length])
+  useEffect(() => {
+    if (!menu) return
+    const close = () => setMenu(null)
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') close() }
+    addEventListener('pointerdown', close); addEventListener('keydown', escape)
+    return () => { removeEventListener('pointerdown', close); removeEventListener('keydown', escape) }
+  }, [menu])
+  const visibleEntries = (column: BrowserColumn) => (column.page?.entries ?? []).filter(entry => entry.name.toLowerCase().includes(filter.toLowerCase()))
+  const choose = (entry: Entry, columnIndex: number, entryIndex: number, event?: Pick<React.MouseEvent, 'metaKey' | 'ctrlKey' | 'shiftKey'>) => {
+    const entries = visibleEntries(columns[columnIndex])
+    setActiveColumn(columnIndex)
+    if (event?.shiftKey && anchor.current?.column === columnIndex) {
+      const start = Math.min(anchor.current.index, entryIndex), end = Math.max(anchor.current.index, entryIndex)
+      selectItems(new Set(entries.slice(start, end + 1).map(item => item.id)), entry, columnIndex, columns[columnIndex].directoryId)
+      return
+    }
+    if (event?.metaKey || event?.ctrlKey) {
+      const next = activeColumn === columnIndex ? new Set(selected) : new Set<string>()
+      next.has(entry.id) ? next.delete(entry.id) : next.add(entry.id)
+      anchor.current = { column: columnIndex, index: entryIndex }
+      selectItems(next, next.has(entry.id) ? entry : null, columnIndex, columns[columnIndex].directoryId)
+      return
+    }
+    anchor.current = { column: columnIndex, index: entryIndex }
+    selectItems(new Set([entry.id]), entry, columnIndex, columns[columnIndex].directoryId)
+  }
+  const keyboard = (event: React.KeyboardEvent, columnIndex: number) => {
+    const entries = visibleEntries(columns[columnIndex])
+    if (!entries.length) return
+    let index = primary ? entries.findIndex(entry => entry.id === primary.id) : -1
+    const current = index >= 0 ? entries[index] : null
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault(); index = event.key === 'ArrowDown' ? Math.min(entries.length - 1, index + 1) : Math.max(0, index < 0 ? entries.length - 1 : index - 1)
+      choose(entries[index], columnIndex, index)
+    } else if (event.key === 'ArrowRight' && current?.kind === 'directory') {
+      event.preventDefault(); void navigate(current, columnIndex).then(() => setTimeout(() => columnRefs.current[columnIndex + 1]?.focus()))
+    } else if (event.key === 'ArrowLeft' && columnIndex > 0) {
+      event.preventDefault(); selectParent(columnIndex); setTimeout(() => columnRefs.current[columnIndex - 1]?.focus())
+    } else if (event.key === 'Enter' && current) { event.preventDefault(); current.kind === 'directory' ? void navigate(current, columnIndex) : activate(current) }
+  }
+  const startResize = (event: React.PointerEvent) => {
+    event.preventDefault(); const startX = event.clientX, startWidth = columnWidth
+    const move = (pointer: PointerEvent) => setColumnWidth(Math.min(480, Math.max(180, startWidth + pointer.clientX - startX)))
+    const up = () => { removeEventListener('pointermove', move); removeEventListener('pointerup', up) }
+    addEventListener('pointermove', move); addEventListener('pointerup', up)
+  }
+  const startDrag = (event: React.DragEvent, entry: Entry, columnIndex: number) => {
+    const ids = selected.has(entry.id) ? Array.from(selected) : [entry.id]
+    draggedIds.current = ids
+    if (!selected.has(entry.id)) selectItems(new Set([entry.id]), entry, columnIndex, entry.parentId)
+    event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('application/x-remote-file-browser', ids.join(',')); event.dataTransfer.setData('text/plain', entry.name)
+  }
+  const acceptDrop = (event: React.DragEvent, id: string) => {
+    if (!draggedIds.current.length || draggedIds.current.includes(id)) return false
+    event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move'; setDropTarget(id || '__root__'); return true
+  }
+  const drop = (event: React.DragEvent, id: string) => {
+    if (!acceptDrop(event, id)) return
+    const ids = draggedIds.current; draggedIds.current = []; setDropTarget(null); void moveEntries(ids, id)
+  }
+  return <div className="column-browser" ref={scroller} style={{ '--column-width': `${columnWidth}px` } as React.CSSProperties}>
+    {columns.map((column, columnIndex) => {
+      const entries = visibleEntries(column), targetKey = column.directoryId || '__root__'
+      return <div className={`finder-column ${activeColumn === columnIndex ? 'active' : ''} ${dropTarget === targetKey ? 'drop-target' : ''}`} key={column.directoryId || '__root__'} ref={node => { columnRefs.current[columnIndex] = node }} tabIndex={0} role="listbox" aria-label={column.label} aria-multiselectable="true" onFocus={() => setActiveColumn(columnIndex)} onKeyDown={event => keyboard(event, columnIndex)} onDragOver={event => acceptDrop(event, column.directoryId)} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null) }} onDrop={event => drop(event, column.directoryId)}>
+        {!column.page ? <div className="column-state"><span className="spinner" /></div> : entries.length === 0 ? <div className="column-state">{filter ? 'No matches' : 'Empty folder'}</div> : entries.map((entry, entryIndex) => <div className={`column-row ${selected.has(entry.id) ? 'selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} key={entry.id} role="option" aria-selected={selected.has(entry.id)} draggable onDragStart={event => startDrag(event, entry, columnIndex)} onDragEnd={() => { draggedIds.current = []; setDropTarget(null) }} onClick={event => choose(entry, columnIndex, entryIndex, event)} onDoubleClick={() => entry.kind === 'directory' ? void navigate(entry, columnIndex) : activate(entry)} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ entry, columnIndex, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 140) }) }} onDragOver={event => { if (entry.kind === 'directory') acceptDrop(event, entry.id) }} onDrop={event => { if (entry.kind === 'directory') drop(event, entry.id) }}>
+          <FileGlyph entry={entry} /><span title={entry.name}>{entry.name}</span>{entry.kind === 'directory' && <ChevronRight className="column-arrow" />}
+        </div>)}
+        <div className="column-resizer" role="separator" aria-orientation="vertical" title="Resize columns" onPointerDown={startResize} />
+      </div>
+    })}
+    {menu && <ContextMenu entry={menu.entry} x={menu.x} y={menu.y} close={() => setMenu(null)} open={() => menu.entry.kind === 'directory' ? void navigate(menu.entry, menu.columnIndex) : activate(menu.entry)} deleteEntry={deleteEntry} setError={setError} />}
+  </div>
 }
 
-function FileList({ rows, view, open, selected, setSelected, activate, toggle, setCurrentDir, moveEntries, deleteEntry, setError }: {
-  rows: Row[]; view: ViewMode; open: Set<string>; selected: Set<string>; setSelected: (value: Set<string>) => void
-  activate: (entry: Entry) => void; toggle: (entry: Entry) => void; setCurrentDir: (id: string) => void
+function ColumnPreview({ entries, primary }: { entries: Entry[]; primary: Entry | null }) {
+  if (!entries.length) return <aside className="column-preview"><div className="preview-placeholder"><Eye /><span>Select an item to preview</span></div></aside>
+  if (entries.length > 1) return <aside className="column-preview"><div className="preview-hero"><File className="preview-glyph" /><strong>{entries.length} items</strong><span>{formatBytes(entries.reduce((sum, entry) => sum + entry.size, 0))}</span></div></aside>
+  const entry = primary && entries.some(item => item.id === primary.id) ? primary : entries[0]
+  return <aside className="column-preview">
+    <div className="preview-hero">
+      {entry.mime.startsWith('image/') ? <img src={thumbnailUrl(entry.id, 'large')} alt="" /> : entry.mime.startsWith('video/') ? <VideoPlayer key={entry.id} entry={entry} autoPlay={false} /> : entry.mime.startsWith('audio/') ? <audio key={entry.id} src={mediaUrl(entry.id)} controls preload="metadata" /> : <FileGlyph entry={entry} />}
+      <strong title={entry.name}>{entry.name}</strong><span>{entry.kind === 'directory' ? 'Folder' : entry.mime}</span>
+    </div>
+    <dl className="preview-metadata"><dt>Size</dt><dd>{formatBytes(entry.size)}</dd><dt>Permissions</dt><dd><code>{entry.permissions} {entry.mode.toString(8)}</code></dd><dt>Owner</dt><dd>{entry.uid}:{entry.gid}</dd><dt>Modified</dt><dd>{formatDate(entry.modifiedAt)}</dd><dt>Created</dt><dd>{formatDate(entry.createdAt)}</dd><dt>Accessed</dt><dd>{formatDate(entry.accessedAt)}</dd></dl>
+  </aside>
+}
+
+type Row = { entry: Entry; depth: number }
+
+function FileList({ rows, view, selected, setSelected, setPrimary, activate, moveEntries, deleteEntry, setError }: {
+  rows: Row[]; view: ViewMode; selected: Set<string>; setSelected: (value: Set<string>) => void; setPrimary: (entry: Entry | null) => void
+  activate: (entry: Entry) => void
   moveEntries: (ids: string[], destinationId: string) => Promise<void>
   deleteEntry: (entry: Entry) => Promise<void>; setError: (message: string) => void
 }) {
   const [menu, setMenu] = useState<{ entry: Entry; x: number; y: number } | null>(null)
   const [dropTarget, setDropTarget] = useState<string | null>(null)
   const draggedIds = useRef<string[]>([])
+  const anchor = useRef<number | null>(null)
   useEffect(() => {
     if (!menu) return
     const close = () => setMenu(null)
@@ -200,13 +364,24 @@ function FileList({ rows, view, open, selected, setSelected, activate, toggle, s
     event.preventDefault(); event.stopPropagation()
     setMenu({ entry, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 140) })
   }
-  const choose = (entry: Entry, checked: boolean) => { const next = new Set(selected); checked ? next.add(entry.id) : next.delete(entry.id); setSelected(next); if (entry.kind === 'directory') setCurrentDir(entry.id) }
+  const choose = (entry: Entry, checked: boolean) => { const next = new Set(selected); checked ? next.add(entry.id) : next.delete(entry.id); setSelected(next); setPrimary(checked ? entry : null) }
+  const selectEntry = (entry: Entry, index: number, event: React.MouseEvent) => {
+    if (event.shiftKey && anchor.current !== null) {
+      const start = Math.min(anchor.current, index), end = Math.max(anchor.current, index)
+      setSelected(new Set(rows.slice(start, end + 1).map(row => row.entry.id))); setPrimary(entry); return
+    }
+    if (event.metaKey || event.ctrlKey) {
+      const next = new Set(selected); next.has(entry.id) ? next.delete(entry.id) : next.add(entry.id)
+      setSelected(next); setPrimary(next.has(entry.id) ? entry : null); anchor.current = index; return
+    }
+    setSelected(new Set([entry.id])); setPrimary(entry); anchor.current = index
+  }
   const dragProps = (entry: Entry) => ({
     draggable: true,
     onDragStart: (event: React.DragEvent) => {
       const ids = selected.has(entry.id) ? Array.from(selected) : [entry.id]
       draggedIds.current = ids
-      if (!selected.has(entry.id)) setSelected(new Set([entry.id]))
+      if (!selected.has(entry.id)) { setSelected(new Set([entry.id])); setPrimary(entry) }
       event.dataTransfer.effectAllowed = 'move'
       event.dataTransfer.setData('application/x-remote-file-browser', ids.join(','))
       event.dataTransfer.setData('text/plain', entry.name)
@@ -228,23 +403,12 @@ function FileList({ rows, view, open, selected, setSelected, activate, toggle, s
     },
   })
   const contextMenu = menu && <ContextMenu {...menu} close={() => setMenu(null)} open={() => activate(menu.entry)} deleteEntry={deleteEntry} setError={setError} />
-  if (view === 'details') return <><div className="details-table" role="treegrid">
-    <div className="details-head"><span>Name</span><span>Permissions</span><span>Owner</span><span>Size</span><span>Modified</span></div>
-    {rows.map(({ entry, depth }) => <div className={`file-row ${selected.has(entry.id) ? 'selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} key={entry.id} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} role="row" {...dragProps(entry)}>
-      <div className="name-cell" style={{ paddingLeft: 12 + depth * 22 }}>
-        <input type="checkbox" checked={selected.has(entry.id)} onChange={e => choose(entry, e.target.checked)} />
-        {entry.kind === 'directory' ? <button className="disclosure" onClick={() => toggle(entry)}>{open.has(entry.id) ? <ChevronDown /> : <ChevronRight />}</button> : <span className="disclosure" />}
-        <FileGlyph entry={entry} /><button className="filename" onClick={() => entry.kind === 'directory' ? setCurrentDir(entry.id) : activate(entry)}>{entry.name}</button><button className="row-menu" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>
-      </div>
-      <code>{entry.permissions} <small>{entry.mode.toString(8)}</small></code><span>{entry.uid}:{entry.gid}</span><span>{formatBytes(entry.size)}</span><span>{formatDate(entry.modifiedAt)}</span>
-    </div>)}
-  </div>{contextMenu}</>
   return <div className={`preview-list ${view}`}>
-    {rows.map(({ entry, depth }) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
-      <input type="checkbox" checked={selected.has(entry.id)} onChange={e => choose(entry, e.target.checked)} />
+    {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => selectEntry(entry, index, event)} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
+      <input type="checkbox" checked={selected.has(entry.id)} onClick={event => event.stopPropagation()} onChange={e => choose(entry, e.target.checked)} />
       <button className="card-menu" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>
-      {entry.kind === 'directory' ? <button className="preview-image folder-preview" onClick={() => toggle(entry)}>{open.has(entry.id) ? <FolderOpen /> : <Folder />}</button> : isPreviewable(entry) ? <button className="preview-image" onClick={() => activate(entry)}><img src={thumbnailUrl(entry.id, view)} loading="lazy" /></button> : <button className="preview-image" onClick={() => activate(entry)}><FileGlyph entry={entry} /></button>}
-      <button className="filename" onClick={() => activate(entry)} title={entry.name}>{entry.name}</button>
+      {entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : isPreviewable(entry) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view)} loading="lazy" /></button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
+      <button className="filename" tabIndex={-1} title={entry.name}>{entry.name}</button>
       <small>{formatBytes(entry.size)}</small>
     </div>)}
     {contextMenu}
@@ -270,7 +434,7 @@ function ContextMenu({ entry, x, y, close, open, deleteEntry, setError }: { entr
 
 function ViewSelector({ view, setView }: { view: ViewMode; setView: (view: ViewMode) => void }) {
   return <div className="view-selector" aria-label="View mode">
-    {(['details', 'small', 'medium', 'large'] as ViewMode[]).map(mode => <button className={view === mode ? 'active' : ''} title={mode} key={mode} onClick={() => setView(mode)}>{mode === 'details' ? <List /> : mode === 'small' ? <Menu /> : mode === 'medium' ? <Grid2X2 /> : <Maximize2 />}</button>)}
+    {(['details', 'small', 'medium', 'large'] as ViewMode[]).map(mode => <button className={view === mode ? 'active' : ''} title={mode === 'details' ? 'columns' : mode} key={mode} onClick={() => setView(mode)}>{mode === 'details' ? <Columns3 /> : mode === 'small' ? <Menu /> : mode === 'medium' ? <Grid2X2 /> : <Maximize2 />}</button>)}
   </div>
 }
 
@@ -297,7 +461,7 @@ function ViewerWindow({ entry, type, onClose }: { entry: Entry; type: 'image' | 
   </FloatingWindow>
 }
 
-function VideoPlayer({ entry }: { entry: Entry }) {
+function VideoPlayer({ entry, autoPlay = true }: { entry: Entry; autoPlay?: boolean }) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const [message, setMessage] = useState('')
   const fallback = async () => {
@@ -314,7 +478,7 @@ function VideoPlayer({ entry }: { entry: Entry }) {
       setMessage('')
     } catch (e) { setMessage(messageOf(e)) }
   }
-  return <div className="video-stage"><video ref={videoRef} src={mediaUrl(entry.id)} controls autoPlay onError={fallback} /><div className="video-message">{message}</div></div>
+  return <div className="video-stage"><video ref={videoRef} src={mediaUrl(entry.id)} controls autoPlay={autoPlay} preload={autoPlay ? 'auto' : 'metadata'} onError={fallback} />{message && <div className="video-message">{message}</div>}</div>
 }
 
 function TrashWindow({ items, onClose, onChanged, onRestored, setError }: { items: TrashEntry[]; onClose: () => void; onChanged: () => Promise<void>; onRestored: (entry: Entry) => Promise<void>; setError: (s: string) => void }) {
