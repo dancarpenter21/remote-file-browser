@@ -74,6 +74,29 @@ services:
       retries: 5
     restart: unless-stopped
 
+  frontend-dev:
+    image: node:24-bookworm-slim
+    container_name: rfb-frontend-dev
+    profiles: [dev]
+    working_dir: /app
+    command: ["sh", "-c", "test -x node_modules/.bin/vite || npm ci; exec npm run dev"]
+    environment:
+      VITE_PROXY_TARGET: http://backend:8080
+      CHOKIDAR_USEPOLLING: "${RFB_DEV_POLLING:-false}"
+    volumes:
+      - ./frontend:/app
+      - frontend-dev-node-modules:/app/node_modules
+    ports:
+      - "${RFB_BIND_ADDRESS:-0.0.0.0}:${RFB_DEV_PORT:-5173}:5173"
+    depends_on:
+      backend:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  frontend-dev-node-modules:
+
 secrets:
   admin_password:
     file: "${RFB_ADMIN_PASSWORD_PATH:-./secrets/admin_password}"

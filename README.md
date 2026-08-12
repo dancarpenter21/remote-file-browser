@@ -35,6 +35,27 @@ For a Linux home directory, use `cp .env.linux.example .env` and run ordinary `d
 
 ## Development
 
+For a containerized frontend with Vite hot reload, start the `dev` profile and
+target its development service explicitly:
+
+```sh
+RFB_SECURE_COOKIES=false docker compose --profile dev up frontend-dev
+```
+
+Open `http://localhost:5173` (or replace `localhost` with the server hostname).
+The frontend source directory is bind-mounted, while dependencies are kept in a
+named Docker volume. The existing backend image is reused and Vite proxies
+`/api` to it. Stop the profile with:
+
+```sh
+docker compose --profile dev down
+```
+
+Set `RFB_DEV_PORT` to change the published port. If file changes are not
+detected, set `RFB_DEV_POLLING=true`; the WSL template enables this by default.
+
+To run both processes directly on the host instead, use the following commands.
+
 Backend:
 
 ```sh
