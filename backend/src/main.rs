@@ -1631,6 +1631,8 @@ struct HlsResponse {
     key: String,
     status: String,
     playlist_url: String,
+    playable: bool,
+    mode: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -1639,7 +1641,111 @@ struct MediaJob {
     key: String,
     file_name: String,
     status: String,
+    playable: bool,
+    mode: String,
     started_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConversionMode {
+    Remux,
+    Audio,
+    Full,
+}
+
+impl ConversionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Remux => "remux",
+            Self::Audio => "audio",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ProbeOutput {
+    streams: Vec<ProbeStream>,
+}
+
+#[derive(Deserialize)]
+struct ProbeStream {
+    codec_type: Option<String>,
+    codec_name: Option<String>,
+    pix_fmt: Option<String>,
+}
+
+fn conversion_mode(probe: &ProbeOutput) -> ConversionMode {
+    let video = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("video"));
+    let Some(video) = video else {
+        return ConversionMode::Full;
+    };
+    let compatible_video = video.codec_name.as_deref() == Some("h264")
+        && matches!(video.pix_fmt.as_deref(), Some("yuv420p") | Some("yuvj420p"));
+    if !compatible_video {
+        return ConversionMode::Full;
+    }
+    match probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("audio"))
+    {
+        None => ConversionMode::Remux,
+        Some(audio) if audio.codec_name.as_deref() == Some("aac") => ConversionMode::Remux,
+        Some(_) => ConversionMode::Audio,
+    }
+}
+
+async fn probe_conversion_mode(source: &Path) -> ConversionMode {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name,pix_fmt",
+            "-of",
+            "json",
+        ])
+        .arg(source)
+        .output()
+        .await;
+    match output {
+        Ok(output) if output.status.success() => {
+            serde_json::from_slice::<ProbeOutput>(&output.stdout)
+                .map(|probe| conversion_mode(&probe))
+                .unwrap_or(ConversionMode::Full)
+        }
+        _ => ConversionMode::Full,
+    }
+}
+
+fn playlist_state(directory: &Path) -> (bool, bool) {
+    let Ok(content) = std::fs::read_to_string(directory.join("index.m3u8")) else {
+        return (false, false);
+    };
+    let segments = content
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    let playable = !segments.is_empty()
+        && segments.iter().all(|name| {
+            Path::new(name).components().count() == 1 && directory.join(name).is_file()
+        });
+    (
+        playable,
+        playable && content.lines().any(|line| line == "#EXT-X-ENDLIST"),
+    )
+}
+
+fn cached_mode(directory: &Path) -> String {
+    std::fs::read_to_string(directory.join("mode"))
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| matches!(value.as_str(), "remux" | "audio" | "full"))
+        .unwrap_or_else(|| "full".into())
 }
 
 async fn list_media_jobs(
@@ -1673,7 +1779,7 @@ async fn start_hls(
     }
     let source_meta = fs::metadata(&source).await?;
     let fingerprint = format!(
-        "{}:{}:{:?}:ffmpeg-8.1.2-h264-aac",
+        "{}:{}:{:?}:ffmpeg-8.1.2-progressive-hls-v2",
         input.id,
         source_meta.len(),
         source_meta.modified().ok()
@@ -1686,13 +1792,17 @@ async fn start_hls(
         .unwrap_or_else(|| OsStr::new("video"))
         .to_string_lossy()
         .into_owned();
-    if fs::metadata(&playlist).await.is_ok() {
+    let (cached_playable, cached_ready) = playlist_state(&directory);
+    if cached_ready {
+        let mode = cached_mode(&directory);
         state.media_jobs.insert(
             key.clone(),
             MediaJob {
                 key: key.clone(),
                 file_name,
                 status: "ready".into(),
+                playable: true,
+                mode: mode.clone(),
                 started_at: Utc::now(),
             },
         );
@@ -1702,17 +1812,32 @@ async fn start_hls(
                 key: key.clone(),
                 status: "ready".into(),
                 playlist_url: format!("/api/v1/media/hls/{key}/index.m3u8"),
+                playable: true,
+                mode,
             }),
         ));
     }
-    if state.media_jobs.get(&key).is_none() {
+    let should_start = state
+        .media_jobs
+        .get(&key)
+        .map(|job| job.status != "working")
+        .unwrap_or(true);
+    if should_start {
+        state.media_jobs.remove(&key);
+        if fs::metadata(&directory).await.is_ok() {
+            fs::remove_dir_all(&directory).await?;
+        }
         fs::create_dir_all(&directory).await?;
+        let mode = probe_conversion_mode(&source).await;
+        fs::write(directory.join("mode"), mode.as_str()).await?;
         state.media_jobs.insert(
             key.clone(),
             MediaJob {
                 key: key.clone(),
                 file_name,
                 status: "working".into(),
+                playable: false,
+                mode: mode.as_str().into(),
                 started_at: Utc::now(),
             },
         );
@@ -1720,7 +1845,8 @@ async fn start_hls(
         let job_key = key.clone();
         tokio::spawn(async move {
             let segment = directory.join("segment-%05d.ts");
-            let status = Command::new("ffmpeg")
+            let mut command = Command::new("ffmpeg");
+            command
                 .args([
                     "-nostdin",
                     "-hide_banner",
@@ -1731,29 +1857,64 @@ async fn start_hls(
                     "-i",
                 ])
                 .arg(source)
+                .args(["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"]);
+            match mode {
+                ConversionMode::Remux => {
+                    command.args(["-c", "copy"]);
+                }
+                ConversionMode::Audio => {
+                    command.args(["-c:v", "copy", "-c:a", "aac"]);
+                }
+                ConversionMode::Full => {
+                    command.args([
+                        "-vf",
+                        "scale='min(1920,iw)':-2",
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "veryfast",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-force_key_frames",
+                        "expr:gte(t,n_forced*4)",
+                        "-c:a",
+                        "aac",
+                    ]);
+                }
+            }
+            command
                 .args([
-                    "-vf",
-                    "scale='min(1920,iw)':-2",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-c:a",
-                    "aac",
                     "-hls_time",
                     "4",
                     "-hls_playlist_type",
-                    "vod",
+                    "event",
+                    "-hls_flags",
+                    "temp_file",
                     "-hls_segment_filename",
                 ])
                 .arg(segment)
-                .arg(&playlist)
-                .status()
-                .await;
+                .arg(&playlist);
+            let child = command.spawn();
+            let status = match child {
+                Ok(mut child) => loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break Some(status),
+                        Ok(None) => {
+                            let (playable, _) = playlist_state(&directory);
+                            if playable && let Some(mut job) = jobs.get_mut(&job_key) {
+                                job.playable = true;
+                            }
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                        Err(_) => break None,
+                    }
+                },
+                Err(_) => None,
+            };
+            let (playable, ready) = playlist_state(&directory);
             if let Some(mut job) = jobs.get_mut(&job_key) {
-                job.status = if status.map(|s| s.success()).unwrap_or(false) {
+                job.playable = playable;
+                job.status = if status.map(|s| s.success()).unwrap_or(false) && ready {
                     "ready".into()
                 } else {
                     "failed".into()
@@ -1767,6 +1928,12 @@ async fn start_hls(
             key: key.clone(),
             status: "working".into(),
             playlist_url: format!("/api/v1/media/hls/{key}/index.m3u8"),
+            playable: cached_playable,
+            mode: state
+                .media_jobs
+                .get(&key)
+                .map(|job| job.mode.clone())
+                .unwrap_or_else(|| "full".into()),
         }),
     ))
 }
@@ -1780,22 +1947,29 @@ async fn hls_status(
     if !key.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(ApiError::bad("invalid_key", "Invalid media key"));
     }
-    let status = if fs::metadata(state.config.cache.join("hls").join(&key).join("index.m3u8"))
-        .await
-        .is_ok()
-    {
+    let directory = state.config.cache.join("hls").join(&key);
+    let (disk_playable, disk_ready) = playlist_state(&directory);
+    let job = state
+        .media_jobs
+        .get(&key)
+        .map(|value| value.value().clone());
+    let status = if disk_ready {
         "ready".into()
     } else {
-        state
-            .media_jobs
-            .get(&key)
-            .map(|v| v.value().status.clone())
+        job.as_ref()
+            .map(|v| v.status.clone())
             .unwrap_or_else(|| "missing".into())
     };
+    let playable = disk_playable || job.as_ref().map(|v| v.playable).unwrap_or(false);
+    let mode = job
+        .map(|v| v.mode)
+        .unwrap_or_else(|| cached_mode(&directory));
     Ok(Json(HlsResponse {
         key: key.clone(),
         status,
         playlist_url: format!("/api/v1/media/hls/{key}/index.m3u8"),
+        playable,
+        mode,
     }))
 }
 
@@ -1811,18 +1985,29 @@ async fn hls_file(
     {
         return Err(ApiError::bad("invalid_media_path", "Invalid media path"));
     }
-    serve_file(
-        state.config.cache.join("hls").join(key).join(file),
+    let mut response = serve_file(
+        state.config.cache.join("hls").join(key).join(&file),
         &headers,
         true,
     )
-    .await
+    .await?;
+    if file == "index.m3u8" {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    } else {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            "private, max-age=86400".parse().unwrap(),
+        );
+    }
+    Ok(response)
 }
 
 fn spawn_cache_cleanup(state: AppState) {
     tokio::spawn(async move {
         loop {
-            if let Err(error) = cleanup_cache(&state.config).await {
+            if let Err(error) = cleanup_cache(&state).await {
                 error!(?error, "cache cleanup failed");
             }
             tokio::time::sleep(Duration::from_secs(60 * 60)).await;
@@ -1830,49 +2015,84 @@ fn spawn_cache_cleanup(state: AppState) {
     });
 }
 
-async fn cleanup_cache(config: &Config) -> ApiResult<()> {
-    let max_age = Duration::from_secs(config.cache_age_days * 24 * 60 * 60);
-    let cache = config.cache.clone();
-    let max_bytes = config.cache_max;
+async fn cleanup_cache(state: &AppState) -> ApiResult<()> {
+    let max_age = Duration::from_secs(state.config.cache_age_days * 24 * 60 * 60);
+    let cache = state.config.cache.clone();
+    let max_bytes = state.config.cache_max;
+    let active = state
+        .media_jobs
+        .iter()
+        .filter(|job| job.status == "working")
+        .map(|job| job.key.clone())
+        .collect::<std::collections::HashSet<_>>();
     tokio::task::spawn_blocking(move || {
-        let mut files = Vec::<(PathBuf, u64, SystemTime)>::new();
-        fn walk(path: &Path, out: &mut Vec<(PathBuf, u64, SystemTime)>) {
+        let mut units = Vec::<(PathBuf, u64, SystemTime, bool)>::new();
+        fn directory_stats(path: &Path) -> (u64, SystemTime) {
+            let mut size = 0;
+            let mut access = SystemTime::UNIX_EPOCH;
             if let Ok(read) = std::fs::read_dir(path) {
                 for item in read.flatten() {
-                    if item.path().file_name() == Some(OsStr::new("provenance.json"))
-                        || item.path().file_name() == Some(OsStr::new(".provenance.json.tmp"))
-                    {
-                        continue;
-                    }
                     if let Ok(meta) = item.metadata() {
                         if meta.is_dir() {
-                            walk(&item.path(), out);
+                            let (child_size, child_access) = directory_stats(&item.path());
+                            size += child_size;
+                            access = access.max(child_access);
                         } else {
-                            out.push((
-                                item.path(),
-                                meta.len(),
-                                meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH),
-                            ));
+                            size += meta.len();
+                            access = access.max(meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH));
                         }
                     }
                 }
             }
+            (size, access)
         }
-        walk(&cache, &mut files);
-        let now = SystemTime::now();
-        for (path, _, access) in &files {
-            if now.duration_since(*access).unwrap_or_default() > max_age {
-                let _ = std::fs::remove_file(path);
+        if let Ok(read) = std::fs::read_dir(cache.join("thumbnails")) {
+            for item in read.flatten() {
+                if let Ok(meta) = item.metadata()
+                    && meta.is_file()
+                {
+                    units.push((
+                        item.path(),
+                        meta.len(),
+                        meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH),
+                        false,
+                    ));
+                }
             }
         }
-        files.retain(|(path, _, _)| path.exists());
-        let mut total: u64 = files.iter().map(|(_, size, _)| *size).sum();
-        files.sort_by_key(|(_, _, access)| *access);
-        for (path, size, _) in files {
+        if let Ok(read) = std::fs::read_dir(cache.join("hls")) {
+            for item in read.flatten() {
+                if item.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                    && !active.contains(&item.file_name().to_string_lossy().into_owned())
+                {
+                    let (size, access) = directory_stats(&item.path());
+                    units.push((item.path(), size, access, true));
+                }
+            }
+        }
+        let now = SystemTime::now();
+        for (path, _, access, directory) in &units {
+            if now.duration_since(*access).unwrap_or_default() > max_age {
+                if *directory {
+                    let _ = std::fs::remove_dir_all(path);
+                } else {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        units.retain(|(path, _, _, _)| path.exists());
+        let mut total: u64 = units.iter().map(|(_, size, _, _)| *size).sum();
+        units.sort_by_key(|(_, _, access, _)| *access);
+        for (path, size, _, directory) in units {
             if total <= max_bytes.saturating_mul(9) / 10 {
                 break;
             }
-            if std::fs::remove_file(path).is_ok() {
+            let removed = if directory {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            };
+            if removed.is_ok() {
                 total = total.saturating_sub(size);
             }
         }
@@ -1886,6 +2106,21 @@ async fn cleanup_cache(config: &Config) -> ApiResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn probe(video: (&str, &str), audio: Option<&str>) -> ProbeOutput {
+        let mut streams = vec![ProbeStream {
+            codec_type: Some("video".into()),
+            codec_name: Some(video.0.into()),
+            pix_fmt: Some(video.1.into()),
+        }];
+        if let Some(codec) = audio {
+            streams.push(ProbeStream {
+                codec_type: Some("audio".into()),
+                codec_name: Some(codec.into()),
+                pix_fmt: None,
+            });
+        }
+        ProbeOutput { streams }
+    }
     #[test]
     fn path_ids_round_trip_non_utf8() {
         let raw = OsStr::from_bytes(b"folder/\xff-name");
@@ -1904,5 +2139,51 @@ mod tests {
     #[test]
     fn permissions_are_symbolic() {
         assert_eq!(permission_string(0o754, "file"), "-rwxr-xr--");
+    }
+    #[test]
+    fn compatible_h264_is_remuxed() {
+        assert_eq!(
+            conversion_mode(&probe(("h264", "yuv420p"), Some("aac"))),
+            ConversionMode::Remux
+        );
+        assert_eq!(
+            conversion_mode(&probe(("h264", "yuv420p"), None)),
+            ConversionMode::Remux
+        );
+    }
+    #[test]
+    fn compatible_video_with_other_audio_only_converts_audio() {
+        assert_eq!(
+            conversion_mode(&probe(("h264", "yuv420p"), Some("dts"))),
+            ConversionMode::Audio
+        );
+    }
+    #[test]
+    fn incompatible_video_is_fully_converted() {
+        assert_eq!(
+            conversion_mode(&probe(("hevc", "yuv420p"), Some("aac"))),
+            ConversionMode::Full
+        );
+        assert_eq!(
+            conversion_mode(&probe(("h264", "yuv420p10le"), Some("aac"))),
+            ConversionMode::Full
+        );
+    }
+    #[test]
+    fn playlist_requires_segments_and_endlist_to_be_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("segment-00000.ts"), b"segment").unwrap();
+        std::fs::write(
+            directory.path().join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:4,\nsegment-00000.ts\n",
+        )
+        .unwrap();
+        assert_eq!(playlist_state(directory.path()), (true, false));
+        std::fs::write(
+            directory.path().join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:4,\nsegment-00000.ts\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        assert_eq!(playlist_state(directory.path()), (true, true));
     }
 }

@@ -8,7 +8,7 @@ import Hls from 'hls.js'
 import {
   ChevronRight, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
   Film, Folder, FolderOpen, Grid2X2, LogOut, Maximize2, Menu, MoreHorizontal,
-  ExternalLink, Link2, Move, Plus, RefreshCw, RotateCw, Save, Search, Trash2, Upload, X, ZoomIn, ZoomOut,
+  ExternalLink, Link2, Minus, Move, Plus, RefreshCw, RotateCw, Save, Search, Trash2, Upload, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import { api, ApiFailure, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, mediaUrl, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { updateFinderPathForSelection } from './finderPath'
@@ -329,7 +329,7 @@ function ConversionJobs() {
     <div className="conversion-job-list">
       {jobs.length === 0 ? <p>No conversions yet.</p> : jobs.map(job => <div className={`conversion-job ${job.status}`} key={job.key} title={job.fileName}>
         <span className="conversion-status" aria-label={job.status} />
-        <div><strong>{job.fileName}</strong><small>{job.status === 'working' ? 'Converting…' : job.status === 'ready' ? 'Compatible stream ready' : 'Conversion failed'}</small></div>
+        <div><strong>{job.fileName}</strong><small>{job.status === 'failed' ? 'Conversion failed' : `${job.mode === 'remux' ? 'Remuxing' : job.mode === 'audio' ? 'Converting audio' : 'Converting video'}${job.status === 'ready' ? ' complete' : job.playable ? ' · playing' : '…'}`}</small></div>
       </div>)}
     </div>
   </div>
@@ -625,18 +625,42 @@ function ViewerWindow({ entry, type, onClose }: { entry: Entry; type: 'image' | 
 
 function VideoPlayer({ entry, autoPlay = true }: { entry: Entry; autoPlay?: boolean }) {
   const videoRef = useRef<HTMLVideoElement>(null)
+  const hlsRef = useRef<Hls | null>(null)
+  const cancelled = useRef(false)
+  const fallbackStarted = useRef(false)
   const [message, setMessage] = useState('')
+  useEffect(() => {
+    cancelled.current = false; fallbackStarted.current = false
+    return () => { cancelled.current = true; hlsRef.current?.destroy(); hlsRef.current = null }
+  }, [entry.id])
+  const attach = (playlistUrl: string) => {
+    const video = videoRef.current
+    if (!video || cancelled.current) return
+    if (video.canPlayType('application/vnd.apple.mpegurl')) video.src = playlistUrl
+    else if (Hls.isSupported()) {
+      hlsRef.current?.destroy()
+      const hls = new Hls(); hlsRef.current = hls
+      hls.loadSource(playlistUrl); hls.attachMedia(video)
+    } else throw new Error('This browser cannot play HLS video')
+    setMessage('')
+    if (autoPlay) void video.play().catch(() => {})
+  }
   const fallback = async () => {
-    if (message) return
+    if (fallbackStarted.current) return
+    fallbackStarted.current = true
     setMessage('Preparing a browser-compatible stream…')
     try {
-      const job = await api.startHls(entry.id)
-      let current = job
-      while (current.status === 'working') { await new Promise(r => setTimeout(r, 1500)); current = await api.hlsStatus(job.key) }
+      let current = await api.startHls(entry.id)
+      const key = current.key
+      let attached = false
+      if (current.playable) { attach(current.playlistUrl); attached = true }
+      while (current.status === 'working' && !cancelled.current) {
+        await new Promise(r => setTimeout(r, 1000)); current = await api.hlsStatus(key)
+        if (!attached && current.playable) { attach(current.playlistUrl); attached = true }
+      }
+      if (cancelled.current) return
       if (current.status !== 'ready') throw new Error('Transcoding failed')
-      const video = videoRef.current!;
-      if (video.canPlayType('application/vnd.apple.mpegurl')) video.src = current.playlistUrl
-      else if (Hls.isSupported()) { const hls = new Hls(); hls.loadSource(current.playlistUrl); hls.attachMedia(video) }
+      if (!attached) attach(current.playlistUrl)
       setMessage('')
     } catch (e) { setMessage(messageOf(e)) }
   }
@@ -668,9 +692,10 @@ function TrashWindow({ items, onClose, onChanged, onRestored, setError }: { item
 
 function FloatingWindow({ title, onClose, className = '', children }: { title: string; onClose: () => void; className?: string; children: React.ReactNode }) {
   const [position, setPosition] = useState({ x: Math.max(20, innerWidth * .12), y: 90 })
+  const [minimized, setMinimized] = useState(false)
   const drag = useRef<{ x: number; y: number } | null>(null)
-  return <div className={`floating ${className}`} style={{ left: position.x, top: position.y }}>
-    <div className="window-title" onPointerDown={e => { drag.current = { x: e.clientX - position.x, y: e.clientY - position.y }; e.currentTarget.setPointerCapture(e.pointerId) }} onPointerMove={e => { if (drag.current) setPosition({ x: Math.max(0, e.clientX - drag.current.x), y: Math.max(0, e.clientY - drag.current.y) }) }} onPointerUp={() => { drag.current = null }}><span>{title}</span><button aria-label={`Close ${title}`} onPointerDown={e => e.stopPropagation()} onClick={onClose}><X /></button></div>
+  return <div className={`floating ${minimized ? 'minimized' : ''} ${className}`} style={{ left: position.x, top: position.y }}>
+    <div className="window-title" onDoubleClick={() => setMinimized(value => !value)} onPointerDown={e => { drag.current = { x: e.clientX - position.x, y: e.clientY - position.y }; e.currentTarget.setPointerCapture(e.pointerId) }} onPointerMove={e => { if (drag.current) setPosition({ x: Math.max(0, e.clientX - drag.current.x), y: Math.max(0, e.clientY - drag.current.y) }) }} onPointerUp={() => { drag.current = null }}><span>{title}</span><div className="window-actions"><button aria-label={`${minimized ? 'Restore' : 'Minimize'} ${title}`} title={minimized ? 'Restore' : 'Minimize'} onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={() => setMinimized(value => !value)}>{minimized ? <Maximize2 /> : <Minus />}</button><button aria-label={`Close ${title}`} title="Close" onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={onClose}><X /></button></div></div>
     {children}
   </div>
 }

@@ -26,7 +26,9 @@ export type TrashEntry = {
   size: number
 }
 export type Provenance = { urls: string[] }
-export type ConversionJob = { key: string; fileName: string; status: 'working' | 'ready' | 'failed'; startedAt: string }
+export type ConversionMode = 'remux' | 'audio' | 'full'
+export type ConversionJob = { key: string; fileName: string; status: 'working' | 'ready' | 'failed'; playable: boolean; mode: ConversionMode; startedAt: string }
+export type HlsJob = { key: string; status: 'working' | 'ready' | 'failed' | 'missing'; playlistUrl: string; playable: boolean; mode: ConversionMode }
 
 export class ApiFailure extends Error {
   constructor(public status: number, public code: string, message: string) { super(message) }
@@ -68,8 +70,8 @@ export const api = {
   restore: (id: string, destinationId?: string, replace = false) => request<Entry>(`/trash/${id}/restore`, { method: 'POST', body: JSON.stringify({ destinationId, replace }) }),
   purge: (id: string) => request<void>(`/trash/${id}`, { method: 'DELETE' }),
   emptyTrash: () => request<void>('/trash', { method: 'DELETE' }),
-  startHls: (id: string) => request<{ key: string; status: string; playlistUrl: string }>('/media/hls', { method: 'POST', body: JSON.stringify({ id }) }),
-  hlsStatus: (key: string) => request<{ key: string; status: string; playlistUrl: string }>(`/media/hls/${key}/status`),
+  startHls: (id: string) => request<HlsJob>('/media/hls', { method: 'POST', body: JSON.stringify({ id }) }),
+  hlsStatus: (key: string) => request<HlsJob>(`/media/hls/${key}/status`),
   conversionJobs: () => request<ConversionJob[]>('/media/jobs'),
 }
 
