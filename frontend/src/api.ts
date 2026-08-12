@@ -15,6 +15,7 @@ export type Entry = {
   mime: string
   symlinkTarget?: string
   etag: string
+  hasProvenance: boolean
 }
 
 export type EntryPage = { entries: Entry[]; total: number; nextOffset?: number }

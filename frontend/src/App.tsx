@@ -124,6 +124,20 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   useEffect(() => { localStorage.setItem('rfb-hidden', String(hidden)) }, [hidden])
   useEffect(() => { localStorage.setItem('rfb-column-preview', String(showPreview)) }, [showPreview])
   useEffect(() => { localStorage.setItem('rfb-column-width', String(columnWidth)) }, [columnWidth])
+  useEffect(() => {
+    const changed = (event: Event) => {
+      const id = (event as CustomEvent<string>).detail
+      void api.provenance(id).then(({ urls }) => {
+        const update = (entry: Entry) => entry.id === id ? { ...entry, hasProvenance: urls.length > 0 } : entry
+        setRoot(page => page && ({ ...page, entries: page.entries.map(update) }))
+        setExpanded(pages => Object.fromEntries(Object.entries(pages).map(([key, page]) => [key, { ...page, entries: page.entries.map(update) }])))
+        setPrimary(entry => entry?.id === id ? update(entry) : entry)
+        setColumnPath(path => path.map(update))
+      }).catch(() => {})
+    }
+    addEventListener('rfb:provenance-changed', changed)
+    return () => removeEventListener('rfb:provenance-changed', changed)
+  }, [])
 
   const refresh = async (id = currentDir) => {
     try {
@@ -417,9 +431,9 @@ function ColumnBrowser({ root, path, pages, filter, selected, primary, columnWid
   }
   return <div className="column-browser" ref={scroller} style={{ '--column-width': `${columnWidth}px` } as React.CSSProperties}>
     {columns.map((column, columnIndex) => {
-      const entries = visibleEntries(column), targetKey = column.directoryId || '__root__'
+      const entries = visibleEntries(column), targetKey = column.directoryId || '__root__', branchId = path[columnIndex]?.id
       return <div className={`finder-column ${activeColumn === columnIndex ? 'active' : ''} ${dropTarget === targetKey ? 'drop-target' : ''}`} key={column.directoryId || '__root__'} ref={node => { columnRefs.current[columnIndex] = node }} tabIndex={0} role="listbox" aria-label={column.label} aria-multiselectable="true" onFocus={() => setActiveColumn(columnIndex)} onKeyDown={event => keyboard(event, columnIndex)} onContextMenu={event => showFolderMenu(event, column.directoryId, columnIndex === 0 ? '/fs-root' : path[columnIndex - 1].path)} onDragOver={event => acceptDrop(event, column.directoryId)} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null) }} onDrop={event => drop(event, column.directoryId)}>
-        {!column.page ? <div className="column-state"><span className="spinner" /></div> : entries.length === 0 ? <div className="column-state">{filter ? 'No matches' : 'Empty folder'}</div> : entries.map((entry, entryIndex) => <div className={`column-row ${selected.has(entry.id) ? 'selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} key={entry.id} role="option" aria-selected={selected.has(entry.id)} draggable onDragStart={event => startDrag(event, entry, columnIndex)} onDragEnd={() => { draggedIds.current = []; setDropTarget(null) }} onClick={event => choose(entry, columnIndex, entryIndex, event, true)} onDoubleClick={() => entry.kind === 'directory' ? void navigate(entry, columnIndex) : activate(entry)} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ entry, columnIndex, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 180) }) }} onDragOver={event => { if (entry.kind === 'directory') acceptDrop(event, entry.id) }} onDrop={event => { if (entry.kind === 'directory') drop(event, entry.id) }}>
+        {!column.page ? <div className="column-state"><span className="spinner" /></div> : entries.length === 0 ? <div className="column-state">{filter ? 'No matches' : 'Empty folder'}</div> : entries.map((entry, entryIndex) => <div className={`column-row ${selected.has(entry.id) ? 'selected' : branchId === entry.id ? 'branch-selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} key={entry.id} role="option" aria-selected={selected.has(entry.id)} aria-current={branchId === entry.id ? 'location' : undefined} draggable onDragStart={event => startDrag(event, entry, columnIndex)} onDragEnd={() => { draggedIds.current = []; setDropTarget(null) }} onClick={event => choose(entry, columnIndex, entryIndex, event, true)} onDoubleClick={() => entry.kind === 'directory' ? void navigate(entry, columnIndex) : activate(entry)} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ entry, columnIndex, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 180) }) }} onDragOver={event => { if (entry.kind === 'directory') acceptDrop(event, entry.id) }} onDrop={event => { if (entry.kind === 'directory') drop(event, entry.id) }}>
           <FileGlyph entry={entry} /><span title={entry.name}>{entry.name}</span>{entry.kind === 'directory' && <ChevronRight className="column-arrow" />}
         </div>)}
         <div className="column-resizer" role="separator" aria-orientation="vertical" title="Resize columns" onPointerDown={startResize} />
@@ -457,11 +471,11 @@ function ProvenanceEditor({ entry }: { entry: Entry }) {
   const add = async () => {
     const url = await promptAction({ title: 'Add provenance URL', label: 'Source URL', submitLabel: 'Add', placeholder: 'https://example.com/source' })
     if (!url || !urls) return
-    try { setUrls((await api.setProvenance(entry.id, [...urls, url])).urls); setError('') } catch (e) { setError(messageOf(e)) }
+    try { setUrls((await api.setProvenance(entry.id, [...urls, url])).urls); dispatchEvent(new CustomEvent('rfb:provenance-changed', { detail: entry.id })); setError('') } catch (e) { setError(messageOf(e)) }
   }
   const remove = async (url: string) => {
     if (!urls) return
-    try { setUrls((await api.setProvenance(entry.id, urls.filter(value => value !== url))).urls); setError('') } catch (e) { setError(messageOf(e)) }
+    try { setUrls((await api.setProvenance(entry.id, urls.filter(value => value !== url))).urls); dispatchEvent(new CustomEvent('rfb:provenance-changed', { detail: entry.id })); setError('') } catch (e) { setError(messageOf(e)) }
   }
   return <section className="provenance-panel" aria-label="File provenance">
     <div className="provenance-heading"><span><Link2 /> Provenance</span><button className="compact" onClick={() => void add()} disabled={!urls}><Plus /> Add URL</button></div>
@@ -548,6 +562,14 @@ function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, setEr
     try { await navigator.clipboard.writeText(entry.path) } catch { setError('The browser denied clipboard access.') }
     close()
   }
+  const copyProvenance = async () => {
+    close()
+    try {
+      const provenance = await api.provenance(entry.id)
+      if (!provenance.urls[0]) throw new Error('No provenance URL is defined.')
+      await navigator.clipboard.writeText(provenance.urls[0])
+    } catch (error) { setError(error instanceof Error ? error.message : 'The browser denied clipboard access.') }
+  }
   const remove = async () => {
     close()
     try { await deleteEntry(entry) } catch (error) { setError(messageOf(error)) }
@@ -569,6 +591,7 @@ function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, setEr
     <button role="menuitem" onClick={copyPath}><Copy /> Copy path</button>
     <span className="context-divider" />
     {entry.kind === 'file' && <button role="menuitem" onClick={() => void addProvenance()}><Link2 /> Add provenance URL</button>}
+    {entry.kind === 'file' && entry.hasProvenance && <button role="menuitem" onClick={() => void copyProvenance()}><Copy /> Copy Provenance URL</button>}
     <button role="menuitem" className="danger" onClick={remove}><Trash2 /> Delete</button>
   </div>
 }
@@ -702,10 +725,8 @@ function FloatingWindow({ title, onClose, className = '', children }: { title: s
 
 function FileGlyph({ entry }: { entry: Pick<Entry, 'kind'> & Partial<Entry> }) {
   if (entry.kind === 'directory') return <Folder className="glyph folder" />
-  if (entry.mime?.startsWith('image/')) return <FileImage className="glyph" />
-  if (entry.mime?.startsWith('video/')) return <Film className="glyph" />
-  if (entry.mime?.startsWith('text/')) return <FileText className="glyph" />
-  return <File className="glyph" />
+  const icon = entry.mime?.startsWith('image/') ? <FileImage /> : entry.mime?.startsWith('video/') ? <Film /> : entry.mime?.startsWith('text/') ? <FileText /> : <File />
+  return <span className="file-glyph glyph">{icon}{entry.hasProvenance && <span className="provenance-check">✓</span>}</span>
 }
 function first<T>(set: Set<T>) { return set.values().next().value }
 function findEntry(id: string | undefined, root: EntryPage | null, pages: Record<string, EntryPage>) { if (id === undefined) return; return [...(root?.entries ?? []), ...Object.values(pages).flatMap(p => p.entries)].find(entry => entry.id === id) }

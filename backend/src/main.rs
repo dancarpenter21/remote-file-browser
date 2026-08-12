@@ -437,6 +437,7 @@ struct Entry {
     mime: String,
     symlink_target: Option<String>,
     etag: String,
+    has_provenance: bool,
 }
 
 #[derive(Deserialize)]
@@ -483,7 +484,7 @@ async fn list_entries(
         if !query.hidden && name.as_bytes().starts_with(b".") {
             continue;
         }
-        entries.push(entry_from_path(&state.config, item.path()).await?);
+        entries.push(entry_from_path(&state, item.path()).await?);
     }
     let sort = query.sort.as_deref().unwrap_or("name");
     entries.sort_by(|a, b| {
@@ -527,7 +528,7 @@ async fn metadata(
 ) -> ApiResult<Json<Entry>> {
     require_session(&state, &jar)?;
     let path = resolve_existing(&state.config, &query.id).await?;
-    Ok(Json(entry_from_path(&state.config, path).await?))
+    Ok(Json(entry_from_path(&state, path).await?))
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -676,7 +677,8 @@ async fn remap_provenance(
     persist_provenance(state).await
 }
 
-async fn entry_from_path(config: &Config, path: PathBuf) -> ApiResult<Entry> {
+async fn entry_from_path(state: &AppState, path: PathBuf) -> ApiResult<Entry> {
+    let config = &state.config;
     let meta = fs::symlink_metadata(&path).await?;
     let relative = path
         .strip_prefix(&config.root)
@@ -713,8 +715,16 @@ async fn entry_from_path(config: &Config, path: PathBuf) -> ApiResult<Entry> {
         meta.len(),
         meta.mtime_nsec() ^ meta.mtime()
     );
+    let id = encode_path(relative.as_os_str());
+    let has_provenance = kind == "file"
+        && state
+            .provenance
+            .read()
+            .await
+            .get(&id)
+            .is_some_and(|urls| !urls.is_empty());
     Ok(Entry {
-        id: encode_path(relative.as_os_str()),
+        id,
         parent_id: encode_path(parent.as_os_str()),
         path: if relative.as_os_str().is_empty() {
             "/fs-root".into()
@@ -738,6 +748,7 @@ async fn entry_from_path(config: &Config, path: PathBuf) -> ApiResult<Entry> {
         mime,
         symlink_target,
         etag,
+        has_provenance,
     })
 }
 
@@ -975,7 +986,7 @@ async fn create_item(
     }
     Ok((
         StatusCode::CREATED,
-        Json(entry_from_path(&state.config, path).await?),
+        Json(entry_from_path(&state, path).await?),
     ))
 }
 
@@ -1040,7 +1051,7 @@ async fn upload(
         }
         file.sync_all().await?;
         fs::rename(&temporary, &target).await?;
-        uploaded.push(entry_from_path(&state.config, target).await?);
+        uploaded.push(entry_from_path(&state, target).await?);
     }
     Ok(Json(uploaded))
 }
@@ -1148,7 +1159,7 @@ async fn operation(
                 ));
             }
         }
-        results.push(entry_from_path(&state.config, target).await?);
+        results.push(entry_from_path(&state, target).await?);
     }
     Ok(Json(results))
 }
@@ -1394,7 +1405,7 @@ async fn restore_trash(
         remove_recursively(&payload).await?;
     }
     fs::remove_dir_all(item).await?;
-    Ok(Json(entry_from_path(&state.config, target).await?))
+    Ok(Json(entry_from_path(&state, target).await?))
 }
 
 async fn purge_trash(
