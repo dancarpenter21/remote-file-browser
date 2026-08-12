@@ -8,9 +8,9 @@ import Hls from 'hls.js'
 import {
   ChevronRight, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
   Film, Folder, FolderOpen, Grid2X2, LogOut, Maximize2, Menu, MoreHorizontal,
-  Move, Plus, RefreshCw, RotateCw, Save, Search, Trash2, Upload, X, ZoomIn, ZoomOut,
+  ExternalLink, Link2, Move, Plus, RefreshCw, RotateCw, Save, Search, Trash2, Upload, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
-import { api, ApiFailure, contentUrl, DocumentFile, Entry, EntryPage, mediaUrl, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
+import { api, ApiFailure, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, mediaUrl, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type Clipboard = { operation: 'copy' | 'move'; ids: string[] } | null
@@ -161,8 +161,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const showFolderMenu = (event: React.MouseEvent, directoryId: string, path: string) => {
     event.preventDefault(); event.stopPropagation(); setFolderMenu({ directoryId, path, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 150) })
   }
-  const rename = async () => {
-    const entry = findEntry(first(selected), root, expanded); if (!entry) return
+  const rename = async (target?: Entry) => {
+    const entry = target ?? findEntry(first(selected), root, expanded); if (!entry) return
     const name = await promptAction({ title: 'Rename Item', label: 'Name', initialValue: entry.name, submitLabel: 'Rename' }); if (!name || name === entry.name) return
     const perform = (replace = false) => api.operate('rename', [entry.id], entry.parentId, name, replace)
     setError('')
@@ -241,6 +241,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       <aside>
         <button className="nav-item active"><Folder size={17} /> Files</button>
         <button className="nav-item" onClick={openTrash}><Trash2 size={17} /> Trash</button>
+        <ConversionJobs />
         <div className="aside-note"><span>Signed in as</span><strong>{session.username}</strong></div>
       </aside>
       <main className={`browser ${view === 'details' ? 'column-view' : ''}`}>
@@ -253,7 +254,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
           <button disabled={!selected.size} onClick={() => setClipboard({ operation: 'copy', ids: Array.from(selected) })}><Copy size={16} /> Copy</button>
           <button disabled={!selected.size} onClick={() => setClipboard({ operation: 'move', ids: Array.from(selected) })}><Move size={16} /> Move</button>
           <button disabled={!clipboard} onClick={paste}>Paste</button>
-          <button disabled={selected.size !== 1} onClick={rename}><Edit3 size={16} /> Rename</button>
+          <button disabled={selected.size !== 1} onClick={() => void rename()}><Edit3 size={16} /> Rename</button>
           <button disabled={!selected.size} onClick={deleteSelected}><Trash2 size={16} /> Delete</button>
           <div className="toolbar-spacer" />
           <label className="hidden-toggle"><input type="checkbox" checked={hidden} onChange={e => setHidden(e.target.checked)} /> Hidden</label>
@@ -265,8 +266,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         {error && <div className="banner error"><span>{error}</span><button onClick={() => setError('')}><X size={15} /></button></div>}
         <div className="browser-body"><div className="browser-view" onContextMenu={view === 'details' ? undefined : event => showFolderMenu(event, currentDir, columnPath.at(-1)?.path ?? '/fs-root')}>
           {!root ? <div className="center"><span className="spinner" /></div> : view === 'details' ?
-            <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} primary={primary} columnWidth={columnWidth} setColumnWidth={setColumnWidth} navigate={navigateColumn} selectItems={selectColumnItems} selectParent={selectParentColumn} activate={activate} moveEntries={moveByDrag} deleteEntry={deleteEntry} showFolderMenu={showFolderMenu} setError={setError} /> :
-            !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view={view} selected={selected} setSelected={setSelected} setPrimary={setPrimary} activate={activate} moveEntries={moveByDrag} deleteEntry={deleteEntry} setError={setError} />}
+            <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} primary={primary} columnWidth={columnWidth} setColumnWidth={setColumnWidth} navigate={navigateColumn} selectItems={selectColumnItems} selectParent={selectParentColumn} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} showFolderMenu={showFolderMenu} setError={setError} /> :
+            !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view={view} selected={selected} setSelected={setSelected} setPrimary={setPrimary} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} setError={setError} />}
         </div>{showPreview && <ColumnPreview entries={previewEntries} primary={primary} />}</div>
       </main>
     </div>
@@ -277,12 +278,32 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   </div>
 }
 
+function ConversionJobs() {
+  const [jobs, setJobs] = useState<ConversionJob[]>([])
+  useEffect(() => {
+    let active = true
+    const refresh = () => api.conversionJobs().then(next => { if (active) setJobs(next) }).catch(() => {})
+    refresh()
+    const timer = window.setInterval(refresh, 2000)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [])
+  return <div className="conversion-jobs" aria-label="Compatibility conversion jobs">
+    <div className="conversion-jobs-heading"><Film /> <span>Conversions</span>{jobs.some(job => job.status === 'working') && <span className="conversion-pulse" title="Conversions in progress" />}</div>
+    <div className="conversion-job-list">
+      {jobs.length === 0 ? <p>No conversions yet.</p> : jobs.map(job => <div className={`conversion-job ${job.status}`} key={job.key} title={job.fileName}>
+        <span className="conversion-status" aria-label={job.status} />
+        <div><strong>{job.fileName}</strong><small>{job.status === 'working' ? 'Converting…' : job.status === 'ready' ? 'Compatible stream ready' : 'Conversion failed'}</small></div>
+      </div>)}
+    </div>
+  </div>
+}
+
 type BrowserColumn = { directoryId: string; page?: EntryPage; label: string }
-function ColumnBrowser({ root, path, pages, filter, selected, primary, columnWidth, setColumnWidth, navigate, selectItems, selectParent, activate, moveEntries, deleteEntry, showFolderMenu, setError }: {
+function ColumnBrowser({ root, path, pages, filter, selected, primary, columnWidth, setColumnWidth, navigate, selectItems, selectParent, activate, renameEntry, moveEntries, deleteEntry, showFolderMenu, setError }: {
   root: EntryPage; path: Entry[]; pages: Record<string, EntryPage>; filter: string; selected: Set<string>; primary: Entry | null
   columnWidth: number; setColumnWidth: (width: number) => void
   navigate: (entry: Entry, columnIndex: number) => Promise<void>; selectItems: (ids: Set<string>, primary: Entry | null, columnIndex: number, directoryId: string) => void
-  selectParent: (columnIndex: number) => void; activate: (entry: Entry) => void; moveEntries: (ids: string[], destinationId: string) => Promise<void>
+  selectParent: (columnIndex: number) => void; activate: (entry: Entry) => void; renameEntry: (entry: Entry) => Promise<void>; moveEntries: (ids: string[], destinationId: string) => Promise<void>
   deleteEntry: (entry: Entry) => Promise<void>; showFolderMenu: (event: React.MouseEvent, directoryId: string, path: string) => void; setError: (message: string) => void
 }) {
   const columns: BrowserColumn[] = [{ directoryId: '', page: root, label: 'fs-root' }, ...path.map(entry => ({ directoryId: entry.id, page: pages[entry.id], label: entry.name }))]
@@ -367,7 +388,7 @@ function ColumnBrowser({ root, path, pages, filter, selected, primary, columnWid
         <div className="column-resizer" role="separator" aria-orientation="vertical" title="Resize columns" onPointerDown={startResize} />
       </div>
     })}
-    {menu && <ContextMenu entry={menu.entry} x={menu.x} y={menu.y} close={() => setMenu(null)} open={() => menu.entry.kind === 'directory' ? void navigate(menu.entry, menu.columnIndex) : activate(menu.entry)} deleteEntry={deleteEntry} setError={setError} />}
+    {menu && <ContextMenu entry={menu.entry} x={menu.x} y={menu.y} close={() => setMenu(null)} open={() => menu.entry.kind === 'directory' ? void navigate(menu.entry, menu.columnIndex) : activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} setError={setError} />}
   </div>
 }
 
@@ -381,14 +402,36 @@ function ColumnPreview({ entries, primary }: { entries: Entry[]; primary: Entry 
       <strong title={entry.name}>{entry.name}</strong><span>{entry.kind === 'directory' ? 'Folder' : entry.mime}</span>
     </div>
     <dl className="preview-metadata"><dt>Size</dt><dd>{formatBytes(entry.size)}</dd><dt>Permissions</dt><dd><code>{entry.permissions} {entry.mode.toString(8)}</code></dd><dt>Owner</dt><dd>{entry.uid}:{entry.gid}</dd><dt>Modified</dt><dd>{formatDate(entry.modifiedAt)}</dd><dt>Created</dt><dd>{formatDate(entry.createdAt)}</dd><dt>Accessed</dt><dd>{formatDate(entry.accessedAt)}</dd></dl>
+    {entry.kind === 'file' && <ProvenanceEditor key={entry.id} entry={entry} />}
   </aside>
+}
+
+function ProvenanceEditor({ entry }: { entry: Entry }) {
+  const promptAction = usePrompt()
+  const [urls, setUrls] = useState<string[] | null>(null)
+  const [error, setError] = useState('')
+  useEffect(() => { setUrls(null); setError(''); api.provenance(entry.id).then(data => setUrls(data.urls)).catch(e => setError(messageOf(e))) }, [entry.id])
+  const add = async () => {
+    const url = await promptAction({ title: 'Add provenance URL', label: 'Source URL', submitLabel: 'Add', placeholder: 'https://example.com/source' })
+    if (!url || !urls) return
+    try { setUrls((await api.setProvenance(entry.id, [...urls, url])).urls); setError('') } catch (e) { setError(messageOf(e)) }
+  }
+  const remove = async (url: string) => {
+    if (!urls) return
+    try { setUrls((await api.setProvenance(entry.id, urls.filter(value => value !== url))).urls); setError('') } catch (e) { setError(messageOf(e)) }
+  }
+  return <section className="provenance-panel" aria-label="File provenance">
+    <div className="provenance-heading"><span><Link2 /> Provenance</span><button className="compact" onClick={() => void add()} disabled={!urls}><Plus /> Add URL</button></div>
+    {error && <div className="provenance-error">{error}</div>}
+    {urls === null && !error ? <span className="spinner" /> : urls?.length === 0 ? <p>No source URLs recorded.</p> : <ul>{urls?.map(url => <li key={url}><a href={url} target="_blank" rel="noreferrer" title={url}>{url}<ExternalLink /></a><button className="icon-button" title="Remove URL" aria-label={`Remove ${url}`} onClick={() => void remove(url)}><X /></button></li>)}</ul>}
+  </section>
 }
 
 type Row = { entry: Entry; depth: number }
 
-function FileList({ rows, view, selected, setSelected, setPrimary, activate, moveEntries, deleteEntry, setError }: {
+function FileList({ rows, view, selected, setSelected, setPrimary, activate, renameEntry, moveEntries, deleteEntry, setError }: {
   rows: Row[]; view: ViewMode; selected: Set<string>; setSelected: (value: Set<string>) => void; setPrimary: (entry: Entry | null) => void
-  activate: (entry: Entry) => void
+  activate: (entry: Entry) => void; renameEntry: (entry: Entry) => Promise<void>
   moveEntries: (ids: string[], destinationId: string) => Promise<void>
   deleteEntry: (entry: Entry) => Promise<void>; setError: (message: string) => void
 }) {
@@ -444,7 +487,7 @@ function FileList({ rows, view, selected, setSelected, setPrimary, activate, mov
       void moveEntries(ids, entry.id)
     },
   })
-  const contextMenu = menu && <ContextMenu {...menu} close={() => setMenu(null)} open={() => activate(menu.entry)} deleteEntry={deleteEntry} setError={setError} />
+  const contextMenu = menu && <ContextMenu {...menu} close={() => setMenu(null)} open={() => activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} setError={setError} />
   return <div className={`preview-list ${view}`}>
     {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => selectEntry(entry, index, event)} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
       <button className="card-menu" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>
@@ -456,7 +499,7 @@ function FileList({ rows, view, selected, setSelected, setPrimary, activate, mov
   </div>
 }
 
-function ContextMenu({ entry, x, y, close, open, deleteEntry, setError }: { entry: Entry; x: number; y: number; close: () => void; open: () => void; deleteEntry: (entry: Entry) => Promise<void>; setError: (message: string) => void }) {
+function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, setError }: { entry: Entry; x: number; y: number; close: () => void; open: () => void; renameEntry: (entry: Entry) => Promise<void>; deleteEntry: (entry: Entry) => Promise<void>; setError: (message: string) => void }) {
   const copyPath = async () => {
     try { await navigator.clipboard.writeText(entry.path) } catch { setError('The browser denied clipboard access.') }
     close()
@@ -465,8 +508,10 @@ function ContextMenu({ entry, x, y, close, open, deleteEntry, setError }: { entr
     close()
     try { await deleteEntry(entry) } catch (error) { setError(messageOf(error)) }
   }
+  const rename = () => { close(); void renameEntry(entry) }
   return <div className="context-menu" style={{ left: x, top: y }} role="menu" onPointerDown={event => event.stopPropagation()}>
     <button role="menuitem" autoFocus onClick={() => { close(); open() }}><FolderOpen /> Open</button>
+    <button role="menuitem" onClick={rename}><Edit3 /> Rename</button>
     <button role="menuitem" onClick={copyPath}><Copy /> Copy path</button>
     <span className="context-divider" />
     <button role="menuitem" className="danger" onClick={remove}><Trash2 /> Delete</button>

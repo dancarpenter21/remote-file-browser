@@ -25,6 +25,8 @@ export type TrashEntry = {
   kind: string
   size: number
 }
+export type Provenance = { urls: string[] }
+export type ConversionJob = { key: string; fileName: string; status: 'working' | 'ready' | 'failed'; startedAt: string }
 
 export class ApiFailure extends Error {
   constructor(public status: number, public code: string, message: string) { super(message) }
@@ -57,6 +59,8 @@ export const api = {
     return request<Entry[]>(`/fs/uploads?id=${encodeURIComponent(parentId)}&replace=${replace}`, { method: 'POST', body })
   },
   operate: (operation: 'copy' | 'move' | 'rename', sources: string[], destinationId: string, name?: string, replace = false) => request<Entry[]>('/fs/operations', { method: 'POST', body: JSON.stringify({ operation, sources, destinationId, name, replace }) }),
+  provenance: (id: string) => request<Provenance>(`/fs/provenance?id=${encodeURIComponent(id)}`),
+  setProvenance: (id: string, urls: string[]) => request<Provenance>(`/fs/provenance?id=${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify({ urls }) }),
   trash: (ids: string[]) => request<void>('/fs/trash', { method: 'POST', body: JSON.stringify({ ids }) }),
   readDocument: (id: string) => request<DocumentFile>(`/editor/document?id=${encodeURIComponent(id)}`),
   saveDocument: (document: DocumentFile) => request<DocumentFile>('/editor/document', { method: 'PUT', body: JSON.stringify({ id: document.id, content: document.content, expectedEtag: document.etag }) }),
@@ -66,6 +70,7 @@ export const api = {
   emptyTrash: () => request<void>('/trash', { method: 'DELETE' }),
   startHls: (id: string) => request<{ key: string; status: string; playlistUrl: string }>('/media/hls', { method: 'POST', body: JSON.stringify({ id }) }),
   hlsStatus: (key: string) => request<{ key: string; status: string; playlistUrl: string }>(`/media/hls/${key}/status`),
+  conversionJobs: () => request<ConversionJob[]>('/media/jobs'),
 }
 
 export const contentUrl = (id: string) => `/api/v1/fs/content?id=${encodeURIComponent(id)}`

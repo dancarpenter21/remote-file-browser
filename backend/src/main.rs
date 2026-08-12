@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::{OsStr, OsString},
     io::SeekFrom,
     os::unix::ffi::{OsStrExt, OsStringExt},
@@ -29,6 +30,7 @@ use tokio::{
     fs,
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     process::Command,
+    sync::RwLock,
 };
 use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
@@ -44,7 +46,8 @@ struct AppState {
     password_hash: Arc<String>,
     sessions: Arc<DashMap<String, Session>>,
     login_attempts: Arc<DashMap<String, Vec<SystemTime>>>,
-    media_jobs: Arc<DashMap<String, String>>,
+    media_jobs: Arc<DashMap<String, MediaJob>>,
+    provenance: Arc<RwLock<HashMap<String, Vec<String>>>>,
 }
 
 struct Config {
@@ -152,6 +155,7 @@ async fn main() {
     fs::create_dir_all(cache.join("hls"))
         .await
         .expect("create media cache");
+    let provenance = load_provenance(&cache).await;
 
     let password = read_secret().await;
     assert!(
@@ -184,6 +188,7 @@ async fn main() {
         sessions: Arc::new(DashMap::new()),
         login_attempts: Arc::new(DashMap::new()),
         media_jobs: Arc::new(DashMap::new()),
+        provenance: Arc::new(RwLock::new(provenance)),
     };
 
     spawn_cache_cleanup(state.clone());
@@ -194,6 +199,7 @@ async fn main() {
         .route("/auth/logout", post(logout))
         .route("/fs/entries", get(list_entries))
         .route("/fs/metadata", get(metadata))
+        .route("/fs/provenance", get(get_provenance).put(set_provenance))
         .route("/fs/content", get(content))
         .route("/fs/items", post(create_item))
         .route("/fs/uploads", post(upload))
@@ -206,6 +212,7 @@ async fn main() {
         .route("/previews/thumbnail", get(thumbnail))
         .route("/media/file", get(media_file))
         .route("/media/hls", post(start_hls))
+        .route("/media/jobs", get(list_media_jobs))
         .route("/media/hls/{key}/status", get(hls_status))
         .route("/media/hls/{key}/{file}", get(hls_file));
 
@@ -521,6 +528,152 @@ async fn metadata(
     require_session(&state, &jar)?;
     let path = resolve_existing(&state.config, &query.id).await?;
     Ok(Json(entry_from_path(&state.config, path).await?))
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct Provenance {
+    urls: Vec<String>,
+}
+
+async fn load_provenance(cache: &Path) -> HashMap<String, Vec<String>> {
+    match fs::read(cache.join("provenance.json")).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            error!(%error, "could not parse provenance metadata");
+            HashMap::new()
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(error) => {
+            error!(%error, "could not read provenance metadata");
+            HashMap::new()
+        }
+    }
+}
+
+async fn persist_provenance(state: &AppState) -> ApiResult<()> {
+    let bytes = {
+        let records = state.provenance.read().await;
+        serde_json::to_vec_pretty(&*records).map_err(ApiError::internal)?
+    };
+    let target = state.config.cache.join("provenance.json");
+    let temporary = state.config.cache.join(".provenance.json.tmp");
+    fs::write(&temporary, bytes).await?;
+    fs::rename(temporary, target).await?;
+    Ok(())
+}
+
+async fn get_provenance(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(query): Query<IdQuery>,
+) -> ApiResult<Json<Provenance>> {
+    require_session(&state, &jar)?;
+    let path = resolve_existing(&state.config, &query.id).await?;
+    if !fs::symlink_metadata(path).await?.is_file() {
+        return Err(ApiError::bad(
+            "not_file",
+            "Provenance can only be attached to files",
+        ));
+    }
+    let records = state.provenance.read().await;
+    Ok(Json(Provenance {
+        urls: records.get(&query.id).cloned().unwrap_or_default(),
+    }))
+}
+
+async fn set_provenance(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Query(query): Query<IdQuery>,
+    Json(input): Json<Provenance>,
+) -> ApiResult<Json<Provenance>> {
+    require_csrf(&state, &jar, &headers)?;
+    let path = resolve_existing(&state.config, &query.id).await?;
+    if !fs::symlink_metadata(path).await?.is_file() {
+        return Err(ApiError::bad(
+            "not_file",
+            "Provenance can only be attached to files",
+        ));
+    }
+    if input.urls.len() > 50 {
+        return Err(ApiError::bad(
+            "too_many_urls",
+            "A file can have at most 50 provenance URLs",
+        ));
+    }
+    let mut urls = Vec::with_capacity(input.urls.len());
+    for value in input.urls {
+        let value = value.trim().to_string();
+        let uri: http::Uri = value
+            .parse()
+            .map_err(|_| ApiError::bad("invalid_url", "Enter a valid HTTP or HTTPS URL"))?;
+        if !matches!(uri.scheme_str(), Some("http" | "https"))
+            || uri.authority().is_none()
+            || value.len() > 2048
+        {
+            return Err(ApiError::bad(
+                "invalid_url",
+                "Enter a valid HTTP or HTTPS URL",
+            ));
+        }
+        if !urls.contains(&value) {
+            urls.push(value);
+        }
+    }
+    {
+        let mut records = state.provenance.write().await;
+        if urls.is_empty() {
+            records.remove(&query.id);
+        } else {
+            records.insert(query.id, urls.clone());
+        }
+    }
+    persist_provenance(&state).await?;
+    Ok(Json(Provenance { urls }))
+}
+
+async fn remap_provenance(
+    state: &AppState,
+    source: &Path,
+    target: &Path,
+    copy: bool,
+) -> ApiResult<()> {
+    let source_relative = source
+        .strip_prefix(&state.config.root)
+        .map_err(ApiError::internal)?;
+    let target_relative = target
+        .strip_prefix(&state.config.root)
+        .map_err(ApiError::internal)?;
+    let changes = {
+        let records = state.provenance.read().await;
+        records
+            .iter()
+            .filter_map(|(id, urls)| {
+                let path = decode_path(id).ok()?;
+                let suffix = path.strip_prefix(source_relative).ok()?;
+                let new_path = if suffix.as_os_str().is_empty() {
+                    target_relative.to_path_buf()
+                } else {
+                    target_relative.join(suffix)
+                };
+                Some((id.clone(), encode_path(new_path.as_os_str()), urls.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
+    if changes.is_empty() {
+        return Ok(());
+    }
+    {
+        let mut records = state.provenance.write().await;
+        for (old, new, urls) in changes {
+            if !copy {
+                records.remove(&old);
+            }
+            records.insert(new, urls);
+        }
+    }
+    persist_provenance(state).await
 }
 
 async fn entry_from_path(config: &Config, path: PathBuf) -> ApiResult<Entry> {
@@ -963,8 +1116,12 @@ async fn operation(
                     copy_recursively(&source, &target).await?;
                     remove_recursively(&source).await?;
                 }
+                remap_provenance(&state, &source, &target, false).await?;
             }
-            "copy" => copy_recursively(&source, &target).await?,
+            "copy" => {
+                copy_recursively(&source, &target).await?;
+                remap_provenance(&state, &source, &target, true).await?;
+            }
             _ => {
                 return Err(ApiError::bad(
                     "invalid_operation",
@@ -1412,6 +1569,30 @@ struct HlsResponse {
     playlist_url: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaJob {
+    key: String,
+    file_name: String,
+    status: String,
+    started_at: DateTime<Utc>,
+}
+
+async fn list_media_jobs(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> ApiResult<Json<Vec<MediaJob>>> {
+    require_session(&state, &jar)?;
+    let mut jobs = state
+        .media_jobs
+        .iter()
+        .map(|job| job.value().clone())
+        .collect::<Vec<_>>();
+    jobs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    jobs.truncate(20);
+    Ok(Json(jobs))
+}
+
 async fn start_hls(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1436,7 +1617,21 @@ async fn start_hls(
     let key = blake3::hash(fingerprint.as_bytes()).to_hex().to_string();
     let directory = state.config.cache.join("hls").join(&key);
     let playlist = directory.join("index.m3u8");
+    let file_name = source
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("video"))
+        .to_string_lossy()
+        .into_owned();
     if fs::metadata(&playlist).await.is_ok() {
+        state.media_jobs.insert(
+            key.clone(),
+            MediaJob {
+                key: key.clone(),
+                file_name,
+                status: "ready".into(),
+                started_at: Utc::now(),
+            },
+        );
         return Ok((
             StatusCode::OK,
             Json(HlsResponse {
@@ -1448,7 +1643,15 @@ async fn start_hls(
     }
     if state.media_jobs.get(&key).is_none() {
         fs::create_dir_all(&directory).await?;
-        state.media_jobs.insert(key.clone(), "working".into());
+        state.media_jobs.insert(
+            key.clone(),
+            MediaJob {
+                key: key.clone(),
+                file_name,
+                status: "working".into(),
+                started_at: Utc::now(),
+            },
+        );
         let jobs = state.media_jobs.clone();
         let job_key = key.clone();
         tokio::spawn(async move {
@@ -1485,14 +1688,13 @@ async fn start_hls(
                 .arg(&playlist)
                 .status()
                 .await;
-            jobs.insert(
-                job_key,
-                if status.map(|s| s.success()).unwrap_or(false) {
+            if let Some(mut job) = jobs.get_mut(&job_key) {
+                job.status = if status.map(|s| s.success()).unwrap_or(false) {
                     "ready".into()
                 } else {
                     "failed".into()
-                },
-            );
+                };
+            }
         });
     }
     Ok((
@@ -1523,7 +1725,7 @@ async fn hls_status(
         state
             .media_jobs
             .get(&key)
-            .map(|v| v.value().clone())
+            .map(|v| v.value().status.clone())
             .unwrap_or_else(|| "missing".into())
     };
     Ok(Json(HlsResponse {
@@ -1573,6 +1775,11 @@ async fn cleanup_cache(config: &Config) -> ApiResult<()> {
         fn walk(path: &Path, out: &mut Vec<(PathBuf, u64, SystemTime)>) {
             if let Ok(read) = std::fs::read_dir(path) {
                 for item in read.flatten() {
+                    if item.path().file_name() == Some(OsStr::new("provenance.json"))
+                        || item.path().file_name() == Some(OsStr::new(".provenance.json.tmp"))
+                    {
+                        continue;
+                    }
                     if let Ok(meta) = item.metadata() {
                         if meta.is_dir() {
                             walk(&item.path(), out);
