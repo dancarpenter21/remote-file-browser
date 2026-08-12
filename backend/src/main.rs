@@ -1054,6 +1054,8 @@ struct OperationRequest {
     name: Option<String>,
     #[serde(default)]
     replace: bool,
+    #[serde(default)]
+    merge: bool,
 }
 
 async fn operation(
@@ -1098,10 +1100,23 @@ async fn operation(
                 "A directory cannot be copied or moved inside itself",
             ));
         }
-        if fs::symlink_metadata(&target).await.is_ok() {
+        let target_meta = fs::symlink_metadata(&target).await.ok();
+        let merge_directories = input.merge
+            && input.operation == "move"
+            && source.is_dir()
+            && target_meta.as_ref().is_some_and(|meta| meta.is_dir());
+        if target_meta.is_some() && !merge_directories {
             if !input.replace {
+                let code = if input.operation == "move"
+                    && source.is_dir()
+                    && target_meta.as_ref().is_some_and(|meta| meta.is_dir())
+                {
+                    "folder_merge_conflict"
+                } else {
+                    "already_exists"
+                };
                 return Err(ApiError::conflict(
-                    "already_exists",
+                    code,
                     format!(
                         "{} already exists",
                         target.file_name().unwrap().to_string_lossy()
@@ -1112,11 +1127,15 @@ async fn operation(
         }
         match input.operation.as_str() {
             "move" | "rename" => {
-                if fs::rename(&source, &target).await.is_err() {
+                if merge_directories {
+                    merge_directory_trees(&state, &source, &target).await?;
+                } else if fs::rename(&source, &target).await.is_err() {
                     copy_recursively(&source, &target).await?;
                     remove_recursively(&source).await?;
                 }
-                remap_provenance(&state, &source, &target, false).await?;
+                if !merge_directories {
+                    remap_provenance(&state, &source, &target, false).await?;
+                }
             }
             "copy" => {
                 copy_recursively(&source, &target).await?;
@@ -1132,6 +1151,51 @@ async fn operation(
         results.push(entry_from_path(&state.config, target).await?);
     }
     Ok(Json(results))
+}
+
+async fn merge_directory_trees(state: &AppState, source: &Path, target: &Path) -> ApiResult<()> {
+    enum MergeTask {
+        Merge(PathBuf, PathBuf),
+        Remove(PathBuf),
+    }
+    let mut tasks = vec![MergeTask::Merge(source.to_path_buf(), target.to_path_buf())];
+    while let Some(task) = tasks.pop() {
+        match task {
+            MergeTask::Remove(path) => fs::remove_dir(&path).await?,
+            MergeTask::Merge(source_dir, target_dir) => {
+                tasks.push(MergeTask::Remove(source_dir.clone()));
+                let mut reader = fs::read_dir(&source_dir).await?;
+                while let Some(item) = reader.next_entry().await? {
+                    let source_item = item.path();
+                    let target_item = target_dir.join(item.file_name());
+                    match fs::symlink_metadata(&target_item).await {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            if fs::rename(&source_item, &target_item).await.is_err() {
+                                copy_recursively(&source_item, &target_item).await?;
+                                remove_recursively(&source_item).await?;
+                            }
+                            remap_provenance(state, &source_item, &target_item, false).await?;
+                        }
+                        Ok(target_meta) => {
+                            let source_meta = fs::symlink_metadata(&source_item).await?;
+                            if source_meta.is_dir() && target_meta.is_dir() {
+                                tasks.push(MergeTask::Merge(source_item, target_item));
+                            } else {
+                                move_to_trash(&state.config, &target_item).await?;
+                                if fs::rename(&source_item, &target_item).await.is_err() {
+                                    copy_recursively(&source_item, &target_item).await?;
+                                    remove_recursively(&source_item).await?;
+                                }
+                                remap_provenance(state, &source_item, &target_item, false).await?;
+                            }
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn copy_recursively(source: &Path, target: &Path) -> ApiResult<()> {

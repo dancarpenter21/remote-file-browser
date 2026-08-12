@@ -11,12 +11,16 @@ import {
   ExternalLink, Link2, Move, Plus, RefreshCw, RotateCw, Save, Search, Trash2, Upload, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import { api, ApiFailure, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, mediaUrl, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
+import { updateFinderPathForSelection } from './finderPath'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type Clipboard = { operation: 'copy' | 'move'; ids: string[] } | null
 type ConfirmOptions = { title?: string; confirmLabel?: string; danger?: boolean }
 type ConfirmRequest = ConfirmOptions & { message: string; resolve: (answer: boolean) => void }
 const ConfirmContext = createContext<(message: string, options?: ConfirmOptions) => Promise<boolean>>(async () => false)
+type MergeChoice = 'cancel' | 'replace' | 'merge'
+type MergeRequest = { message: string; resolve: (choice: MergeChoice) => void }
+const MergeContext = createContext<(message: string) => Promise<MergeChoice>>(async () => 'cancel')
 type PromptOptions = { title: string; label?: string; initialValue?: string; submitLabel?: string; placeholder?: string }
 type PromptRequest = PromptOptions & { resolve: (answer: string | null) => void }
 const PromptContext = createContext<(options: PromptOptions) => Promise<string | null>>(async () => null)
@@ -33,6 +37,19 @@ function ConfirmProvider({ children }: { children: React.ReactNode }) {
   return <ConfirmContext.Provider value={confirmAction}>{children}{request && <div className="modal-backdrop" role="presentation" onPointerDown={() => answer(false)}><section className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message" onPointerDown={event => event.stopPropagation()}><div className={`confirm-mark ${request.danger ? 'danger' : ''}`}>{request.danger ? <Trash2 /> : <FolderOpen />}</div><h2 id="confirm-title">{request.title ?? 'Confirm action'}</h2><p id="confirm-message">{request.message}</p><div className="confirm-actions"><button autoFocus onClick={() => answer(false)}>Cancel</button><button className={request.danger ? 'danger-confirm' : 'primary'} onClick={() => answer(true)}>{request.confirmLabel ?? 'Continue'}</button></div></section></div>}</ConfirmContext.Provider>
 }
 function useConfirm() { return useContext(ConfirmContext) }
+
+function MergeProvider({ children }: { children: React.ReactNode }) {
+  const [request, setRequest] = useState<MergeRequest | null>(null)
+  const chooseMerge = useCallback((message: string) => new Promise<MergeChoice>(resolve => setRequest({ message, resolve })), [])
+  const answer = (choice: MergeChoice) => { request?.resolve(choice); setRequest(null) }
+  useEffect(() => {
+    if (!request) return
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') answer('cancel') }
+    addEventListener('keydown', escape); return () => removeEventListener('keydown', escape)
+  }, [request])
+  return <MergeContext.Provider value={chooseMerge}>{children}{request && <div className="modal-backdrop" role="presentation" onPointerDown={() => answer('cancel')}><section className="confirm-dialog merge-dialog" role="alertdialog" aria-modal="true" aria-labelledby="merge-title" aria-describedby="merge-message" onPointerDown={event => event.stopPropagation()}><div className="confirm-mark danger"><FolderOpen /></div><h2 id="merge-title">Folder already exists</h2><p id="merge-message">{request.message}</p><p className="merge-detail">Replace moves the entire destination folder to Trash. Merge combines both trees, but nested same-name files are replaced and moved to Trash.</p><div className="confirm-actions merge-actions"><button autoFocus onClick={() => answer('cancel')}>Cancel</button><button className="danger-confirm" onClick={() => answer('replace')}>Destructively replace</button><button className="primary" onClick={() => answer('merge')}>Merge</button></div></section></div>}</MergeContext.Provider>
+}
+function useMergeChoice() { return useContext(MergeContext) }
 
 function PromptProvider({ children }: { children: React.ReactNode }) {
   const [request, setRequest] = useState<PromptRequest | null>(null)
@@ -54,7 +71,7 @@ export default function App() {
   useEffect(() => { api.session().then(s => { setCsrf(s.csrfToken); setSession(s) }) }, [])
   if (!session) return <div className="center"><span className="spinner" /></div>
   if (!session.authenticated) return <Login onLogin={s => { setCsrf(s.csrfToken); setSession(s) }} />
-  return <ConfirmProvider><PromptProvider><FileManager session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false }) }} /></PromptProvider></ConfirmProvider>
+  return <ConfirmProvider><MergeProvider><PromptProvider><FileManager session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false }) }} /></PromptProvider></MergeProvider></ConfirmProvider>
 }
 
 function Login({ onLogin }: { onLogin: (session: Session) => void }) {
@@ -80,6 +97,7 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
 
 function FileManager({ session, onLogout }: { session: Session; onLogout: () => void }) {
   const confirmAction = useConfirm()
+  const chooseMerge = useMergeChoice()
   const promptAction = usePrompt()
   const [root, setRoot] = useState<EntryPage | null>(null)
   const [expanded, setExpanded] = useState<Record<string, EntryPage>>({})
@@ -133,9 +151,9 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       catch (e) { setError(messageOf(e)) }
     }
   }
-  const selectColumnItems = (ids: Set<string>, entry: Entry | null, columnIndex: number, directoryId: string) => {
+  const selectColumnItems = (ids: Set<string>, entry: Entry | null, columnIndex: number, directoryId: string, preserveCurrentBranch = false) => {
     setSelected(ids); setPrimary(entry); setCurrentDir(directoryId)
-    setColumnPath(previous => previous.slice(0, columnIndex))
+    setColumnPath(previous => updateFinderPathForSelection(previous, ids, columnIndex, preserveCurrentBranch))
   }
   const selectParentColumn = (columnIndex: number) => {
     const parent = columnPath[columnIndex - 1]
@@ -195,9 +213,22 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   }
   const deleteSelected = () => deleteItems(Array.from(selected))
   const deleteEntry = (entry: Entry) => deleteItems(selected.has(entry.id) ? Array.from(selected) : [entry.id])
-  const paste = () => {
+  const paste = async () => {
     if (!clipboard) return
-    mutate(async () => { await api.operate(clipboard.operation, clipboard.ids, currentDir); if (clipboard.operation === 'move') setClipboard(null) }, currentDir, async () => { await api.operate(clipboard.operation, clipboard.ids, currentDir, undefined, true); if (clipboard.operation === 'move') setClipboard(null) })
+    setError('')
+    try {
+      await api.operate(clipboard.operation, clipboard.ids, currentDir)
+    } catch (e) {
+      if (clipboard.operation === 'move' && e instanceof ApiFailure && e.code === 'folder_merge_conflict') {
+        const choice = await chooseMerge(e.message)
+        if (choice === 'cancel') return
+        try { await api.operate('move', clipboard.ids, currentDir, undefined, choice === 'replace', choice === 'merge') } catch (retryError) { setError(messageOf(retryError)); return }
+      } else if (e instanceof ApiFailure && e.code === 'already_exists' && await confirmAction(`${e.message}. Replace it and move the old item to Trash?`, { title: 'Replace existing item?', confirmLabel: 'Replace', danger: true })) {
+        try { await api.operate(clipboard.operation, clipboard.ids, currentDir, undefined, true) } catch (retryError) { setError(messageOf(retryError)); return }
+      } else { setError(messageOf(e)); return }
+    }
+    if (clipboard.operation === 'move') setClipboard(null)
+    await refresh(currentDir)
   }
   const moveByDrag = async (ids: string[], destinationId: string) => {
     const movableIds = ids.filter(id => findEntry(id, root, expanded)?.parentId !== destinationId)
@@ -208,16 +239,22 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       return source?.kind === 'directory' && destination.path.startsWith(`${source.path}/`)
     })) { setError('A directory cannot be moved inside itself.'); return }
     const sourceParents = new Set(movableIds.map(id => findEntry(id, root, expanded)?.parentId ?? ''))
-    const perform = (replace = false) => api.operate('move', movableIds, destinationId, undefined, replace)
+    const perform = (replace = false, merge = false) => api.operate('move', movableIds, destinationId, undefined, replace, merge)
     setError('')
     try {
       await perform()
     } catch (e) {
-      if (!(e instanceof ApiFailure) || e.code !== 'already_exists' ||
-          !await confirmAction(`${e.message}. Replace it and move the old item to Trash?`, { title: 'Replace existing item?', confirmLabel: 'Replace', danger: true })) {
-        setError(messageOf(e)); return
+      if (e instanceof ApiFailure && e.code === 'folder_merge_conflict') {
+        const choice = await chooseMerge(e.message)
+        if (choice === 'cancel') return
+        try { await perform(choice === 'replace', choice === 'merge') } catch (retryError) { setError(messageOf(retryError)); return }
+      } else {
+        if (!(e instanceof ApiFailure) || e.code !== 'already_exists' ||
+            !await confirmAction(`${e.message}. Replace it and move the old item to Trash?`, { title: 'Replace existing item?', confirmLabel: 'Replace', danger: true })) {
+          setError(messageOf(e)); return
+        }
+        try { await perform(true) } catch (retryError) { setError(messageOf(retryError)); return }
       }
-      try { await perform(true) } catch (retryError) { setError(messageOf(retryError)); return }
     }
     const pathIndex = columnPath.findIndex(entry => movableIds.includes(entry.id))
     if (pathIndex >= 0) { setColumnPath(previous => previous.slice(0, pathIndex)); setCurrentDir(columnPath[pathIndex]?.parentId ?? '') }
@@ -302,7 +339,7 @@ type BrowserColumn = { directoryId: string; page?: EntryPage; label: string }
 function ColumnBrowser({ root, path, pages, filter, selected, primary, columnWidth, setColumnWidth, navigate, selectItems, selectParent, activate, renameEntry, moveEntries, deleteEntry, showFolderMenu, setError }: {
   root: EntryPage; path: Entry[]; pages: Record<string, EntryPage>; filter: string; selected: Set<string>; primary: Entry | null
   columnWidth: number; setColumnWidth: (width: number) => void
-  navigate: (entry: Entry, columnIndex: number) => Promise<void>; selectItems: (ids: Set<string>, primary: Entry | null, columnIndex: number, directoryId: string) => void
+  navigate: (entry: Entry, columnIndex: number) => Promise<void>; selectItems: (ids: Set<string>, primary: Entry | null, columnIndex: number, directoryId: string, preserveCurrentBranch?: boolean) => void
   selectParent: (columnIndex: number) => void; activate: (entry: Entry) => void; renameEntry: (entry: Entry) => Promise<void>; moveEntries: (ids: string[], destinationId: string) => Promise<void>
   deleteEntry: (entry: Entry) => Promise<void>; showFolderMenu: (event: React.MouseEvent, directoryId: string, path: string) => void; setError: (message: string) => void
 }) {
@@ -326,23 +363,23 @@ function ColumnBrowser({ root, path, pages, filter, selected, primary, columnWid
     return () => { removeEventListener('pointerdown', close); removeEventListener('keydown', escape) }
   }, [menu])
   const visibleEntries = (column: BrowserColumn) => (column.page?.entries ?? []).filter(entry => entry.name.toLowerCase().includes(filter.toLowerCase()))
-  const choose = (entry: Entry, columnIndex: number, entryIndex: number, event?: Pick<React.MouseEvent, 'metaKey' | 'ctrlKey' | 'shiftKey'>) => {
+  const choose = (entry: Entry, columnIndex: number, entryIndex: number, event?: Pick<React.MouseEvent, 'metaKey' | 'ctrlKey' | 'shiftKey'>, preserveCurrentBranch = false) => {
     const entries = visibleEntries(columns[columnIndex])
     setActiveColumn(columnIndex)
     if (event?.shiftKey && anchor.current?.column === columnIndex) {
       const start = Math.min(anchor.current.index, entryIndex), end = Math.max(anchor.current.index, entryIndex)
-      selectItems(new Set(entries.slice(start, end + 1).map(item => item.id)), entry, columnIndex, columns[columnIndex].directoryId)
+      selectItems(new Set(entries.slice(start, end + 1).map(item => item.id)), entry, columnIndex, columns[columnIndex].directoryId, preserveCurrentBranch)
       return
     }
     if (event?.metaKey || event?.ctrlKey) {
       const next = activeColumn === columnIndex ? new Set(selected) : new Set<string>()
       next.has(entry.id) ? next.delete(entry.id) : next.add(entry.id)
       anchor.current = { column: columnIndex, index: entryIndex }
-      selectItems(next, next.has(entry.id) ? entry : null, columnIndex, columns[columnIndex].directoryId)
+      selectItems(next, next.has(entry.id) ? entry : null, columnIndex, columns[columnIndex].directoryId, preserveCurrentBranch)
       return
     }
     anchor.current = { column: columnIndex, index: entryIndex }
-    selectItems(new Set([entry.id]), entry, columnIndex, columns[columnIndex].directoryId)
+    selectItems(new Set([entry.id]), entry, columnIndex, columns[columnIndex].directoryId, preserveCurrentBranch)
   }
   const keyboard = (event: React.KeyboardEvent, columnIndex: number) => {
     const entries = visibleEntries(columns[columnIndex])
@@ -382,7 +419,7 @@ function ColumnBrowser({ root, path, pages, filter, selected, primary, columnWid
     {columns.map((column, columnIndex) => {
       const entries = visibleEntries(column), targetKey = column.directoryId || '__root__'
       return <div className={`finder-column ${activeColumn === columnIndex ? 'active' : ''} ${dropTarget === targetKey ? 'drop-target' : ''}`} key={column.directoryId || '__root__'} ref={node => { columnRefs.current[columnIndex] = node }} tabIndex={0} role="listbox" aria-label={column.label} aria-multiselectable="true" onFocus={() => setActiveColumn(columnIndex)} onKeyDown={event => keyboard(event, columnIndex)} onContextMenu={event => showFolderMenu(event, column.directoryId, columnIndex === 0 ? '/fs-root' : path[columnIndex - 1].path)} onDragOver={event => acceptDrop(event, column.directoryId)} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null) }} onDrop={event => drop(event, column.directoryId)}>
-        {!column.page ? <div className="column-state"><span className="spinner" /></div> : entries.length === 0 ? <div className="column-state">{filter ? 'No matches' : 'Empty folder'}</div> : entries.map((entry, entryIndex) => <div className={`column-row ${selected.has(entry.id) ? 'selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} key={entry.id} role="option" aria-selected={selected.has(entry.id)} draggable onDragStart={event => startDrag(event, entry, columnIndex)} onDragEnd={() => { draggedIds.current = []; setDropTarget(null) }} onClick={event => choose(entry, columnIndex, entryIndex, event)} onDoubleClick={() => entry.kind === 'directory' ? void navigate(entry, columnIndex) : activate(entry)} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ entry, columnIndex, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 140) }) }} onDragOver={event => { if (entry.kind === 'directory') acceptDrop(event, entry.id) }} onDrop={event => { if (entry.kind === 'directory') drop(event, entry.id) }}>
+        {!column.page ? <div className="column-state"><span className="spinner" /></div> : entries.length === 0 ? <div className="column-state">{filter ? 'No matches' : 'Empty folder'}</div> : entries.map((entry, entryIndex) => <div className={`column-row ${selected.has(entry.id) ? 'selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} key={entry.id} role="option" aria-selected={selected.has(entry.id)} draggable onDragStart={event => startDrag(event, entry, columnIndex)} onDragEnd={() => { draggedIds.current = []; setDropTarget(null) }} onClick={event => choose(entry, columnIndex, entryIndex, event, true)} onDoubleClick={() => entry.kind === 'directory' ? void navigate(entry, columnIndex) : activate(entry)} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ entry, columnIndex, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 180) }) }} onDragOver={event => { if (entry.kind === 'directory') acceptDrop(event, entry.id) }} onDrop={event => { if (entry.kind === 'directory') drop(event, entry.id) }}>
           <FileGlyph entry={entry} /><span title={entry.name}>{entry.name}</span>{entry.kind === 'directory' && <ChevronRight className="column-arrow" />}
         </div>)}
         <div className="column-resizer" role="separator" aria-orientation="vertical" title="Resize columns" onPointerDown={startResize} />
@@ -410,7 +447,13 @@ function ProvenanceEditor({ entry }: { entry: Entry }) {
   const promptAction = usePrompt()
   const [urls, setUrls] = useState<string[] | null>(null)
   const [error, setError] = useState('')
-  useEffect(() => { setUrls(null); setError(''); api.provenance(entry.id).then(data => setUrls(data.urls)).catch(e => setError(messageOf(e))) }, [entry.id])
+  useEffect(() => {
+    const load = () => api.provenance(entry.id).then(data => setUrls(data.urls)).catch(e => setError(messageOf(e)))
+    setUrls(null); setError(''); void load()
+    const changed = (event: Event) => { if ((event as CustomEvent<string>).detail === entry.id) void load() }
+    addEventListener('rfb:provenance-changed', changed)
+    return () => removeEventListener('rfb:provenance-changed', changed)
+  }, [entry.id])
   const add = async () => {
     const url = await promptAction({ title: 'Add provenance URL', label: 'Source URL', submitLabel: 'Add', placeholder: 'https://example.com/source' })
     if (!url || !urls) return
@@ -448,7 +491,7 @@ function FileList({ rows, view, selected, setSelected, setPrimary, activate, ren
   }, [menu])
   const showMenu = (event: React.MouseEvent, entry: Entry) => {
     event.preventDefault(); event.stopPropagation()
-    setMenu({ entry, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 140) })
+    setMenu({ entry, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 180) })
   }
   const selectEntry = (entry: Entry, index: number, event: React.MouseEvent) => {
     if (event.shiftKey && anchor.current !== null) {
@@ -500,6 +543,7 @@ function FileList({ rows, view, selected, setSelected, setPrimary, activate, ren
 }
 
 function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, setError }: { entry: Entry; x: number; y: number; close: () => void; open: () => void; renameEntry: (entry: Entry) => Promise<void>; deleteEntry: (entry: Entry) => Promise<void>; setError: (message: string) => void }) {
+  const promptAction = usePrompt()
   const copyPath = async () => {
     try { await navigator.clipboard.writeText(entry.path) } catch { setError('The browser denied clipboard access.') }
     close()
@@ -509,11 +553,22 @@ function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, setEr
     try { await deleteEntry(entry) } catch (error) { setError(messageOf(error)) }
   }
   const rename = () => { close(); void renameEntry(entry) }
+  const addProvenance = async () => {
+    close()
+    const url = await promptAction({ title: 'Add provenance URL', label: 'Source URL', submitLabel: 'Add', placeholder: 'https://example.com/source' })
+    if (!url) return
+    try {
+      const current = await api.provenance(entry.id)
+      await api.setProvenance(entry.id, [...current.urls, url])
+      dispatchEvent(new CustomEvent('rfb:provenance-changed', { detail: entry.id }))
+    } catch (error) { setError(messageOf(error)) }
+  }
   return <div className="context-menu" style={{ left: x, top: y }} role="menu" onPointerDown={event => event.stopPropagation()}>
     <button role="menuitem" autoFocus onClick={() => { close(); open() }}><FolderOpen /> Open</button>
     <button role="menuitem" onClick={rename}><Edit3 /> Rename</button>
     <button role="menuitem" onClick={copyPath}><Copy /> Copy path</button>
     <span className="context-divider" />
+    {entry.kind === 'file' && <button role="menuitem" onClick={() => void addProvenance()}><Link2 /> Add provenance URL</button>}
     <button role="menuitem" className="danger" onClick={remove}><Trash2 /> Delete</button>
   </div>
 }
@@ -585,7 +640,7 @@ function VideoPlayer({ entry, autoPlay = true }: { entry: Entry; autoPlay?: bool
       setMessage('')
     } catch (e) { setMessage(messageOf(e)) }
   }
-  return <div className="video-stage"><video ref={videoRef} src={mediaUrl(entry.id)} controls autoPlay={autoPlay} preload={autoPlay ? 'auto' : 'metadata'} onError={fallback} />{message && <div className="video-message">{message}</div>}</div>
+  return <div className="video-stage"><video ref={videoRef} src={mediaUrl(entry.id)} controls muted autoPlay={autoPlay} preload={autoPlay ? 'auto' : 'metadata'} onError={fallback} />{message && <div className="video-message">{message}</div>}</div>
 }
 
 function TrashWindow({ items, onClose, onChanged, onRestored, setError }: { items: TrashEntry[]; onClose: () => void; onChanged: () => Promise<void>; onRestored: (entry: Entry) => Promise<void>; setError: (s: string) => void }) {
