@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import CodeMirror from '@uiw/react-codemirror'
 import { markdown } from '@codemirror/lang-markdown'
 import ReactMarkdown from 'react-markdown'
@@ -14,13 +14,47 @@ import { api, ApiFailure, contentUrl, DocumentFile, Entry, EntryPage, mediaUrl, 
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type Clipboard = { operation: 'copy' | 'move'; ids: string[] } | null
+type ConfirmOptions = { title?: string; confirmLabel?: string; danger?: boolean }
+type ConfirmRequest = ConfirmOptions & { message: string; resolve: (answer: boolean) => void }
+const ConfirmContext = createContext<(message: string, options?: ConfirmOptions) => Promise<boolean>>(async () => false)
+type PromptOptions = { title: string; label?: string; initialValue?: string; submitLabel?: string; placeholder?: string }
+type PromptRequest = PromptOptions & { resolve: (answer: string | null) => void }
+const PromptContext = createContext<(options: PromptOptions) => Promise<string | null>>(async () => null)
+
+function ConfirmProvider({ children }: { children: React.ReactNode }) {
+  const [request, setRequest] = useState<ConfirmRequest | null>(null)
+  const confirmAction = useCallback((message: string, options: ConfirmOptions = {}) => new Promise<boolean>(resolve => setRequest({ message, resolve, ...options })), [])
+  const answer = (value: boolean) => { request?.resolve(value); setRequest(null) }
+  useEffect(() => {
+    if (!request) return
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') answer(false) }
+    addEventListener('keydown', escape); return () => removeEventListener('keydown', escape)
+  }, [request])
+  return <ConfirmContext.Provider value={confirmAction}>{children}{request && <div className="modal-backdrop" role="presentation" onPointerDown={() => answer(false)}><section className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message" onPointerDown={event => event.stopPropagation()}><div className={`confirm-mark ${request.danger ? 'danger' : ''}`}>{request.danger ? <Trash2 /> : <FolderOpen />}</div><h2 id="confirm-title">{request.title ?? 'Confirm action'}</h2><p id="confirm-message">{request.message}</p><div className="confirm-actions"><button autoFocus onClick={() => answer(false)}>Cancel</button><button className={request.danger ? 'danger-confirm' : 'primary'} onClick={() => answer(true)}>{request.confirmLabel ?? 'Continue'}</button></div></section></div>}</ConfirmContext.Provider>
+}
+function useConfirm() { return useContext(ConfirmContext) }
+
+function PromptProvider({ children }: { children: React.ReactNode }) {
+  const [request, setRequest] = useState<PromptRequest | null>(null)
+  const [value, setValue] = useState('')
+  const promptAction = useCallback((options: PromptOptions) => new Promise<string | null>(resolve => { setValue(options.initialValue ?? ''); setRequest({ ...options, resolve }) }), [])
+  const answer = (result: string | null) => { request?.resolve(result); setRequest(null) }
+  useEffect(() => {
+    if (!request) return
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') answer(null) }
+    addEventListener('keydown', escape); return () => removeEventListener('keydown', escape)
+  }, [request])
+  const submit = (event: React.FormEvent) => { event.preventDefault(); const name = value.trim(); if (name) answer(name) }
+  return <PromptContext.Provider value={promptAction}>{children}{request && <div className="modal-backdrop" role="presentation" onPointerDown={() => answer(null)}><form className="confirm-dialog prompt-dialog" role="dialog" aria-modal="true" aria-labelledby="prompt-title" onSubmit={submit} onPointerDown={event => event.stopPropagation()}><div className="confirm-mark"><Edit3 /></div><h2 id="prompt-title">{request.title}</h2><label>{request.label ?? 'Name'}<input value={value} onChange={event => setValue(event.target.value)} onFocus={event => event.target.select()} placeholder={request.placeholder} autoFocus /></label><div className="confirm-actions"><button type="button" onClick={() => answer(null)}>Cancel</button><button className="primary" disabled={!value.trim()}>{request.submitLabel ?? 'Create'}</button></div></form></div>}</PromptContext.Provider>
+}
+function usePrompt() { return useContext(PromptContext) }
 
 export default function App() {
   const [session, setSession] = useState<Session | null>(null)
   useEffect(() => { api.session().then(s => { setCsrf(s.csrfToken); setSession(s) }) }, [])
   if (!session) return <div className="center"><span className="spinner" /></div>
   if (!session.authenticated) return <Login onLogin={s => { setCsrf(s.csrfToken); setSession(s) }} />
-  return <FileManager session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false }) }} />
+  return <ConfirmProvider><PromptProvider><FileManager session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false }) }} /></PromptProvider></ConfirmProvider>
 }
 
 function Login({ onLogin }: { onLogin: (session: Session) => void }) {
@@ -45,6 +79,8 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
 }
 
 function FileManager({ session, onLogout }: { session: Session; onLogout: () => void }) {
+  const confirmAction = useConfirm()
+  const promptAction = usePrompt()
   const [root, setRoot] = useState<EntryPage | null>(null)
   const [expanded, setExpanded] = useState<Record<string, EntryPage>>({})
   const [selected, setSelected] = useState<Set<string>>(new Set())
@@ -59,6 +95,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [viewer, setViewer] = useState<{ entry: Entry; type: 'image' | 'video' } | null>(null)
   const [trash, setTrash] = useState<TrashEntry[] | null>(null)
   const [error, setError] = useState('')
+  const [folderMenu, setFolderMenu] = useState<{ directoryId: string; path: string; x: number; y: number } | null>(null)
   const [showPreview, setShowPreview] = useState(() => localStorage.getItem('rfb-column-preview') !== 'false')
   const [columnWidth, setColumnWidth] = useState(() => Math.min(480, Math.max(180, Number(localStorage.getItem('rfb-column-width')) || 240)))
   const inputRef = useRef<HTMLInputElement>(null)
@@ -113,22 +150,25 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   }
   const mutate = async (action: () => Promise<unknown>, dir = currentDir, replace?: () => Promise<unknown>) => {
     setError(''); try { await action(); await refresh(dir) } catch (e) {
-      if (replace && e instanceof ApiFailure && e.code === 'already_exists' && confirm(`${e.message}. Replace it and move the old item to Trash?`)) { try { await replace(); await refresh(dir); return } catch (retryError) { setError(messageOf(retryError)); return } }
+      if (replace && e instanceof ApiFailure && e.code === 'already_exists' && await confirmAction(`${e.message}. Replace it and move the old item to Trash?`, { title: 'Replace existing item?', confirmLabel: 'Replace', danger: true })) { try { await replace(); await refresh(dir); return } catch (retryError) { setError(messageOf(retryError)); return } }
       setError(messageOf(e))
     }
   }
-  const createItem = (kind: 'file' | 'directory') => {
-    const name = prompt(`New ${kind} name`); if (!name) return
-    mutate(() => api.create(currentDir, name, kind), currentDir, () => api.create(currentDir, name, kind, true))
+  const createItem = async (kind: 'file' | 'directory', directoryId = currentDir) => {
+    const name = await promptAction({ title: kind === 'directory' ? 'New Folder' : 'New File', label: 'Name', submitLabel: 'Create' }); if (!name) return
+    await mutate(() => api.create(directoryId, name, kind), directoryId, () => api.create(directoryId, name, kind, true))
+  }
+  const showFolderMenu = (event: React.MouseEvent, directoryId: string, path: string) => {
+    event.preventDefault(); event.stopPropagation(); setFolderMenu({ directoryId, path, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 150) })
   }
   const rename = async () => {
     const entry = findEntry(first(selected), root, expanded); if (!entry) return
-    const name = prompt('Rename item', entry.name); if (!name || name === entry.name) return
+    const name = await promptAction({ title: 'Rename Item', label: 'Name', initialValue: entry.name, submitLabel: 'Rename' }); if (!name || name === entry.name) return
     const perform = (replace = false) => api.operate('rename', [entry.id], entry.parentId, name, replace)
     setError('')
     let renamed: Entry
     try { [renamed] = await perform() } catch (e) {
-      if (!(e instanceof ApiFailure) || e.code !== 'already_exists' || !confirm(`${e.message}. Replace it and move the old item to Trash?`)) { setError(messageOf(e)); return }
+      if (!(e instanceof ApiFailure) || e.code !== 'already_exists' || !await confirmAction(`${e.message}. Replace it and move the old item to Trash?`, { title: 'Replace existing item?', confirmLabel: 'Replace', danger: true })) { setError(messageOf(e)); return }
       try { [renamed] = await perform(true) } catch (retryError) { setError(messageOf(retryError)); return }
     }
     await refresh(entry.parentId)
@@ -142,17 +182,19 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     } else setCurrentDir(renamed.parentId)
     setSelected(new Set([renamed.id])); setPrimary(renamed)
   }
-  const deleteSelected = async () => {
-    if (!selected.size || !confirm(`Move ${selected.size} selected item${selected.size === 1 ? '' : 's'} to Trash?`)) return
-    const parents = new Set(Array.from(selected).map(id => findEntry(id, root, expanded)?.parentId ?? ''))
-    try { await api.trash(Array.from(selected)); const pathIndex = columnPath.findIndex(entry => selected.has(entry.id)); if (pathIndex >= 0) { setColumnPath(previous => previous.slice(0, pathIndex)); setCurrentDir(columnPath[pathIndex]?.parentId ?? '') } setSelected(new Set()); setPrimary(null); await Promise.all(Array.from(parents).map(refresh)) } catch (e) { setError(messageOf(e)) }
+  const deleteItems = async (ids: string[]) => {
+    if (!ids.length || !await confirmAction(`Move ${ids.length} selected item${ids.length === 1 ? '' : 's'} to Trash?`, { title: 'Delete selected items?', confirmLabel: 'Move to Trash', danger: true })) return
+    const idSet = new Set(ids)
+    const parents = new Set(ids.map(id => findEntry(id, root, expanded)?.parentId ?? ''))
+    try {
+      await api.trash(ids)
+      const pathIndex = columnPath.findIndex(entry => idSet.has(entry.id))
+      if (pathIndex >= 0) { setColumnPath(previous => previous.slice(0, pathIndex)); setCurrentDir(columnPath[pathIndex]?.parentId ?? '') }
+      setSelected(new Set()); setPrimary(null); await Promise.all(Array.from(parents).map(refresh))
+    } catch (e) { setError(messageOf(e)) }
   }
-  const deleteEntry = async (entry: Entry) => {
-    await api.trash([entry.id])
-    const pathIndex = columnPath.findIndex(item => item.id === entry.id)
-    if (pathIndex >= 0) { setColumnPath(previous => previous.slice(0, pathIndex)); setCurrentDir(entry.parentId) }
-    setSelected(new Set()); setPrimary(null); await refresh(entry.parentId)
-  }
+  const deleteSelected = () => deleteItems(Array.from(selected))
+  const deleteEntry = (entry: Entry) => deleteItems(selected.has(entry.id) ? Array.from(selected) : [entry.id])
   const paste = () => {
     if (!clipboard) return
     mutate(async () => { await api.operate(clipboard.operation, clipboard.ids, currentDir); if (clipboard.operation === 'move') setClipboard(null) }, currentDir, async () => { await api.operate(clipboard.operation, clipboard.ids, currentDir, undefined, true); if (clipboard.operation === 'move') setClipboard(null) })
@@ -172,7 +214,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       await perform()
     } catch (e) {
       if (!(e instanceof ApiFailure) || e.code !== 'already_exists' ||
-          !confirm(`${e.message}. Replace it and move the old item to Trash?`)) {
+          !await confirmAction(`${e.message}. Replace it and move the old item to Trash?`, { title: 'Replace existing item?', confirmLabel: 'Replace', danger: true })) {
         setError(messageOf(e)); return
       }
       try { await perform(true) } catch (retryError) { setError(messageOf(retryError)); return }
@@ -221,9 +263,9 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         </div>
         <div className="location"><nav className="breadcrumbs" aria-label="Current directory"><button onClick={() => { setCurrentDir(''); setSelected(new Set()); setPrimary(null); setColumnPath([]) }}>fs-root</button>{columnPath.map((entry, index) => <span key={entry.id}><ChevronRight /><button onClick={() => { setCurrentDir(entry.id); setSelected(new Set()); setPrimary(null); setColumnPath(previous => previous.slice(0, index + 1)) }}>{entry.name}</button></span>)}</nav><span>{visibleCount} visible</span></div>
         {error && <div className="banner error"><span>{error}</span><button onClick={() => setError('')}><X size={15} /></button></div>}
-        <div className="browser-body"><div className="browser-view">
+        <div className="browser-body"><div className="browser-view" onContextMenu={view === 'details' ? undefined : event => showFolderMenu(event, currentDir, columnPath.at(-1)?.path ?? '/fs-root')}>
           {!root ? <div className="center"><span className="spinner" /></div> : view === 'details' ?
-            <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} primary={primary} columnWidth={columnWidth} setColumnWidth={setColumnWidth} navigate={navigateColumn} selectItems={selectColumnItems} selectParent={selectParentColumn} activate={activate} moveEntries={moveByDrag} deleteEntry={deleteEntry} setError={setError} /> :
+            <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} primary={primary} columnWidth={columnWidth} setColumnWidth={setColumnWidth} navigate={navigateColumn} selectItems={selectColumnItems} selectParent={selectParentColumn} activate={activate} moveEntries={moveByDrag} deleteEntry={deleteEntry} showFolderMenu={showFolderMenu} setError={setError} /> :
             !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view={view} selected={selected} setSelected={setSelected} setPrimary={setPrimary} activate={activate} moveEntries={moveByDrag} deleteEntry={deleteEntry} setError={setError} />}
         </div>{showPreview && <ColumnPreview entries={previewEntries} primary={primary} />}</div>
       </main>
@@ -231,16 +273,17 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     {editor && <EditorWindow document={editor} onClose={() => setEditor(null)} onSaved={setEditor} />}
     {viewer && <ViewerWindow {...viewer} onClose={() => setViewer(null)} />}
     {trash && <TrashWindow items={trash} onClose={() => setTrash(null)} onChanged={async () => setTrash(await api.listTrash())} onRestored={entry => refresh(entry.parentId)} setError={setError} />}
+    {folderMenu && <FolderContextMenu {...folderMenu} close={() => setFolderMenu(null)} createItem={createItem} setError={setError} />}
   </div>
 }
 
 type BrowserColumn = { directoryId: string; page?: EntryPage; label: string }
-function ColumnBrowser({ root, path, pages, filter, selected, primary, columnWidth, setColumnWidth, navigate, selectItems, selectParent, activate, moveEntries, deleteEntry, setError }: {
+function ColumnBrowser({ root, path, pages, filter, selected, primary, columnWidth, setColumnWidth, navigate, selectItems, selectParent, activate, moveEntries, deleteEntry, showFolderMenu, setError }: {
   root: EntryPage; path: Entry[]; pages: Record<string, EntryPage>; filter: string; selected: Set<string>; primary: Entry | null
   columnWidth: number; setColumnWidth: (width: number) => void
   navigate: (entry: Entry, columnIndex: number) => Promise<void>; selectItems: (ids: Set<string>, primary: Entry | null, columnIndex: number, directoryId: string) => void
   selectParent: (columnIndex: number) => void; activate: (entry: Entry) => void; moveEntries: (ids: string[], destinationId: string) => Promise<void>
-  deleteEntry: (entry: Entry) => Promise<void>; setError: (message: string) => void
+  deleteEntry: (entry: Entry) => Promise<void>; showFolderMenu: (event: React.MouseEvent, directoryId: string, path: string) => void; setError: (message: string) => void
 }) {
   const columns: BrowserColumn[] = [{ directoryId: '', page: root, label: 'fs-root' }, ...path.map(entry => ({ directoryId: entry.id, page: pages[entry.id], label: entry.name }))]
   const [activeColumn, setActiveColumn] = useState(0)
@@ -317,7 +360,7 @@ function ColumnBrowser({ root, path, pages, filter, selected, primary, columnWid
   return <div className="column-browser" ref={scroller} style={{ '--column-width': `${columnWidth}px` } as React.CSSProperties}>
     {columns.map((column, columnIndex) => {
       const entries = visibleEntries(column), targetKey = column.directoryId || '__root__'
-      return <div className={`finder-column ${activeColumn === columnIndex ? 'active' : ''} ${dropTarget === targetKey ? 'drop-target' : ''}`} key={column.directoryId || '__root__'} ref={node => { columnRefs.current[columnIndex] = node }} tabIndex={0} role="listbox" aria-label={column.label} aria-multiselectable="true" onFocus={() => setActiveColumn(columnIndex)} onKeyDown={event => keyboard(event, columnIndex)} onDragOver={event => acceptDrop(event, column.directoryId)} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null) }} onDrop={event => drop(event, column.directoryId)}>
+      return <div className={`finder-column ${activeColumn === columnIndex ? 'active' : ''} ${dropTarget === targetKey ? 'drop-target' : ''}`} key={column.directoryId || '__root__'} ref={node => { columnRefs.current[columnIndex] = node }} tabIndex={0} role="listbox" aria-label={column.label} aria-multiselectable="true" onFocus={() => setActiveColumn(columnIndex)} onKeyDown={event => keyboard(event, columnIndex)} onContextMenu={event => showFolderMenu(event, column.directoryId, columnIndex === 0 ? '/fs-root' : path[columnIndex - 1].path)} onDragOver={event => acceptDrop(event, column.directoryId)} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null) }} onDrop={event => drop(event, column.directoryId)}>
         {!column.page ? <div className="column-state"><span className="spinner" /></div> : entries.length === 0 ? <div className="column-state">{filter ? 'No matches' : 'Empty folder'}</div> : entries.map((entry, entryIndex) => <div className={`column-row ${selected.has(entry.id) ? 'selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} key={entry.id} role="option" aria-selected={selected.has(entry.id)} draggable onDragStart={event => startDrag(event, entry, columnIndex)} onDragEnd={() => { draggedIds.current = []; setDropTarget(null) }} onClick={event => choose(entry, columnIndex, entryIndex, event)} onDoubleClick={() => entry.kind === 'directory' ? void navigate(entry, columnIndex) : activate(entry)} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ entry, columnIndex, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 140) }) }} onDragOver={event => { if (entry.kind === 'directory') acceptDrop(event, entry.id) }} onDrop={event => { if (entry.kind === 'directory') drop(event, entry.id) }}>
           <FileGlyph entry={entry} /><span title={entry.name}>{entry.name}</span>{entry.kind === 'directory' && <ChevronRight className="column-arrow" />}
         </div>)}
@@ -364,7 +407,6 @@ function FileList({ rows, view, selected, setSelected, setPrimary, activate, mov
     event.preventDefault(); event.stopPropagation()
     setMenu({ entry, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 140) })
   }
-  const choose = (entry: Entry, checked: boolean) => { const next = new Set(selected); checked ? next.add(entry.id) : next.delete(entry.id); setSelected(next); setPrimary(checked ? entry : null) }
   const selectEntry = (entry: Entry, index: number, event: React.MouseEvent) => {
     if (event.shiftKey && anchor.current !== null) {
       const start = Math.min(anchor.current, index), end = Math.max(anchor.current, index)
@@ -405,11 +447,10 @@ function FileList({ rows, view, selected, setSelected, setPrimary, activate, mov
   const contextMenu = menu && <ContextMenu {...menu} close={() => setMenu(null)} open={() => activate(menu.entry)} deleteEntry={deleteEntry} setError={setError} />
   return <div className={`preview-list ${view}`}>
     {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => selectEntry(entry, index, event)} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
-      <input type="checkbox" checked={selected.has(entry.id)} onClick={event => event.stopPropagation()} onChange={e => choose(entry, e.target.checked)} />
       <button className="card-menu" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>
-      {entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : isPreviewable(entry) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view)} loading="lazy" /></button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
+      {entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : entry.mime.startsWith('image/') || (view !== 'small' && entry.mime.startsWith('video/')) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view)} loading="lazy" /></button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
       <button className="filename" tabIndex={-1} title={entry.name}>{entry.name}</button>
-      <small>{formatBytes(entry.size)}</small>
+      {view !== 'small' && <small>{formatBytes(entry.size)}</small>}
     </div>)}
     {contextMenu}
   </div>
@@ -421,7 +462,7 @@ function ContextMenu({ entry, x, y, close, open, deleteEntry, setError }: { entr
     close()
   }
   const remove = async () => {
-    close(); if (!confirm(`Move ${entry.name} to Trash?`)) return
+    close()
     try { await deleteEntry(entry) } catch (error) { setError(messageOf(error)) }
   }
   return <div className="context-menu" style={{ left: x, top: y }} role="menu" onPointerDown={event => event.stopPropagation()}>
@@ -432,6 +473,26 @@ function ContextMenu({ entry, x, y, close, open, deleteEntry, setError }: { entr
   </div>
 }
 
+function FolderContextMenu({ directoryId, path, x, y, close, createItem, setError }: { directoryId: string; path: string; x: number; y: number; close: () => void; createItem: (kind: 'file' | 'directory', directoryId?: string) => Promise<void>; setError: (message: string) => void }) {
+  useEffect(() => {
+    const dismiss = () => close()
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') close() }
+    addEventListener('pointerdown', dismiss); addEventListener('keydown', escape)
+    return () => { removeEventListener('pointerdown', dismiss); removeEventListener('keydown', escape) }
+  }, [close])
+  const create = (kind: 'file' | 'directory') => { close(); void createItem(kind, directoryId) }
+  const copyPath = async () => {
+    try { await navigator.clipboard.writeText(path) } catch { setError('The browser denied clipboard access.') }
+    close()
+  }
+  return <div className="context-menu" style={{ left: x, top: y }} role="menu" onPointerDown={event => event.stopPropagation()}>
+    <button role="menuitem" autoFocus onClick={() => create('directory')}><Folder /> New Folder</button>
+    <button role="menuitem" onClick={() => create('file')}><File /> New File</button>
+    <span className="context-divider" />
+    <button role="menuitem" onClick={copyPath}><Copy /> Copy Path</button>
+  </div>
+}
+
 function ViewSelector({ view, setView }: { view: ViewMode; setView: (view: ViewMode) => void }) {
   return <div className="view-selector" aria-label="View mode">
     {(['details', 'small', 'medium', 'large'] as ViewMode[]).map(mode => <button className={view === mode ? 'active' : ''} title={mode === 'details' ? 'columns' : mode} key={mode} onClick={() => setView(mode)}>{mode === 'details' ? <Columns3 /> : mode === 'small' ? <Menu /> : mode === 'medium' ? <Grid2X2 /> : <Maximize2 />}</button>)}
@@ -439,11 +500,12 @@ function ViewSelector({ view, setView }: { view: ViewMode; setView: (view: ViewM
 }
 
 function EditorWindow({ document, onClose, onSaved }: { document: DocumentFile; onClose: () => void; onSaved: (doc: DocumentFile) => void }) {
+  const confirmAction = useConfirm()
   const [content, setContent] = useState(document.content)
   const [preview, setPreview] = useState(document.mime.includes('markdown') || document.id.endsWith('bWQ'))
   const [error, setError] = useState('')
   const save = async () => { try { onSaved(await api.saveDocument({ ...document, content })); setError('') } catch (e) { setError(messageOf(e)) } }
-  return <FloatingWindow title="Text editor" onClose={() => { if (content === document.content || confirm('Discard unsaved changes?')) onClose() }} className="editor-window">
+  return <FloatingWindow title="Text editor" onClose={async () => { if (content === document.content || await confirmAction('Your unsaved edits will be lost.', { title: 'Discard unsaved changes?', confirmLabel: 'Discard', danger: true })) onClose() }} className="editor-window">
     <div className="window-toolbar"><button className="primary compact" onClick={save}><Save size={15} /> Save</button><button className={preview ? 'active' : ''} onClick={() => setPreview(!preview)}><Eye size={15} /> Markdown preview</button><span className="toolbar-spacer" /><code>{document.mime}</code></div>
     {error && <div className="banner error">{error}</div>}
     <div className={`editor-body ${preview ? 'split' : ''}`}><CodeMirror value={content} height="100%" theme="dark" extensions={[markdown()]} onChange={setContent} />{preview && <article className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]}>{content}</ReactMarkdown></article>}</div>
@@ -482,6 +544,7 @@ function VideoPlayer({ entry, autoPlay = true }: { entry: Entry; autoPlay?: bool
 }
 
 function TrashWindow({ items, onClose, onChanged, onRestored, setError }: { items: TrashEntry[]; onClose: () => void; onChanged: () => Promise<void>; onRestored: (entry: Entry) => Promise<void>; setError: (s: string) => void }) {
+  const confirmAction = useConfirm()
   const act = async (fn: () => Promise<unknown>) => { try { await fn(); await onChanged() } catch (e) { setError(messageOf(e)) } }
   const restore = async (item: TrashEntry) => {
     try {
@@ -489,15 +552,17 @@ function TrashWindow({ items, onClose, onChanged, onRestored, setError }: { item
       try {
         entry = await api.restore(item.info.id)
       } catch (e) {
-        if (!(e instanceof ApiFailure) || e.code !== 'already_exists' || !confirm(`${e.message}. Replace it and move the old item to Trash?`)) throw e
+        if (!(e instanceof ApiFailure) || e.code !== 'already_exists' || !await confirmAction(`${e.message}. Replace it and move the old item to Trash?`, { title: 'Replace existing item?', confirmLabel: 'Replace', danger: true })) throw e
         entry = await api.restore(item.info.id, undefined, true)
       }
       await Promise.all([onChanged(), onRestored(entry)])
     } catch (e) { setError(messageOf(e)) }
   }
+  const empty = async () => { if (await confirmAction('Everything in Trash will be permanently deleted. This cannot be undone.', { title: 'Empty Trash?', confirmLabel: 'Empty Trash', danger: true })) await act(api.emptyTrash) }
+  const purge = async (item: TrashEntry) => { if (await confirmAction(`${item.info.originalName} will be permanently deleted. This cannot be undone.`, { title: 'Delete permanently?', confirmLabel: 'Delete', danger: true })) await act(() => api.purge(item.info.id)) }
   return <FloatingWindow title="Trash" onClose={onClose} className="trash-window">
-    <div className="window-toolbar"><span>{items.length} item{items.length === 1 ? '' : 's'}</span><span className="toolbar-spacer" /><button disabled={!items.length} onClick={() => confirm('Permanently delete everything in Trash? This cannot be undone.') && act(api.emptyTrash)}><Trash2 /> Empty Trash</button></div>
-    <div className="trash-list">{items.length === 0 ? <Empty label="Trash is empty" /> : items.map(item => <div className="trash-row" key={item.info.id}><FileGlyph entry={{ kind: item.kind } as Entry} /><div><strong>{item.info.originalName}</strong><small>Deleted {formatDate(item.info.deletedAt)}</small></div><span>{formatBytes(item.size)}</span><button onClick={() => restore(item)}>Restore</button><button className="danger" onClick={() => confirm(`Permanently delete ${item.info.originalName}?`) && act(() => api.purge(item.info.id))}><Trash2 /></button></div>)}</div>
+    <div className="window-toolbar"><span>{items.length} item{items.length === 1 ? '' : 's'}</span><span className="toolbar-spacer" /><button disabled={!items.length} onClick={empty}><Trash2 /> Empty Trash</button></div>
+    <div className="trash-list">{items.length === 0 ? <Empty label="Trash is empty" /> : items.map(item => <div className="trash-row" key={item.info.id}><FileGlyph entry={{ kind: item.kind } as Entry} /><div><strong>{item.info.originalName}</strong><small>Deleted {formatDate(item.info.deletedAt)}</small></div><span>{formatBytes(item.size)}</span><button onClick={() => restore(item)}>Restore</button><button className="danger" onClick={() => purge(item)}><Trash2 /></button></div>)}</div>
   </FloatingWindow>
 }
 
@@ -517,7 +582,6 @@ function FileGlyph({ entry }: { entry: Pick<Entry, 'kind'> & Partial<Entry> }) {
   if (entry.mime?.startsWith('text/')) return <FileText className="glyph" />
   return <File className="glyph" />
 }
-function isPreviewable(entry: Entry) { return entry.mime.startsWith('image/') || entry.mime.startsWith('video/') }
 function first<T>(set: Set<T>) { return set.values().next().value }
 function findEntry(id: string | undefined, root: EntryPage | null, pages: Record<string, EntryPage>) { if (id === undefined) return; return [...(root?.entries ?? []), ...Object.values(pages).flatMap(p => p.entries)].find(entry => entry.id === id) }
 function formatBytes(bytes: number) { if (bytes < 1024) return `${bytes} B`; const units = ['KB', 'MB', 'GB', 'TB']; let value = bytes / 1024, unit = 0; while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++ } return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}` }
