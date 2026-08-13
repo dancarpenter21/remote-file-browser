@@ -652,16 +652,18 @@ function FileList({ rows, view, selected, setSelected, setPrimary, activate, ren
 function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, setError }: { entry: Entry; x: number; y: number; close: () => void; open: () => void; renameEntry: (entry: Entry) => Promise<void>; deleteEntry: (entry: Entry) => Promise<void>; setError: (message: string) => void }) {
   const promptAction = usePrompt()
   const copyPath = async () => {
-    try { await navigator.clipboard.writeText(entry.path) } catch { setError('The browser denied clipboard access.') }
+    try { await navigator.clipboard.writeText(entry.path) } catch { setError(clipboardError(entry.path)) }
     close()
   }
   const copyProvenance = async () => {
     close()
+    let url = ''
     try {
       const provenance = await api.provenance(entry.id)
-      if (!provenance.urls[0]) throw new Error('No provenance URL is defined.')
-      await navigator.clipboard.writeText(provenance.urls[0])
-    } catch (error) { setError(error instanceof Error ? error.message : 'The browser denied clipboard access.') }
+      url = provenance.urls[0] ?? ''
+      if (!url) throw new Error('No provenance URL is defined.')
+    } catch (error) { setError(messageOf(error)); return }
+    try { await navigator.clipboard.writeText(url) } catch { setError(clipboardError(url)) }
   }
   const remove = async () => {
     close()
@@ -698,7 +700,7 @@ function FolderContextMenu({ directoryId, path, x, y, close, createItem, setErro
   }, [close])
   const create = (kind: 'file' | 'directory') => { close(); void createItem(kind, directoryId) }
   const copyPath = async () => {
-    try { await navigator.clipboard.writeText(path) } catch { setError('The browser denied clipboard access.') }
+    try { await navigator.clipboard.writeText(path) } catch { setError(clipboardError(path)) }
     close()
   }
   return <div className="context-menu" style={{ left: x, top: y }} role="menu" onPointerDown={event => event.stopPropagation()}>
@@ -938,4 +940,5 @@ function findEntry(id: string | undefined, root: EntryPage | null, pages: Record
 function formatBytes(bytes: number) { if (bytes < 1024) return `${bytes} B`; const units = ['KB', 'MB', 'GB', 'TB']; let value = bytes / 1024, unit = 0; while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++ } return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}` }
 function formatDate(value?: string) { return value ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : '—' }
 function messageOf(error: unknown) { return error instanceof Error ? error.message : 'The operation failed' }
+function clipboardError(text: string) { return `The browser denied clipboard access. Copy manually: ${text}` }
 function Empty({ label = 'This folder is empty' }: { label?: string }) { return <div className="empty"><FolderOpen /><strong>{label}</strong><span>Nothing to show here.</span></div> }
