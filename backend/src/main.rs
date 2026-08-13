@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    convert::Infallible,
     ffi::{OsStr, OsString},
     io::SeekFrom,
     os::unix::ffi::{OsStrExt, OsStringExt},
@@ -18,23 +19,32 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{delete, get, post},
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use futures_util::StreamExt;
+use notify::{EventKind, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     process::Command,
-    sync::RwLock,
+    sync::{Mutex, RwLock, broadcast},
 };
+use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 const SESSION_COOKIE: &str = "rfb_session";
@@ -48,6 +58,10 @@ struct AppState {
     login_attempts: Arc<DashMap<String, Vec<SystemTime>>>,
     media_jobs: Arc<DashMap<String, MediaJob>>,
     provenance: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    provenance_write: Arc<Mutex<()>>,
+    provenance_events: broadcast::Sender<ProvenanceEvent>,
+    filesystem_events: broadcast::Sender<FilesystemEvent>,
+    provenance_api_token: Option<Arc<String>>,
 }
 
 struct Config {
@@ -69,7 +83,7 @@ struct Session {
     expires: SystemTime,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 struct Problem {
     code: &'static str,
     message: String,
@@ -131,6 +145,101 @@ impl From<std::io::Error> for ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Remote File Browser API",
+        version = "1.0.0",
+        description = "Authenticated filesystem management, media playback, and provenance automation API. Browser mutations require both the session cookie and CSRF header; provenance automation uses a bearer token."
+    ),
+    paths(
+        health,
+        login,
+        session_info,
+        logout,
+        list_entries,
+        metadata,
+        get_provenance,
+        set_provenance,
+        submit_provenance,
+        provenance_events,
+        filesystem_events,
+        content,
+        create_item,
+        upload,
+        operation,
+        soft_delete,
+        read_document,
+        write_document,
+        list_trash,
+        empty_trash,
+        restore_trash,
+        purge_trash,
+        thumbnail,
+        media_file,
+        start_hls,
+        list_media_jobs,
+        hls_status,
+        hls_file
+    ),
+    components(schemas(
+        Problem,
+        LoginRequest,
+        SessionResponse,
+        Entry,
+        EntryPage,
+        Provenance,
+        ProvenanceSubmission,
+        ProvenanceEvent,
+        FilesystemEvent,
+        CreateRequest,
+        OperationRequest,
+        DeleteRequest,
+        TrashInfo,
+        TrashEntry,
+        RestoreRequest,
+        Document,
+        WriteDocument,
+        HlsRequest,
+        HlsResponse,
+        MediaJob
+    )),
+    modifiers(&SecurityAddon),
+    tags(
+        (name = "authentication", description = "Browser session management"),
+        (name = "filesystem", description = "Root-confined file operations"),
+        (name = "provenance", description = "File source metadata and live updates"),
+        (name = "editor", description = "UTF-8 document editing"),
+        (name = "trash", description = "Recoverable deletion"),
+        (name = "media", description = "Previews and browser-compatible playback"),
+        (name = "system", description = "Service health")
+    )
+)]
+struct ApiDoc;
+
+struct SecurityAddon;
+
+impl utoipa::Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::security::{
+            ApiKey, ApiKeyValue, Http, HttpAuthScheme, SecurityScheme,
+        };
+        let components = openapi.components.get_or_insert_default();
+        components.add_security_scheme(
+            "sessionCookie",
+            SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new(SESSION_COOKIE))),
+        );
+        components.add_security_scheme(
+            "csrfToken",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("x-csrf-token"))),
+        );
+        components.add_security_scheme(
+            "provenanceToken",
+            SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -156,6 +265,9 @@ async fn main() {
         .await
         .expect("create media cache");
     let provenance = load_provenance(&cache).await;
+    let provenance_api_token = read_optional_token("RFB_PROVENANCE_API_TOKEN_FILE").await;
+    let (provenance_event_tx, _) = broadcast::channel(256);
+    let (filesystem_event_tx, _) = broadcast::channel(256);
 
     let password = read_secret().await;
     assert!(
@@ -189,9 +301,14 @@ async fn main() {
         login_attempts: Arc::new(DashMap::new()),
         media_jobs: Arc::new(DashMap::new()),
         provenance: Arc::new(RwLock::new(provenance)),
+        provenance_write: Arc::new(Mutex::new(())),
+        provenance_events: provenance_event_tx,
+        filesystem_events: filesystem_event_tx,
+        provenance_api_token: provenance_api_token.map(Arc::new),
     };
 
     spawn_cache_cleanup(state.clone());
+    spawn_filesystem_watcher(state.clone());
 
     let api = Router::new()
         .route("/auth/login", post(login))
@@ -199,7 +316,14 @@ async fn main() {
         .route("/auth/logout", post(logout))
         .route("/fs/entries", get(list_entries))
         .route("/fs/metadata", get(metadata))
-        .route("/fs/provenance", get(get_provenance).put(set_provenance))
+        .route(
+            "/fs/provenance",
+            get(get_provenance)
+                .put(set_provenance)
+                .post(submit_provenance),
+        )
+        .route("/fs/provenance/events", get(provenance_events))
+        .route("/fs/events", get(filesystem_events))
         .route("/fs/content", get(content))
         .route("/fs/items", post(create_item))
         .route("/fs/uploads", post(upload))
@@ -217,8 +341,9 @@ async fn main() {
         .route("/media/hls/{key}/{file}", get(hls_file));
 
     let app = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(health))
         .nest("/api/v1", api)
+        .merge(SwaggerUi::new("/api/docs").url("/api/openapi.json", ApiDoc::openapi()))
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -226,6 +351,11 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     info!(address = %listener.local_addr().unwrap(), "remote file browser backend started");
     axum::serve(listener, app).await.unwrap();
+}
+
+#[utoipa::path(get, path = "/healthz", tag = "system", responses((status = 200, body = String)))]
+async fn health() -> &'static str {
+    "ok"
 }
 
 async fn read_secret() -> String {
@@ -238,6 +368,22 @@ async fn read_secret() -> String {
     }
     std::env::var("RFB_ADMIN_PASSWORD")
         .expect("RFB_ADMIN_PASSWORD_FILE or RFB_ADMIN_PASSWORD is required")
+}
+
+async fn read_optional_token(variable: &str) -> Option<String> {
+    let path = std::env::var(variable)
+        .ok()
+        .filter(|path| !path.trim().is_empty())?;
+    let token = fs::read_to_string(path)
+        .await
+        .expect("read provenance API token secret")
+        .trim()
+        .to_string();
+    assert!(
+        token.chars().count() >= 32,
+        "provenance API token must contain at least 32 characters"
+    );
+    Some(token)
 }
 
 fn env_string(name: &str, default: &str) -> String {
@@ -256,13 +402,13 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 struct LoginRequest {
     username: String,
     password: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct SessionResponse {
     authenticated: bool,
@@ -270,6 +416,7 @@ struct SessionResponse {
     csrf_token: Option<String>,
 }
 
+#[utoipa::path(post, path = "/api/v1/auth/login", tag = "authentication", request_body = LoginRequest, responses((status = 200, body = SessionResponse), (status = 401, body = Problem), (status = 429, body = Problem)))]
 async fn login(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -339,6 +486,7 @@ async fn login(
     ))
 }
 
+#[utoipa::path(get, path = "/api/v1/auth/session", tag = "authentication", responses((status = 200, body = SessionResponse)))]
 async fn session_info(State(state): State<AppState>, jar: CookieJar) -> Json<SessionResponse> {
     match require_session(&state, &jar) {
         Ok(session) => Json(SessionResponse {
@@ -354,6 +502,7 @@ async fn session_info(State(state): State<AppState>, jar: CookieJar) -> Json<Ses
     }
 }
 
+#[utoipa::path(post, path = "/api/v1/auth/logout", tag = "authentication", security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 204), (status = 401, body = Problem), (status = 403, body = Problem)))]
 async fn logout(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -418,7 +567,7 @@ fn random_token() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct Entry {
     id: String,
@@ -453,7 +602,7 @@ struct ListQuery {
     direction: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct EntryPage {
     entries: Vec<Entry>,
@@ -461,6 +610,7 @@ struct EntryPage {
     next_offset: Option<usize>,
 }
 
+#[utoipa::path(get, path = "/api/v1/fs/entries", tag = "filesystem", params(("id" = Option<String>, Query), ("offset" = Option<usize>, Query), ("limit" = Option<usize>, Query), ("hidden" = Option<bool>, Query), ("sort" = Option<String>, Query), ("direction" = Option<String>, Query)), security(("sessionCookie" = [])), responses((status = 200, body = EntryPage), (status = 401, body = Problem)))]
 async fn list_entries(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -521,6 +671,7 @@ struct IdQuery {
     id: String,
 }
 
+#[utoipa::path(get, path = "/api/v1/fs/metadata", tag = "filesystem", params(("id" = String, Query)), security(("sessionCookie" = [])), responses((status = 200, body = Entry), (status = 400, body = Problem), (status = 404, body = Problem)))]
 async fn metadata(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -531,10 +682,30 @@ async fn metadata(
     Ok(Json(entry_from_path(&state, path).await?))
 }
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct Provenance {
     urls: Vec<String>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+struct ProvenanceSubmission {
+    path: String,
+    url: String,
+}
+
+#[derive(Clone, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct ProvenanceEvent {
+    id: String,
+    path: String,
+    urls: Vec<String>,
+}
+
+#[derive(Clone, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct FilesystemEvent {
+    directory_ids: Vec<String>,
 }
 
 async fn load_provenance(cache: &Path) -> HashMap<String, Vec<String>> {
@@ -551,60 +722,27 @@ async fn load_provenance(cache: &Path) -> HashMap<String, Vec<String>> {
     }
 }
 
-async fn persist_provenance(state: &AppState) -> ApiResult<()> {
-    let bytes = {
-        let records = state.provenance.read().await;
-        serde_json::to_vec_pretty(&*records).map_err(ApiError::internal)?
-    };
-    let target = state.config.cache.join("provenance.json");
-    let temporary = state.config.cache.join(".provenance.json.tmp");
+async fn persist_provenance_records(
+    cache: &Path,
+    records: &HashMap<String, Vec<String>>,
+) -> ApiResult<()> {
+    let bytes = serde_json::to_vec_pretty(records).map_err(ApiError::internal)?;
+    let target = cache.join("provenance.json");
+    let temporary = cache.join(".provenance.json.tmp");
     fs::write(&temporary, bytes).await?;
     fs::rename(temporary, target).await?;
     Ok(())
 }
 
-async fn get_provenance(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Query(query): Query<IdQuery>,
-) -> ApiResult<Json<Provenance>> {
-    require_session(&state, &jar)?;
-    let path = resolve_existing(&state.config, &query.id).await?;
-    if !fs::symlink_metadata(path).await?.is_file() {
-        return Err(ApiError::bad(
-            "not_file",
-            "Provenance can only be attached to files",
-        ));
-    }
-    let records = state.provenance.read().await;
-    Ok(Json(Provenance {
-        urls: records.get(&query.id).cloned().unwrap_or_default(),
-    }))
-}
-
-async fn set_provenance(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    headers: HeaderMap,
-    Query(query): Query<IdQuery>,
-    Json(input): Json<Provenance>,
-) -> ApiResult<Json<Provenance>> {
-    require_csrf(&state, &jar, &headers)?;
-    let path = resolve_existing(&state.config, &query.id).await?;
-    if !fs::symlink_metadata(path).await?.is_file() {
-        return Err(ApiError::bad(
-            "not_file",
-            "Provenance can only be attached to files",
-        ));
-    }
-    if input.urls.len() > 50 {
+fn normalize_provenance_urls(input: Vec<String>) -> ApiResult<Vec<String>> {
+    if input.len() > 50 {
         return Err(ApiError::bad(
             "too_many_urls",
             "A file can have at most 50 provenance URLs",
         ));
     }
-    let mut urls = Vec::with_capacity(input.urls.len());
-    for value in input.urls {
+    let mut urls = Vec::with_capacity(input.len());
+    for value in input {
         let value = value.trim().to_string();
         let uri: http::Uri = value
             .parse()
@@ -622,16 +760,326 @@ async fn set_provenance(
             urls.push(value);
         }
     }
-    {
-        let mut records = state.provenance.write().await;
-        if urls.is_empty() {
-            records.remove(&query.id);
-        } else {
-            records.insert(query.id, urls.clone());
-        }
+    Ok(urls)
+}
+
+async fn commit_provenance(
+    state: &AppState,
+    id: String,
+    path: String,
+    urls: Vec<String>,
+) -> ApiResult<Provenance> {
+    let urls = normalize_provenance_urls(urls)?;
+    let _write = state.provenance_write.lock().await;
+    let mut records = state.provenance.read().await.clone();
+    let previous = records.get(&id).cloned().unwrap_or_default();
+    if previous == urls {
+        return Ok(Provenance { urls });
     }
-    persist_provenance(&state).await?;
-    Ok(Json(Provenance { urls }))
+    if urls.is_empty() {
+        records.remove(&id);
+    } else {
+        records.insert(id.clone(), urls.clone());
+    }
+    persist_provenance_records(&state.config.cache, &records).await?;
+    *state.provenance.write().await = records;
+    drop(_write);
+    let _ = state.provenance_events.send(ProvenanceEvent {
+        id,
+        path,
+        urls: urls.clone(),
+    });
+    Ok(Provenance { urls })
+}
+
+async fn append_provenance(
+    state: &AppState,
+    id: String,
+    path: String,
+    url: String,
+) -> ApiResult<Provenance> {
+    let url = normalize_provenance_urls(vec![url])?
+        .into_iter()
+        .next()
+        .expect("one validated provenance URL");
+    let _write = state.provenance_write.lock().await;
+    let mut records = state.provenance.read().await.clone();
+    let urls = records.entry(id.clone()).or_default();
+    if urls.contains(&url) {
+        return Ok(Provenance { urls: urls.clone() });
+    }
+    if urls.len() >= 50 {
+        return Err(ApiError::bad(
+            "too_many_urls",
+            "A file can have at most 50 provenance URLs",
+        ));
+    }
+    urls.push(url);
+    let urls = urls.clone();
+    persist_provenance_records(&state.config.cache, &records).await?;
+    *state.provenance.write().await = records;
+    drop(_write);
+    let _ = state.provenance_events.send(ProvenanceEvent {
+        id,
+        path,
+        urls: urls.clone(),
+    });
+    Ok(Provenance { urls })
+}
+
+#[utoipa::path(get, path = "/api/v1/fs/provenance", tag = "provenance", params(("id" = String, Query)), security(("sessionCookie" = [])), responses((status = 200, body = Provenance), (status = 400, body = Problem), (status = 404, body = Problem)))]
+async fn get_provenance(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(query): Query<IdQuery>,
+) -> ApiResult<Json<Provenance>> {
+    require_session(&state, &jar)?;
+    let path = resolve_existing(&state.config, &query.id).await?;
+    if !fs::symlink_metadata(&path).await?.is_file() {
+        return Err(ApiError::bad(
+            "not_file",
+            "Provenance can only be attached to files",
+        ));
+    }
+    let records = state.provenance.read().await;
+    Ok(Json(Provenance {
+        urls: records.get(&query.id).cloned().unwrap_or_default(),
+    }))
+}
+
+#[utoipa::path(put, path = "/api/v1/fs/provenance", tag = "provenance", params(("id" = String, Query), ("x-csrf-token" = String, Header)), request_body = Provenance, security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 200, body = Provenance), (status = 400, body = Problem), (status = 401, body = Problem), (status = 403, body = Problem)))]
+async fn set_provenance(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Query(query): Query<IdQuery>,
+    Json(input): Json<Provenance>,
+) -> ApiResult<Json<Provenance>> {
+    require_csrf(&state, &jar, &headers)?;
+    let path = resolve_existing(&state.config, &query.id).await?;
+    if !fs::symlink_metadata(&path).await?.is_file() {
+        return Err(ApiError::bad(
+            "not_file",
+            "Provenance can only be attached to files",
+        ));
+    }
+    let relative = path
+        .strip_prefix(&state.config.root)
+        .map_err(ApiError::internal)?;
+    Ok(Json(
+        commit_provenance(
+            &state,
+            query.id,
+            format!("/fs-root/{}", relative.to_string_lossy()),
+            input.urls,
+        )
+        .await?,
+    ))
+}
+
+fn require_provenance_token(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    let token = state.provenance_api_token.as_ref().ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provenance_api_disabled",
+            "The provenance submission API is not configured".into(),
+        )
+    })?;
+    let supplied = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let valid = supplied.len() == token.len()
+        && supplied.as_bytes().ct_eq(token.as_bytes()).unwrap_u8() == 1;
+    if !valid {
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Invalid API token".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn submitted_path_id(path: &str) -> ApiResult<String> {
+    if path.starts_with("/fs-root/") || path == "/fs-root" {
+        return Err(ApiError::bad(
+            "invalid_path",
+            "Use a path relative to the filesystem root",
+        ));
+    }
+    let relative = path.strip_prefix('/').unwrap_or(path);
+    if relative.is_empty()
+        || relative.contains('\0')
+        || relative.starts_with('/')
+        || Path::new(relative)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ApiError::bad(
+            "invalid_path",
+            "Use a path relative to the filesystem root",
+        ));
+    }
+    Ok(encode_path(OsStr::new(relative)))
+}
+
+#[utoipa::path(post, path = "/api/v1/fs/provenance", tag = "provenance", request_body = ProvenanceSubmission, security(("provenanceToken" = [])), responses((status = 200, body = Provenance), (status = 400, body = Problem), (status = 401, body = Problem), (status = 404, body = Problem), (status = 503, body = Problem)))]
+async fn submit_provenance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ProvenanceSubmission>,
+) -> ApiResult<Json<Provenance>> {
+    require_provenance_token(&state, &headers)?;
+    let id = submitted_path_id(&input.path)?;
+    let path = resolve_existing(&state.config, &id).await?;
+    if !fs::symlink_metadata(&path).await?.is_file() {
+        return Err(ApiError::bad(
+            "not_file",
+            "Provenance can only be attached to files",
+        ));
+    }
+    let relative = path
+        .strip_prefix(&state.config.root)
+        .map_err(ApiError::internal)?;
+    Ok(Json(
+        append_provenance(
+            &state,
+            id,
+            format!("/fs-root/{}", relative.to_string_lossy()),
+            input.url,
+        )
+        .await?,
+    ))
+}
+
+#[utoipa::path(get, path = "/api/v1/fs/provenance/events", tag = "provenance", security(("sessionCookie" = [])), responses((status = 200, description = "SSE stream of provenance and resync events", content_type = "text/event-stream"), (status = 401, body = Problem)))]
+async fn provenance_events(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> ApiResult<(
+    HeaderMap,
+    Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
+)> {
+    require_session(&state, &jar)?;
+    let stream = BroadcastStream::new(state.provenance_events.subscribe()).filter_map(|message| {
+        futures_util::future::ready(match message {
+            Ok(change) => Some(Ok(Event::default()
+                .event("provenance")
+                .data(serde_json::to_string(&change).unwrap()))),
+            Err(_) => Some(Ok(Event::default().event("resync").data("{}"))),
+        })
+    });
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
+    headers.insert("x-accel-buffering", "no".parse().unwrap());
+    Ok((
+        headers,
+        Sse::new(stream).keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        ),
+    ))
+}
+
+#[utoipa::path(get, path = "/api/v1/fs/events", tag = "filesystem", security(("sessionCookie" = [])), responses((status = 200, description = "SSE stream identifying directories changed outside the browser", content_type = "text/event-stream"), (status = 401, body = Problem)))]
+async fn filesystem_events(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> ApiResult<(
+    HeaderMap,
+    Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
+)> {
+    require_session(&state, &jar)?;
+    let stream = BroadcastStream::new(state.filesystem_events.subscribe()).filter_map(|message| {
+        futures_util::future::ready(match message {
+            Ok(change) => Some(Ok(Event::default()
+                .event("filesystem")
+                .data(serde_json::to_string(&change).unwrap()))),
+            Err(_) => Some(Ok(Event::default().event("resync").data("{}"))),
+        })
+    });
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
+    headers.insert("x-accel-buffering", "no".parse().unwrap());
+    Ok((
+        headers,
+        Sse::new(stream).keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        ),
+    ))
+}
+
+fn spawn_filesystem_watcher(state: AppState) {
+    std::thread::spawn(move || {
+        let root = state.config.root_canonical.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |event| {
+            let _ = tx.send(event);
+        }) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                error!(%error, "could not create filesystem watcher");
+                return;
+            }
+        };
+        if let Err(error) = watcher.watch(&root, RecursiveMode::Recursive) {
+            error!(%error, path = %root.display(), "could not watch filesystem root");
+            return;
+        }
+        info!(path = %root.display(), "watching filesystem root for live UI updates");
+
+        loop {
+            let first = match rx.recv() {
+                Ok(event) => event,
+                Err(_) => return,
+            };
+            let mut batch = vec![first];
+            while let Ok(event) = rx.recv_timeout(Duration::from_millis(150)) {
+                batch.push(event);
+            }
+            let mut directory_ids = HashSet::new();
+            let mut resync = false;
+            for result in batch {
+                match result {
+                    Ok(event) if matches!(event.kind, EventKind::Access(_)) => {}
+                    Ok(event) => {
+                        for path in event.paths {
+                            let Ok(relative) = path.strip_prefix(&root) else {
+                                resync = true;
+                                continue;
+                            };
+                            if relative.starts_with(".cache/remote-file-browser")
+                                || relative.starts_with(".trash")
+                            {
+                                continue;
+                            }
+                            let parent = relative.parent().unwrap_or(Path::new(""));
+                            directory_ids.insert(encode_path(parent.as_os_str()));
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%error, "filesystem watcher reported an error");
+                        resync = true;
+                    }
+                }
+            }
+            if resync {
+                directory_ids.insert(String::new());
+            }
+            if !directory_ids.is_empty() {
+                let mut directory_ids = directory_ids.into_iter().collect::<Vec<_>>();
+                directory_ids.sort();
+                let _ = state
+                    .filesystem_events
+                    .send(FilesystemEvent { directory_ids });
+            }
+        }
+    });
 }
 
 async fn remap_provenance(
@@ -646,35 +1094,54 @@ async fn remap_provenance(
     let target_relative = target
         .strip_prefix(&state.config.root)
         .map_err(ApiError::internal)?;
-    let changes = {
-        let records = state.provenance.read().await;
-        records
-            .iter()
-            .filter_map(|(id, urls)| {
-                let path = decode_path(id).ok()?;
-                let suffix = path.strip_prefix(source_relative).ok()?;
-                let new_path = if suffix.as_os_str().is_empty() {
-                    target_relative.to_path_buf()
-                } else {
-                    target_relative.join(suffix)
-                };
-                Some((id.clone(), encode_path(new_path.as_os_str()), urls.clone()))
-            })
-            .collect::<Vec<_>>()
-    };
+    let _write = state.provenance_write.lock().await;
+    let mut records = state.provenance.read().await.clone();
+    let changes = records
+        .iter()
+        .filter_map(|(id, urls)| {
+            let path = decode_path(id).ok()?;
+            let suffix = path.strip_prefix(source_relative).ok()?;
+            let new_path = if suffix.as_os_str().is_empty() {
+                target_relative.to_path_buf()
+            } else {
+                target_relative.join(suffix)
+            };
+            Some((
+                id.clone(),
+                path,
+                encode_path(new_path.as_os_str()),
+                new_path,
+                urls.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
     if changes.is_empty() {
         return Ok(());
     }
-    {
-        let mut records = state.provenance.write().await;
-        for (old, new, urls) in changes {
-            if !copy {
-                records.remove(&old);
-            }
-            records.insert(new, urls);
+    let mut events = Vec::new();
+    for (old, old_path, new, new_path, urls) in changes {
+        if !copy {
+            records.remove(&old);
+            events.push(ProvenanceEvent {
+                id: old,
+                path: format!("/fs-root/{}", old_path.to_string_lossy()),
+                urls: Vec::new(),
+            });
         }
+        records.insert(new.clone(), urls.clone());
+        events.push(ProvenanceEvent {
+            id: new,
+            path: format!("/fs-root/{}", new_path.to_string_lossy()),
+            urls,
+        });
     }
-    persist_provenance(state).await
+    persist_provenance_records(&state.config.cache, &records).await?;
+    *state.provenance.write().await = records;
+    drop(_write);
+    for event in events {
+        let _ = state.provenance_events.send(event);
+    }
+    Ok(())
 }
 
 async fn entry_from_path(state: &AppState, path: PathBuf) -> ApiResult<Entry> {
@@ -842,6 +1309,7 @@ fn is_internal(directory: &Path, config: &Config, name: &OsStr) -> bool {
         || directory == config.root.join(".cache") && name == OsStr::new("remote-file-browser")
 }
 
+#[utoipa::path(get, path = "/api/v1/fs/content", tag = "filesystem", params(("id" = String, Query), ("Range" = Option<String>, Header)), security(("sessionCookie" = [])), responses((status = 200, description = "File download", content_type = "application/octet-stream"), (status = 206, description = "Partial file download", content_type = "application/octet-stream"), (status = 404, body = Problem)))]
 async fn content(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -939,7 +1407,7 @@ fn parse_range(headers: &HeaderMap, total: u64) -> ApiResult<(u64, u64, StatusCo
     Ok((start, end.min(total - 1), StatusCode::PARTIAL_CONTENT))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct CreateRequest {
     parent_id: String,
@@ -949,6 +1417,7 @@ struct CreateRequest {
     replace: bool,
 }
 
+#[utoipa::path(post, path = "/api/v1/fs/items", tag = "filesystem", params(("x-csrf-token" = String, Header)), request_body = CreateRequest, security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 201, body = Entry), (status = 400, body = Problem), (status = 409, body = Problem)))]
 async fn create_item(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1004,6 +1473,7 @@ struct UploadQuery {
     replace: bool,
 }
 
+#[utoipa::path(post, path = "/api/v1/fs/uploads", tag = "filesystem", params(("id" = String, Query), ("replace" = Option<bool>, Query), ("x-csrf-token" = String, Header)), request_body(content = String, content_type = "multipart/form-data", description = "One or more files fields"), security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 200, body = [Entry]), (status = 400, body = Problem), (status = 413, body = Problem)))]
 async fn upload(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1056,7 +1526,7 @@ async fn upload(
     Ok(Json(uploaded))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct OperationRequest {
     operation: String,
@@ -1069,6 +1539,7 @@ struct OperationRequest {
     merge: bool,
 }
 
+#[utoipa::path(post, path = "/api/v1/fs/operations", tag = "filesystem", params(("x-csrf-token" = String, Header)), request_body = OperationRequest, security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 200, body = [Entry]), (status = 400, body = Problem), (status = 409, body = Problem)))]
 async fn operation(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1251,11 +1722,12 @@ async fn remove_recursively(path: &Path) -> ApiResult<()> {
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 struct DeleteRequest {
     ids: Vec<String>,
 }
 
+#[utoipa::path(post, path = "/api/v1/fs/trash", tag = "filesystem", params(("x-csrf-token" = String, Header)), request_body = DeleteRequest, security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 204), (status = 400, body = Problem)))]
 async fn soft_delete(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1282,7 +1754,7 @@ async fn soft_delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct TrashInfo {
     id: Uuid,
@@ -1316,7 +1788,7 @@ async fn move_to_trash(config: &Config, path: &Path) -> ApiResult<TrashInfo> {
     Ok(info)
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct TrashEntry {
     info: TrashInfo,
@@ -1324,6 +1796,7 @@ struct TrashEntry {
     size: u64,
 }
 
+#[utoipa::path(get, path = "/api/v1/trash", tag = "trash", security(("sessionCookie" = [])), responses((status = 200, body = [TrashEntry]), (status = 401, body = Problem)))]
 async fn list_trash(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1353,7 +1826,7 @@ async fn list_trash(
     Ok(Json(result))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct RestoreRequest {
     destination_id: Option<String>,
@@ -1361,6 +1834,7 @@ struct RestoreRequest {
     replace: bool,
 }
 
+#[utoipa::path(post, path = "/api/v1/trash/{id}/restore", tag = "trash", params(("id" = Uuid, Path), ("x-csrf-token" = String, Header)), request_body = RestoreRequest, security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 200, body = Entry), (status = 404, body = Problem), (status = 409, body = Problem)))]
 async fn restore_trash(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1408,6 +1882,7 @@ async fn restore_trash(
     Ok(Json(entry_from_path(&state, target).await?))
 }
 
+#[utoipa::path(delete, path = "/api/v1/trash/{id}", tag = "trash", params(("id" = Uuid, Path), ("x-csrf-token" = String, Header)), security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 204), (status = 404, body = Problem)))]
 async fn purge_trash(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1423,6 +1898,7 @@ async fn purge_trash(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(delete, path = "/api/v1/trash", tag = "trash", params(("x-csrf-token" = String, Header)), security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 204), (status = 401, body = Problem)))]
 async fn empty_trash(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1437,7 +1913,7 @@ async fn empty_trash(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct Document {
     id: String,
@@ -1446,6 +1922,7 @@ struct Document {
     mime: String,
 }
 
+#[utoipa::path(get, path = "/api/v1/editor/document", tag = "editor", params(("id" = String, Query)), security(("sessionCookie" = [])), responses((status = 200, body = Document), (status = 400, body = Problem), (status = 404, body = Problem)))]
 async fn read_document(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1473,7 +1950,7 @@ async fn read_document(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct WriteDocument {
     id: String,
@@ -1481,6 +1958,7 @@ struct WriteDocument {
     expected_etag: String,
 }
 
+#[utoipa::path(put, path = "/api/v1/editor/document", tag = "editor", params(("x-csrf-token" = String, Header)), request_body = WriteDocument, security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 200, body = Document), (status = 409, body = Problem), (status = 413, body = Problem)))]
 async fn write_document(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1532,6 +2010,7 @@ struct PreviewQuery {
     size: Option<String>,
 }
 
+#[utoipa::path(get, path = "/api/v1/previews/thumbnail", tag = "media", params(("id" = String, Query), ("size" = Option<String>, Query)), security(("sessionCookie" = [])), responses((status = 200, description = "WebP thumbnail", content_type = "image/webp"), (status = 400, body = Problem)))]
 async fn thumbnail(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1610,6 +2089,7 @@ async fn thumbnail(
     serve_file(output, &headers, true).await
 }
 
+#[utoipa::path(get, path = "/api/v1/media/file", tag = "media", params(("id" = String, Query), ("Range" = Option<String>, Header)), security(("sessionCookie" = [])), responses((status = 200, description = "Inline image, video, or audio"), (status = 206, description = "Partial media response"), (status = 400, body = Problem)))]
 async fn media_file(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1631,12 +2111,12 @@ async fn media_file(
     serve_file(path, &headers, true).await
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 struct HlsRequest {
     id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct HlsResponse {
     key: String,
@@ -1646,7 +2126,7 @@ struct HlsResponse {
     mode: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct MediaJob {
     key: String,
@@ -1759,6 +2239,7 @@ fn cached_mode(directory: &Path) -> String {
         .unwrap_or_else(|| "full".into())
 }
 
+#[utoipa::path(get, path = "/api/v1/media/jobs", tag = "media", security(("sessionCookie" = [])), responses((status = 200, body = [MediaJob]), (status = 401, body = Problem)))]
 async fn list_media_jobs(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1774,6 +2255,7 @@ async fn list_media_jobs(
     Ok(Json(jobs))
 }
 
+#[utoipa::path(post, path = "/api/v1/media/hls", tag = "media", params(("x-csrf-token" = String, Header)), request_body = HlsRequest, security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 200, body = HlsResponse), (status = 202, body = HlsResponse), (status = 400, body = Problem)))]
 async fn start_hls(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1949,6 +2431,7 @@ async fn start_hls(
     ))
 }
 
+#[utoipa::path(get, path = "/api/v1/media/hls/{key}/status", tag = "media", params(("key" = String, Path)), security(("sessionCookie" = [])), responses((status = 200, body = HlsResponse), (status = 400, body = Problem)))]
 async fn hls_status(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1984,6 +2467,7 @@ async fn hls_status(
     }))
 }
 
+#[utoipa::path(get, path = "/api/v1/media/hls/{key}/{file}", tag = "media", params(("key" = String, Path), ("file" = String, Path)), security(("sessionCookie" = [])), responses((status = 200, description = "HLS playlist or MPEG-TS segment"), (status = 206, description = "Partial HLS asset"), (status = 400, body = Problem)))]
 async fn hls_file(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -2117,6 +2601,38 @@ async fn cleanup_cache(state: &AppState) -> ApiResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_state(root: &Path, token: Option<&str>) -> AppState {
+        let cache = root.join(".cache/remote-file-browser");
+        std::fs::create_dir_all(cache.join("hls")).unwrap();
+        std::fs::create_dir_all(cache.join("thumbnails")).unwrap();
+        let trash = root.join(".trash");
+        std::fs::create_dir_all(trash.join("items")).unwrap();
+        let (events, _) = broadcast::channel(16);
+        let (filesystem_events, _) = broadcast::channel(16);
+        AppState {
+            config: Arc::new(Config {
+                root: root.to_path_buf(),
+                root_canonical: std::fs::canonicalize(root).unwrap(),
+                trash,
+                cache,
+                username: "admin".into(),
+                secure_cookies: false,
+                editor_max: 1024,
+                upload_max: 1024,
+                cache_max: 1024,
+                cache_age_days: 1,
+            }),
+            password_hash: Arc::new(String::new()),
+            sessions: Arc::new(DashMap::new()),
+            login_attempts: Arc::new(DashMap::new()),
+            media_jobs: Arc::new(DashMap::new()),
+            provenance: Arc::new(RwLock::new(HashMap::new())),
+            provenance_write: Arc::new(Mutex::new(())),
+            provenance_events: events,
+            filesystem_events,
+            provenance_api_token: token.map(|value| Arc::new(value.to_string())),
+        }
+    }
     fn probe(video: (&str, &str), audio: Option<&str>) -> ProbeOutput {
         let mut streams = vec![ProbeStream {
             codec_type: Some("video".into()),
@@ -2146,6 +2662,125 @@ mod tests {
     #[test]
     fn traversal_is_rejected() {
         assert!(decode_path(&URL_SAFE_NO_PAD.encode(b"../etc")).is_err());
+    }
+    #[test]
+    fn submitted_paths_are_root_relative_and_normalized() {
+        assert_eq!(
+            submitted_path_id("folder/video.mp4").unwrap(),
+            submitted_path_id("/folder/video.mp4").unwrap()
+        );
+        for invalid in [
+            "",
+            "/",
+            ".",
+            "../video.mp4",
+            "folder/../video.mp4",
+            "/fs-root/video.mp4",
+            "//video.mp4",
+        ] {
+            assert!(
+                submitted_path_id(invalid).is_err(),
+                "{invalid} should be rejected"
+            );
+        }
+    }
+    #[test]
+    fn provenance_token_is_optional_and_constant_time_checked() {
+        let root = tempfile::tempdir().unwrap();
+        let disabled = test_state(root.path(), None);
+        assert_eq!(
+            require_provenance_token(&disabled, &HeaderMap::new())
+                .unwrap_err()
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let state = test_state(root.path(), Some("abcdefghijklmnopqrstuvwxyz123456"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer abcdefghijklmnopqrstuvwxyz123456".parse().unwrap(),
+        );
+        assert!(require_provenance_token(&state, &headers).is_ok());
+        headers.insert(header::AUTHORIZATION, "Bearer wrong".parse().unwrap());
+        assert_eq!(
+            require_provenance_token(&state, &headers).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    #[tokio::test]
+    async fn concurrent_appends_preserve_urls_and_broadcast_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        let mut events = state.provenance_events.subscribe();
+        let first = append_provenance(
+            &state,
+            "file".into(),
+            "/fs-root/file".into(),
+            "https://one.example/source".into(),
+        );
+        let second = append_provenance(
+            &state,
+            "file".into(),
+            "/fs-root/file".into(),
+            "https://two.example/source".into(),
+        );
+        let (first, second) = tokio::join!(first, second);
+        assert!(first.is_ok() && second.is_ok());
+        let records = state.provenance.read().await;
+        assert_eq!(records["file"].len(), 2);
+        drop(records);
+        assert!(events.recv().await.is_ok());
+        assert!(events.recv().await.is_ok());
+        let persisted: HashMap<String, Vec<String>> = serde_json::from_slice(
+            &std::fs::read(state.config.cache.join("provenance.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted["file"].len(), 2);
+    }
+    #[test]
+    fn openapi_documents_registered_routes_and_security() {
+        let value = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let paths = value["paths"].as_object().unwrap();
+        for (path, methods) in [
+            ("/healthz", &["get"][..]),
+            ("/api/v1/auth/login", &["post"][..]),
+            ("/api/v1/auth/session", &["get"][..]),
+            ("/api/v1/auth/logout", &["post"][..]),
+            ("/api/v1/fs/entries", &["get"][..]),
+            ("/api/v1/fs/metadata", &["get"][..]),
+            ("/api/v1/fs/provenance", &["get", "put", "post"][..]),
+            ("/api/v1/fs/provenance/events", &["get"][..]),
+            ("/api/v1/fs/events", &["get"][..]),
+            ("/api/v1/fs/content", &["get"][..]),
+            ("/api/v1/fs/items", &["post"][..]),
+            ("/api/v1/fs/uploads", &["post"][..]),
+            ("/api/v1/fs/operations", &["post"][..]),
+            ("/api/v1/fs/trash", &["post"][..]),
+            ("/api/v1/editor/document", &["get", "put"][..]),
+            ("/api/v1/trash", &["get", "delete"][..]),
+            ("/api/v1/trash/{id}/restore", &["post"][..]),
+            ("/api/v1/trash/{id}", &["delete"][..]),
+            ("/api/v1/previews/thumbnail", &["get"][..]),
+            ("/api/v1/media/file", &["get"][..]),
+            ("/api/v1/media/hls", &["post"][..]),
+            ("/api/v1/media/jobs", &["get"][..]),
+            ("/api/v1/media/hls/{key}/status", &["get"][..]),
+            ("/api/v1/media/hls/{key}/{file}", &["get"][..]),
+        ] {
+            let operations = paths
+                .get(path)
+                .unwrap_or_else(|| panic!("OpenAPI is missing {path}"));
+            for method in methods {
+                assert!(
+                    operations.get(method).is_some(),
+                    "OpenAPI is missing {method} {path}"
+                );
+            }
+        }
+        let schemes = value["components"]["securitySchemes"].as_object().unwrap();
+        for scheme in ["sessionCookie", "csrfToken", "provenanceToken"] {
+            assert!(schemes.contains_key(scheme));
+        }
     }
     #[test]
     fn permissions_are_symbolic() {

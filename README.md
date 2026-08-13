@@ -13,6 +13,44 @@ Only the frontend is published. The backend is reachable solely on the Compose n
 
 The application owns `.trash` and `.cache/remote-file-browser` inside the mounted root. Files deleted from ordinary folders are moved into `.trash`; permanent deletion is available only from the Trash view.
 
+## API documentation and provenance automation
+
+The complete OpenAPI document is available at `/api/openapi.json`, with interactive Swagger documentation at `/api/docs/`. Documentation is public, but each operation still enforces the authentication shown in its Swagger security section.
+
+An external agent can append a provenance URL to a file by configuring a dedicated bearer token. Create an untracked secret containing at least 32 characters:
+
+```sh
+openssl rand -base64 32 > secrets/provenance_api_token
+```
+
+Add a Compose override such as `compose.provenance.yaml`:
+
+```yaml
+services:
+  backend:
+    environment:
+      RFB_PROVENANCE_API_TOKEN_FILE: /run/secrets/provenance_api_token
+    secrets:
+      - provenance_api_token
+
+secrets:
+  provenance_api_token:
+    file: ./secrets/provenance_api_token
+```
+
+Start Compose with both files, then submit a path relative to the mounted root. A leading slash is allowed, but `~`, `/fs-root`, and host absolute paths are not:
+
+```sh
+docker compose -f compose.yaml -f compose.provenance.yaml up --build -d
+curl --fail-with-body \
+  -H "Authorization: Bearer $(tr -d '\n' < secrets/provenance_api_token)" \
+  -H 'Content-Type: application/json' \
+  -d '{"path":".wdb/WWVV/Megan Avalon vs Kala.mp4","url":"https://example.com/source"}' \
+  https://localhost/api/v1/fs/provenance
+```
+
+The operation appends uniquely and returns the file's complete provenance URL list. Connected browser sessions receive the change immediately. Use HTTPS whenever the request crosses an untrusted network. If the token is not configured, the automation endpoint returns `503 provenance_api_disabled`; browser provenance editing remains available.
+
 ## Choosing a mounted filesystem
 
 `RFB_ROOT_PATH` may point to any directory visible from the Linux/WSL shell. Compose mounts that exact directory at `/fs-root` and will fail instead of silently creating a missing source path.

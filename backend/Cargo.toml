@@ -15,16 +15,21 @@ dashmap = "6"
 futures-util = "0.3"
 http = "1"
 mime_guess = "2"
+notify = "8.2"
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+subtle = "2"
 thiserror = "2"
 time = "0.3"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["trace", "limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+utoipa = { version = "5", features = ["chrono", "uuid"] }
+utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]

@@ -10,8 +10,9 @@ import {
   Film, Folder, FolderOpen, Grid2X2, LogOut, Maximize2, Menu, MoreHorizontal,
   ExternalLink, Link2, Minus, Move, Plus, RefreshCw, RotateCw, Save, Search, Trash2, Upload, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
-import { api, ApiFailure, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, mediaUrl, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
+import { api, ApiFailure, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, filesystemEventsUrl, FilesystemChange, mediaUrl, provenanceEventsUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { updateFinderPathForSelection } from './finderPath'
+import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type Clipboard = { operation: 'copy' | 'move'; ids: string[] } | null
@@ -117,6 +118,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [showPreview, setShowPreview] = useState(() => localStorage.getItem('rfb-column-preview') !== 'false')
   const [columnWidth, setColumnWidth] = useState(() => Math.min(480, Math.max(180, Number(localStorage.getItem('rfb-column-width')) || 240)))
   const inputRef = useRef<HTMLInputElement>(null)
+  const liveState = useRef({ root, expanded })
+  liveState.current = { root, expanded }
 
   const loadRoot = async () => { try { setRoot(await api.list('', hidden)); setExpanded({}); setSelected(new Set()); setPrimary(null); setColumnPath([]); setCurrentDir('') } catch (e) { setError(messageOf(e)) } }
   useEffect(() => { loadRoot() }, [hidden])
@@ -126,18 +129,89 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   useEffect(() => { localStorage.setItem('rfb-column-width', String(columnWidth)) }, [columnWidth])
   useEffect(() => {
     const changed = (event: Event) => {
-      const id = (event as CustomEvent<string>).detail
-      void api.provenance(id).then(({ urls }) => {
-        const update = (entry: Entry) => entry.id === id ? { ...entry, hasProvenance: urls.length > 0 } : entry
-        setRoot(page => page && ({ ...page, entries: page.entries.map(update) }))
-        setExpanded(pages => Object.fromEntries(Object.entries(pages).map(([key, page]) => [key, { ...page, entries: page.entries.map(update) }])))
-        setPrimary(entry => entry?.id === id ? update(entry) : entry)
-        setColumnPath(path => path.map(update))
-      }).catch(() => {})
+      const { id, urls } = (event as CustomEvent<ProvenanceChange>).detail
+      const apply = () => {
+        const change = { id, urls }
+        setRoot(page => page && applyProvenanceToPage(page, change))
+        setExpanded(pages => Object.fromEntries(Object.entries(pages).map(([key, page]) => [key, applyProvenanceToPage(page, change)])))
+        setPrimary(entry => entry && applyProvenanceToEntry(entry, change))
+        setColumnPath(path => path.map(entry => applyProvenanceToEntry(entry, change)))
+      }
+      apply()
     }
     addEventListener('rfb:provenance-changed', changed)
     return () => removeEventListener('rfb:provenance-changed', changed)
   }, [])
+  useEffect(() => {
+    const events = new EventSource(provenanceEventsUrl, { withCredentials: true })
+    const resync = async () => {
+      const directoryIds = ['', ...Object.keys(liveState.current.expanded)]
+      await Promise.all(directoryIds.map(async id => {
+        try {
+          const page = await api.list(id, hidden)
+          if (id === '') setRoot(page); else setExpanded(previous => ({ ...previous, [id]: page }))
+        } catch { /* the ordinary UI error path handles inaccessible directories */ }
+      }))
+      dispatchEvent(new Event('rfb:provenance-resync'))
+    }
+    const provenance = (event: Event) => {
+      try { dispatchEvent(new CustomEvent<ProvenanceChange>('rfb:provenance-changed', { detail: JSON.parse((event as MessageEvent).data) })) } catch { void resync() }
+    }
+    events.addEventListener('provenance', provenance)
+    events.addEventListener('resync', () => void resync())
+    events.onopen = () => void resync()
+    return () => events.close()
+  }, [hidden])
+  useEffect(() => {
+    const events = new EventSource(filesystemEventsUrl, { withCredentials: true })
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const pending = new Set<string>()
+    const refreshDirectories = async (ids?: string[]) => {
+      const loaded = new Set(['', ...Object.keys(liveState.current.expanded)])
+      const directoryIds = ids ? ids.filter(id => loaded.has(id)) : [...loaded]
+      await Promise.all(directoryIds.map(async id => {
+        try {
+          const previousPage = id === '' ? liveState.current.root : liveState.current.expanded[id]
+          const page = await api.list(id, hidden)
+          if (id === '') setRoot(page); else setExpanded(previous => ({ ...previous, [id]: page }))
+          if (previousPage) {
+            const updatedEntry = (entry: Entry) => {
+              if (entry.parentId !== id) return entry
+              return page.entries.find(candidate => candidate.id === entry.id)
+                ?? page.entries.find(candidate => candidate.etag === entry.etag)
+                ?? entry
+            }
+            setPrimary(entry => entry && updatedEntry(entry))
+            setColumnPath(path => path.map(updatedEntry))
+            setViewer(open => open && ({ ...open, entry: updatedEntry(open.entry) }))
+            setSelected(ids => new Set([...ids].map(selectedId => {
+              const oldEntry = previousPage.entries.find(entry => entry.id === selectedId)
+              return oldEntry ? updatedEntry(oldEntry).id : selectedId
+            })))
+          }
+        } catch {
+          if (id !== '') setExpanded(previous => {
+            const next = { ...previous }; delete next[id]; return next
+          })
+        }
+      }))
+    }
+    const schedule = (ids: string[]) => {
+      ids.forEach(id => pending.add(id))
+      clearTimeout(timer)
+      timer = setTimeout(() => {
+        const ids = [...pending]; pending.clear(); void refreshDirectories(ids)
+      }, 100)
+    }
+    const filesystem = (event: Event) => {
+      try { schedule((JSON.parse((event as MessageEvent).data) as FilesystemChange).directoryIds) }
+      catch { void refreshDirectories() }
+    }
+    events.addEventListener('filesystem', filesystem)
+    events.addEventListener('resync', () => void refreshDirectories())
+    events.onopen = () => void refreshDirectories()
+    return () => { clearTimeout(timer); events.close() }
+  }, [hidden])
 
   const refresh = async (id = currentDir) => {
     try {
@@ -464,18 +538,22 @@ function ProvenanceEditor({ entry }: { entry: Entry }) {
   useEffect(() => {
     const load = () => api.provenance(entry.id).then(data => setUrls(data.urls)).catch(e => setError(messageOf(e)))
     setUrls(null); setError(''); void load()
-    const changed = (event: Event) => { if ((event as CustomEvent<string>).detail === entry.id) void load() }
+    const changed = (event: Event) => {
+      const change = (event as CustomEvent<ProvenanceChange>).detail
+      if (change.id === entry.id) { setUrls(change.urls); setError('') }
+    }
     addEventListener('rfb:provenance-changed', changed)
-    return () => removeEventListener('rfb:provenance-changed', changed)
+    addEventListener('rfb:provenance-resync', load)
+    return () => { removeEventListener('rfb:provenance-changed', changed); removeEventListener('rfb:provenance-resync', load) }
   }, [entry.id])
   const add = async () => {
     const url = await promptAction({ title: 'Add provenance URL', label: 'Source URL', submitLabel: 'Add', placeholder: 'https://example.com/source' })
     if (!url || !urls) return
-    try { setUrls((await api.setProvenance(entry.id, [...urls, url])).urls); dispatchEvent(new CustomEvent('rfb:provenance-changed', { detail: entry.id })); setError('') } catch (e) { setError(messageOf(e)) }
+    try { const next = (await api.setProvenance(entry.id, [...urls, url])).urls; setUrls(next); dispatchEvent(new CustomEvent<ProvenanceChange>('rfb:provenance-changed', { detail: { id: entry.id, urls: next } })); setError('') } catch (e) { setError(messageOf(e)) }
   }
   const remove = async (url: string) => {
     if (!urls) return
-    try { setUrls((await api.setProvenance(entry.id, urls.filter(value => value !== url))).urls); dispatchEvent(new CustomEvent('rfb:provenance-changed', { detail: entry.id })); setError('') } catch (e) { setError(messageOf(e)) }
+    try { const next = (await api.setProvenance(entry.id, urls.filter(value => value !== url))).urls; setUrls(next); dispatchEvent(new CustomEvent<ProvenanceChange>('rfb:provenance-changed', { detail: { id: entry.id, urls: next } })); setError('') } catch (e) { setError(messageOf(e)) }
   }
   return <section className="provenance-panel" aria-label="File provenance">
     <div className="provenance-heading"><span><Link2 /> Provenance</span><button className="compact" onClick={() => void add()} disabled={!urls}><Plus /> Add URL</button></div>
@@ -581,8 +659,8 @@ function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, setEr
     if (!url) return
     try {
       const current = await api.provenance(entry.id)
-      await api.setProvenance(entry.id, [...current.urls, url])
-      dispatchEvent(new CustomEvent('rfb:provenance-changed', { detail: entry.id }))
+      const next = await api.setProvenance(entry.id, [...current.urls, url])
+      dispatchEvent(new CustomEvent<ProvenanceChange>('rfb:provenance-changed', { detail: { id: entry.id, urls: next.urls } }))
     } catch (error) { setError(messageOf(error)) }
   }
   return <div className="context-menu" style={{ left: x, top: y }} role="menu" onPointerDown={event => event.stopPropagation()}>

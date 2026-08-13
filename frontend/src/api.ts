@@ -27,6 +27,8 @@ export type TrashEntry = {
   size: number
 }
 export type Provenance = { urls: string[] }
+export type ProvenanceChange = { id: string; path?: string; urls: string[] }
+export type FilesystemChange = { directoryIds: string[] }
 export type ConversionMode = 'remux' | 'audio' | 'full'
 export type ConversionJob = { key: string; fileName: string; status: 'working' | 'ready' | 'failed'; playable: boolean; mode: ConversionMode; startedAt: string }
 export type HlsJob = { key: string; status: 'working' | 'ready' | 'failed' | 'missing'; playlistUrl: string; playable: boolean; mode: ConversionMode }
@@ -79,3 +81,5 @@ export const api = {
 export const contentUrl = (id: string) => `/api/v1/fs/content?id=${encodeURIComponent(id)}`
 export const mediaUrl = (id: string) => `/api/v1/media/file?id=${encodeURIComponent(id)}`
 export const thumbnailUrl = (id: string, size: string) => `/api/v1/previews/thumbnail?id=${encodeURIComponent(id)}&size=${size}`
+export const provenanceEventsUrl = '/api/v1/fs/provenance/events'
+export const filesystemEventsUrl = '/api/v1/fs/events'
