@@ -6,7 +6,7 @@ import remarkGfm from 'remark-gfm'
 import rehypeSanitize from 'rehype-sanitize'
 import Hls from 'hls.js'
 import {
-  ChevronRight, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
+  ChevronLeft, ChevronRight, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
   Film, Folder, FolderOpen, Grid2X2, LogOut, Maximize2, Menu, MoreHorizontal,
   ExternalLink, Link2, Minus, Move, Plus, RefreshCw, RotateCw, Save, Search, Trash2, Upload, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
@@ -356,6 +356,9 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const gridRows = (activePage?.entries ?? []).filter(entry => entry.name.toLowerCase().includes(filter.toLowerCase())).map(entry => ({ entry, depth: 0 }))
   const visibleCount = gridRows.length
   const previewEntries = Array.from(selected).map(id => findEntry(id, root, expanded)).filter((entry): entry is Entry => Boolean(entry))
+  const viewerImages = viewer?.type === 'image'
+    ? ((viewer.entry.parentId === '' ? root : expanded[viewer.entry.parentId])?.entries.filter(entry => entry.mime.startsWith('image/')) ?? [viewer.entry])
+    : []
   return <div className="app-shell">
     <header className="topbar">
       <div className="brand"><FolderOpen size={20} /><strong>Remote Files</strong><span>/fs-root</span></div>
@@ -397,7 +400,9 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       </main>
     </div>
     {editor && <EditorWindow document={editor} onClose={() => setEditor(null)} onSaved={setEditor} />}
-    {viewer && <ViewerWindow {...viewer} onClose={() => setViewer(null)} />}
+    {viewer && <ViewerWindow {...viewer} images={viewerImages} onNavigate={entry => {
+      setViewer({ entry, type: 'image' }); setSelected(new Set([entry.id])); setPrimary(entry)
+    }} onClose={() => setViewer(null)} />}
     {trash && <TrashWindow items={trash} onClose={() => setTrash(null)} onChanged={async () => setTrash(await api.listTrash())} onRestored={entry => refresh(entry.parentId)} setError={setError} />}
     {folderMenu && <FolderContextMenu {...folderMenu} close={() => setFolderMenu(null)} createItem={createItem} setError={setError} />}
   </div>
@@ -713,13 +718,34 @@ function EditorWindow({ document, onClose, onSaved }: { document: DocumentFile; 
   </FloatingWindow>
 }
 
-function ViewerWindow({ entry, type, onClose }: { entry: Entry; type: 'image' | 'video'; onClose: () => void }) {
+function ViewerWindow({ entry, type, images, onNavigate, onClose }: { entry: Entry; type: 'image' | 'video'; images: Entry[]; onNavigate: (entry: Entry) => void; onClose: () => void }) {
   const [zoom, setZoom] = useState(1)
   const [rotate, setRotate] = useState(0)
+  const imageIndex = images.findIndex(image => image.id === entry.id)
+  const navigate = useCallback((direction: -1 | 1) => {
+    if (images.length < 2) return
+    const current = imageIndex >= 0 ? imageIndex : 0
+    onNavigate(images[(current + direction + images.length) % images.length])
+  }, [imageIndex, images, onNavigate])
+  useEffect(() => { setZoom(1); setRotate(0) }, [entry.id])
+  useEffect(() => {
+    if (type !== 'image') return
+    const keyboard = (event: KeyboardEvent) => {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+      event.preventDefault(); event.stopPropagation()
+      navigate(event.key === 'ArrowLeft' ? -1 : 1)
+    }
+    addEventListener('keydown', keyboard, { capture: true })
+    return () => removeEventListener('keydown', keyboard, { capture: true })
+  }, [navigate, type])
   return <FloatingWindow title={entry.name} onClose={onClose} className="viewer-window">
     {type === 'image' ? <>
       <div className="window-toolbar"><button onClick={() => setZoom(z => Math.max(.25, z - .25))}><ZoomOut /></button><span>{Math.round(zoom * 100)}%</span><button onClick={() => setZoom(z => Math.min(5, z + .25))}><ZoomIn /></button><button onClick={() => setRotate(r => r + 90)}><RotateCw /></button><a className="button" href={contentUrl(entry.id)}><Download /> Download</a></div>
-      <div className="image-stage"><img src={mediaUrl(entry.id)} style={{ transform: `scale(${zoom}) rotate(${rotate}deg)` }} /></div>
+      <div className="image-stage">
+        <button className="image-nav previous" disabled={images.length < 2} aria-label="Previous image" title="Previous image (Left Arrow)" onClick={() => navigate(-1)}><ChevronLeft /></button>
+        <img src={mediaUrl(entry.id)} alt={entry.name} style={{ transform: `scale(${zoom}) rotate(${rotate}deg)` }} />
+        <button className="image-nav next" disabled={images.length < 2} aria-label="Next image" title="Next image (Right Arrow)" onClick={() => navigate(1)}><ChevronRight /></button>
+      </div>
     </> : <VideoPlayer entry={entry} />}
   </FloatingWindow>
 }
@@ -795,8 +821,12 @@ function FloatingWindow({ title, onClose, className = '', children }: { title: s
   const [position, setPosition] = useState({ x: Math.max(20, innerWidth * .12), y: 90 })
   const [minimized, setMinimized] = useState(false)
   const drag = useRef<{ x: number; y: number } | null>(null)
+  const toggleMinimized = (event?: React.MouseEvent) => {
+    event?.preventDefault(); event?.stopPropagation()
+    setMinimized(value => !value)
+  }
   return <div className={`floating ${minimized ? 'minimized' : ''} ${className}`} style={{ left: position.x, top: position.y }}>
-    <div className="window-title" onDoubleClick={() => setMinimized(value => !value)} onPointerDown={e => { drag.current = { x: e.clientX - position.x, y: e.clientY - position.y }; e.currentTarget.setPointerCapture(e.pointerId) }} onPointerMove={e => { if (drag.current) setPosition({ x: Math.max(0, e.clientX - drag.current.x), y: Math.max(0, e.clientY - drag.current.y) }) }} onPointerUp={() => { drag.current = null }}><span>{title}</span><div className="window-actions"><button aria-label={`${minimized ? 'Restore' : 'Minimize'} ${title}`} title={minimized ? 'Restore' : 'Minimize'} onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={() => setMinimized(value => !value)}>{minimized ? <Maximize2 /> : <Minus />}</button><button aria-label={`Close ${title}`} title="Close" onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={onClose}><X /></button></div></div>
+    <div className="window-title" onDoubleClick={() => toggleMinimized()} onPointerDown={e => { drag.current = { x: e.clientX - position.x, y: e.clientY - position.y }; e.currentTarget.setPointerCapture(e.pointerId) }} onPointerMove={e => { if (drag.current) setPosition({ x: Math.max(0, e.clientX - drag.current.x), y: Math.max(0, e.clientY - drag.current.y) }) }} onPointerUp={() => { drag.current = null }}><span>{title}</span><div className="window-actions"><button type="button" aria-label={`${minimized ? 'Restore' : 'Minimize'} ${title}`} title={minimized ? 'Restore' : 'Minimize'} onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={toggleMinimized}>{minimized ? <Maximize2 /> : <Minus />}</button><button type="button" aria-label={`Close ${title}`} title="Close" onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={onClose}><X /></button></div></div>
     {children}
   </div>
 }
