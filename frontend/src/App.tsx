@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import CodeMirror from '@uiw/react-codemirror'
 import { markdown } from '@codemirror/lang-markdown'
 import ReactMarkdown from 'react-markdown'
@@ -405,6 +406,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     }} onClose={() => setViewer(null)} />}
     {trash && <TrashWindow items={trash} onClose={() => setTrash(null)} onChanged={async () => setTrash(await api.listTrash())} onRestored={entry => refresh(entry.parentId)} setError={setError} />}
     {folderMenu && <FolderContextMenu {...folderMenu} close={() => setFolderMenu(null)} createItem={createItem} setError={setError} />}
+    <div id="window-tray" className="window-tray" role="region" aria-label="Minimized windows" />
   </div>
 }
 
@@ -825,10 +827,17 @@ function FloatingWindow({ title, onClose, className = '', children }: { title: s
     event?.preventDefault(); event?.stopPropagation()
     setMinimized(value => !value)
   }
-  return <div className={`floating ${minimized ? 'minimized' : ''} ${className}`} style={{ left: position.x, top: position.y }}>
-    <div className="window-title" onDoubleClick={() => toggleMinimized()} onPointerDown={e => { drag.current = { x: e.clientX - position.x, y: e.clientY - position.y }; e.currentTarget.setPointerCapture(e.pointerId) }} onPointerMove={e => { if (drag.current) setPosition({ x: Math.max(0, e.clientX - drag.current.x), y: Math.max(0, e.clientY - drag.current.y) }) }} onPointerUp={() => { drag.current = null }}><span>{title}</span><div className="window-actions"><button type="button" aria-label={`${minimized ? 'Restore' : 'Minimize'} ${title}`} title={minimized ? 'Restore' : 'Minimize'} onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={toggleMinimized}>{minimized ? <Maximize2 /> : <Minus />}</button><button type="button" aria-label={`Close ${title}`} title="Close" onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={onClose}><X /></button></div></div>
-    {children}
-  </div>
+  const tray = minimized ? document.getElementById('window-tray') : null
+  return <>
+    <div className={`floating ${minimized ? 'stashed' : ''} ${className}`} style={{ left: position.x, top: position.y }} aria-hidden={minimized}>
+      <div className="window-title" onDoubleClick={() => toggleMinimized()} onPointerDown={e => { drag.current = { x: e.clientX - position.x, y: e.clientY - position.y }; e.currentTarget.setPointerCapture(e.pointerId) }} onPointerMove={e => { if (drag.current) setPosition({ x: Math.max(0, e.clientX - drag.current.x), y: Math.max(0, e.clientY - drag.current.y) }) }} onPointerUp={() => { drag.current = null }}><span>{title}</span><div className="window-actions"><button type="button" aria-label={`Minimize ${title}`} title="Minimize to tray" onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={toggleMinimized}><Minus /></button><button type="button" aria-label={`Close ${title}`} title="Close" onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={onClose}><X /></button></div></div>
+      {children}
+    </div>
+    {tray && createPortal(<div className="window-tray-item">
+      <button type="button" className="window-tray-restore" title={`Restore ${title}`} onClick={toggleMinimized}><Maximize2 /><span>{title}</span></button>
+      <button type="button" className="window-tray-close" aria-label={`Close ${title}`} title={`Close ${title}`} onClick={onClose}><X /></button>
+    </div>, tray)}
+  </>
 }
 
 function FileGlyph({ entry }: { entry: Pick<Entry, 'kind'> & Partial<Entry> }) {
