@@ -57,6 +57,7 @@ struct AppState {
     sessions: Arc<DashMap<String, Session>>,
     login_attempts: Arc<DashMap<String, Vec<SystemTime>>>,
     media_jobs: Arc<DashMap<String, MediaJob>>,
+    extraction_jobs: Arc<DashMap<String, ExtractionJob>>,
     provenance: Arc<RwLock<HashMap<String, Vec<String>>>>,
     provenance_write: Arc<Mutex<()>>,
     provenance_events: broadcast::Sender<ProvenanceEvent>,
@@ -177,6 +178,10 @@ type ApiResult<T> = Result<T, ApiError>;
         purge_trash,
         thumbnail,
         media_file,
+        media_info,
+        start_extraction,
+        list_extraction_jobs,
+        extraction_status,
         start_hls,
         list_media_jobs,
         hls_status,
@@ -202,7 +207,10 @@ type ApiResult<T> = Result<T, ApiError>;
         WriteDocument,
         HlsRequest,
         HlsResponse,
-        MediaJob
+        MediaJob,
+        MediaInfo,
+        ExtractionRequest,
+        ExtractionJob
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -300,6 +308,7 @@ async fn main() {
         sessions: Arc::new(DashMap::new()),
         login_attempts: Arc::new(DashMap::new()),
         media_jobs: Arc::new(DashMap::new()),
+        extraction_jobs: Arc::new(DashMap::new()),
         provenance: Arc::new(RwLock::new(provenance)),
         provenance_write: Arc::new(Mutex::new(())),
         provenance_events: provenance_event_tx,
@@ -335,6 +344,12 @@ async fn main() {
         .route("/trash/{id}", delete(purge_trash))
         .route("/previews/thumbnail", get(thumbnail))
         .route("/media/file", get(media_file))
+        .route("/media/info", get(media_info))
+        .route(
+            "/media/extractions",
+            post(start_extraction).get(list_extraction_jobs),
+        )
+        .route("/media/extractions/{key}", get(extraction_status))
         .route("/media/hls", post(start_hls))
         .route("/media/jobs", get(list_media_jobs))
         .route("/media/hls/{key}/status", get(hls_status))
@@ -567,7 +582,7 @@ fn random_token() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Clone, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct Entry {
     id: String,
@@ -2111,6 +2126,392 @@ async fn media_file(
     serve_file(path, &headers, true).await
 }
 
+#[derive(Clone, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct MediaInfo {
+    duration_seconds: f64,
+    frame_rate: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct MediaProbeOutput {
+    streams: Vec<MediaProbeStream>,
+    format: MediaProbeFormat,
+}
+
+#[derive(Deserialize)]
+struct MediaProbeStream {
+    codec_type: Option<String>,
+    avg_frame_rate: Option<String>,
+    r_frame_rate: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MediaProbeFormat {
+    duration: Option<String>,
+}
+
+fn parse_frame_rate(value: &str) -> Option<f64> {
+    let (numerator, denominator) = value.split_once('/')?;
+    let numerator = numerator.parse::<f64>().ok()?;
+    let denominator = denominator.parse::<f64>().ok()?;
+    let rate = numerator / denominator;
+    (rate.is_finite() && rate > 0.0).then_some(rate)
+}
+
+async fn probe_media(source: &Path) -> ApiResult<MediaInfo> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,avg_frame_rate,r_frame_rate:format=duration",
+            "-of",
+            "json",
+        ])
+        .arg(source)
+        .output()
+        .await
+        .map_err(ApiError::internal)?;
+    if !output.status.success() {
+        return Err(ApiError::bad(
+            "not_video",
+            "FFprobe could not read this video",
+        ));
+    }
+    let probe: MediaProbeOutput =
+        serde_json::from_slice(&output.stdout).map_err(ApiError::internal)?;
+    let video = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("video"))
+        .ok_or_else(|| ApiError::bad("not_video", "The selected file has no video stream"))?;
+    let duration_seconds = probe
+        .format
+        .duration
+        .as_deref()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| ApiError::bad("invalid_duration", "The video duration is unavailable"))?;
+    let frame_rate = video
+        .avg_frame_rate
+        .as_deref()
+        .and_then(parse_frame_rate)
+        .or_else(|| video.r_frame_rate.as_deref().and_then(parse_frame_rate));
+    Ok(MediaInfo {
+        duration_seconds,
+        frame_rate,
+    })
+}
+
+#[utoipa::path(get, path = "/api/v1/media/info", tag = "media", params(("id" = String, Query)), security(("sessionCookie" = [])), responses((status = 200, body = MediaInfo), (status = 400, body = Problem)))]
+async fn media_info(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(query): Query<IdQuery>,
+) -> ApiResult<Json<MediaInfo>> {
+    require_session(&state, &jar)?;
+    let source = resolve_existing(&state.config, &query.id).await?;
+    if !fs::metadata(&source).await?.is_file() {
+        return Err(ApiError::bad(
+            "not_file",
+            "Video source must be a regular file",
+        ));
+    }
+    Ok(Json(probe_media(&source).await?))
+}
+
+#[derive(Clone, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct ExtractionRequest {
+    id: String,
+    kind: String,
+    time: Option<f64>,
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+}
+
+#[derive(Clone, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct ExtractionJob {
+    key: String,
+    file_name: String,
+    kind: String,
+    status: String,
+    time: Option<f64>,
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+    started_at: DateTime<Utc>,
+    error: Option<String>,
+    result: Option<Entry>,
+}
+
+fn valid_media_time(value: f64, duration: f64) -> bool {
+    value.is_finite() && value >= 0.0 && value < duration
+}
+
+fn timestamp_label(seconds: f64) -> String {
+    let millis = (seconds.max(0.0) * 1000.0).round() as u64;
+    format!(
+        "{:02}-{:02}-{:02}.{:03}",
+        millis / 3_600_000,
+        millis / 60_000 % 60,
+        millis / 1000 % 60,
+        millis % 1000
+    )
+}
+
+async fn publish_extraction(
+    temporary: &Path,
+    directory: &Path,
+    base: &str,
+    extension: &str,
+) -> ApiResult<PathBuf> {
+    for suffix in 1..=10_000 {
+        let name = if suffix == 1 {
+            format!("{base}.{extension}")
+        } else {
+            format!("{base}-{suffix}.{extension}")
+        };
+        let target = directory.join(name);
+        match fs::hard_link(temporary, &target).await {
+            Ok(()) => {
+                fs::remove_file(temporary).await?;
+                return Ok(target);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(ApiError::conflict(
+        "too_many_collisions",
+        "Could not choose a unique extraction filename",
+    ))
+}
+
+async fn run_extraction(
+    state: &AppState,
+    request: &ExtractionRequest,
+    source: &Path,
+) -> ApiResult<Entry> {
+    let directory = source
+        .parent()
+        .ok_or_else(|| ApiError::bad("invalid_path", "Video has no parent directory"))?;
+    let stem = source
+        .file_stem()
+        .unwrap_or_else(|| OsStr::new("video"))
+        .to_string_lossy();
+    let (base, extension, temporary, mut command) = if request.kind == "frame" {
+        let time = request.time.unwrap();
+        let base = format!("{stem}-frame-{}", timestamp_label(time));
+        let temporary = directory.join(format!(".rfb-extraction-{}.png", Uuid::new_v4()));
+        let mut command = Command::new("ffmpeg");
+        command
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(source)
+            .args([
+                "-ss",
+                &format!("{time:.6}"),
+                "-map",
+                "0:v:0",
+                "-frames:v",
+                "1",
+                "-y",
+            ])
+            .arg(&temporary);
+        (base, "png", temporary, command)
+    } else {
+        let start = request.start_time.unwrap();
+        let end = request.end_time.unwrap();
+        let base = format!(
+            "{stem}-clip-{}-to-{}",
+            timestamp_label(start),
+            timestamp_label(end)
+        );
+        let temporary = directory.join(format!(".rfb-extraction-{}.mp4", Uuid::new_v4()));
+        let mut command = Command::new("ffmpeg");
+        command
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(source)
+            .args([
+                "-ss",
+                &format!("{start:.6}"),
+                "-t",
+                &format!("{:.6}", end - start),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-sn",
+                "-dn",
+                "-vf",
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                "-y",
+            ])
+            .arg(&temporary);
+        (base, "mp4", temporary, command)
+    };
+    let output = match command.output().await {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(ApiError::internal(error));
+        }
+    };
+    if !output.status.success() {
+        let _ = fs::remove_file(&temporary).await;
+        let detail = String::from_utf8_lossy(&output.stderr);
+        error!(kind = %request.kind, source = %source.display(), %detail, "media extraction failed");
+        return Err(ApiError::bad(
+            "extraction_failed",
+            "FFmpeg could not extract the media",
+        ));
+    }
+    let target = match publish_extraction(&temporary, directory, &base, extension).await {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+    };
+    entry_from_path(state, target).await
+}
+
+#[utoipa::path(post, path = "/api/v1/media/extractions", tag = "media", params(("x-csrf-token" = String, Header)), request_body = ExtractionRequest, security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 202, body = ExtractionJob), (status = 400, body = Problem)))]
+async fn start_extraction(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Json(request): Json<ExtractionRequest>,
+) -> ApiResult<(StatusCode, Json<ExtractionJob>)> {
+    require_csrf(&state, &jar, &headers)?;
+    let source = resolve_existing(&state.config, &request.id).await?;
+    if !fs::metadata(&source).await?.is_file() {
+        return Err(ApiError::bad(
+            "not_file",
+            "Video source must be a regular file",
+        ));
+    }
+    let info = probe_media(&source).await?;
+    match request.kind.as_str() {
+        "frame"
+            if request
+                .time
+                .is_some_and(|time| valid_media_time(time, info.duration_seconds)) => {}
+        "segment"
+            if request
+                .start_time
+                .is_some_and(|time| valid_media_time(time, info.duration_seconds))
+                && request.end_time.is_some_and(|time| {
+                    time.is_finite() && time > 0.0 && time <= info.duration_seconds
+                })
+                && request.end_time.unwrap() > request.start_time.unwrap() => {}
+        "frame" | "segment" => {
+            return Err(ApiError::bad(
+                "invalid_time",
+                "Extraction timestamps are outside the video",
+            ));
+        }
+        _ => {
+            return Err(ApiError::bad(
+                "invalid_kind",
+                "Extraction kind must be frame or segment",
+            ));
+        }
+    }
+    let key = Uuid::new_v4().simple().to_string();
+    let job = ExtractionJob {
+        key: key.clone(),
+        file_name: source
+            .file_name()
+            .unwrap_or_else(|| OsStr::new("video"))
+            .to_string_lossy()
+            .into_owned(),
+        kind: request.kind.clone(),
+        status: "working".into(),
+        time: request.time,
+        start_time: request.start_time,
+        end_time: request.end_time,
+        started_at: Utc::now(),
+        error: None,
+        result: None,
+    };
+    state.extraction_jobs.insert(key.clone(), job.clone());
+    if state.extraction_jobs.len() > 100 {
+        let mut oldest = state
+            .extraction_jobs
+            .iter()
+            .filter(|candidate| candidate.status != "working")
+            .map(|candidate| (candidate.started_at, candidate.key.clone()))
+            .collect::<Vec<_>>();
+        oldest.sort_by_key(|candidate| candidate.0);
+        for (_, old_key) in oldest
+            .into_iter()
+            .take(state.extraction_jobs.len().saturating_sub(100))
+        {
+            state.extraction_jobs.remove(&old_key);
+        }
+    }
+    let task_state = state.clone();
+    tokio::spawn(async move {
+        let outcome = run_extraction(&task_state, &request, &source).await;
+        if let Some(mut job) = task_state.extraction_jobs.get_mut(&key) {
+            match outcome {
+                Ok(entry) => {
+                    job.status = "ready".into();
+                    job.result = Some(entry);
+                }
+                Err(error) => {
+                    job.status = "failed".into();
+                    job.error = Some(error.2);
+                }
+            }
+        }
+    });
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+#[utoipa::path(get, path = "/api/v1/media/extractions", tag = "media", security(("sessionCookie" = [])), responses((status = 200, body = [ExtractionJob])))]
+async fn list_extraction_jobs(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> ApiResult<Json<Vec<ExtractionJob>>> {
+    require_session(&state, &jar)?;
+    let mut jobs = state
+        .extraction_jobs
+        .iter()
+        .map(|job| job.value().clone())
+        .collect::<Vec<_>>();
+    jobs.sort_by_key(|job| std::cmp::Reverse(job.started_at));
+    jobs.truncate(20);
+    Ok(Json(jobs))
+}
+
+#[utoipa::path(get, path = "/api/v1/media/extractions/{key}", tag = "media", params(("key" = String, Path)), security(("sessionCookie" = [])), responses((status = 200, body = ExtractionJob), (status = 404, body = Problem)))]
+async fn extraction_status(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    AxumPath(key): AxumPath<String>,
+) -> ApiResult<Json<ExtractionJob>> {
+    require_session(&state, &jar)?;
+    let job = state
+        .extraction_jobs
+        .get(&key)
+        .map(|job| job.value().clone())
+        .ok_or_else(|| ApiError::not_found("Extraction job does not exist"))?;
+    Ok(Json(job))
+}
+
 #[derive(Deserialize, utoipa::ToSchema)]
 struct HlsRequest {
     id: String,
@@ -2250,7 +2651,7 @@ async fn list_media_jobs(
         .iter()
         .map(|job| job.value().clone())
         .collect::<Vec<_>>();
-    jobs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    jobs.sort_by_key(|job| std::cmp::Reverse(job.started_at));
     jobs.truncate(20);
     Ok(Json(jobs))
 }
@@ -2626,6 +3027,7 @@ mod tests {
             sessions: Arc::new(DashMap::new()),
             login_attempts: Arc::new(DashMap::new()),
             media_jobs: Arc::new(DashMap::new()),
+            extraction_jobs: Arc::new(DashMap::new()),
             provenance: Arc::new(RwLock::new(HashMap::new())),
             provenance_write: Arc::new(Mutex::new(())),
             provenance_events: events,
@@ -2762,6 +3164,9 @@ mod tests {
             ("/api/v1/trash/{id}", &["delete"][..]),
             ("/api/v1/previews/thumbnail", &["get"][..]),
             ("/api/v1/media/file", &["get"][..]),
+            ("/api/v1/media/info", &["get"][..]),
+            ("/api/v1/media/extractions", &["get", "post"][..]),
+            ("/api/v1/media/extractions/{key}", &["get"][..]),
             ("/api/v1/media/hls", &["post"][..]),
             ("/api/v1/media/jobs", &["get"][..]),
             ("/api/v1/media/hls/{key}/status", &["get"][..]),
@@ -2814,6 +3219,40 @@ mod tests {
             conversion_mode(&probe(("h264", "yuv420p10le"), Some("aac"))),
             ConversionMode::Full
         );
+    }
+    #[test]
+    fn frame_rates_are_parsed_safely() {
+        assert_eq!(parse_frame_rate("30000/1001").unwrap(), 30000.0 / 1001.0);
+        assert_eq!(parse_frame_rate("25/1"), Some(25.0));
+        assert_eq!(parse_frame_rate("0/0"), None);
+        assert_eq!(parse_frame_rate("invalid"), None);
+    }
+    #[test]
+    fn extraction_times_and_names_are_stable() {
+        assert!(valid_media_time(0.0, 10.0));
+        assert!(valid_media_time(9.999, 10.0));
+        assert!(!valid_media_time(10.0, 10.0));
+        assert!(!valid_media_time(f64::NAN, 10.0));
+        assert_eq!(timestamp_label(3661.234), "01-01-01.234");
+    }
+    #[tokio::test]
+    async fn extraction_publication_never_overwrites() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_temporary = directory.path().join("first.tmp");
+        std::fs::write(&first_temporary, b"first").unwrap();
+        let first = publish_extraction(&first_temporary, directory.path(), "clip", "mp4")
+            .await
+            .unwrap();
+        let second_temporary = directory.path().join("second.tmp");
+        std::fs::write(&second_temporary, b"second").unwrap();
+        let second = publish_extraction(&second_temporary, directory.path(), "clip", "mp4")
+            .await
+            .unwrap();
+        assert_eq!(first.file_name().unwrap(), "clip.mp4");
+        assert_eq!(second.file_name().unwrap(), "clip-2.mp4");
+        assert_eq!(std::fs::read(first).unwrap(), b"first");
+        assert_eq!(std::fs::read(second).unwrap(), b"second");
+        assert!(!first_temporary.exists() && !second_temporary.exists());
     }
     #[test]
     fn playlist_requires_segments_and_endlist_to_be_ready() {

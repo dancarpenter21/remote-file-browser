@@ -7,13 +7,14 @@ import remarkGfm from 'remark-gfm'
 import rehypeSanitize from 'rehype-sanitize'
 import Hls from 'hls.js'
 import {
-  ChevronLeft, ChevronRight, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
+  Camera, ChevronLeft, ChevronRight, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
   Film, Folder, FolderOpen, Grid2X2, LogOut, Maximize2, Menu, MoreHorizontal,
-  ExternalLink, Link2, Minus, Move, Plus, RefreshCw, RotateCw, Save, Search, Trash2, Upload, X, ZoomIn, ZoomOut,
+  ExternalLink, Link2, Minus, Move, Plus, RefreshCw, RotateCw, Save, Scissors, Search, Trash2, Upload, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
-import { api, ApiFailure, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, filesystemEventsUrl, FilesystemChange, mediaUrl, provenanceEventsUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
+import { api, ApiFailure, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, ExtractionJob, filesystemEventsUrl, FilesystemChange, mediaUrl, provenanceEventsUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { updateFinderPathForSelection } from './finderPath'
 import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState'
+import { formatMediaTime, ignoresVideoShortcut, stepFrame, validSegment } from './videoPlayerState'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type Clipboard = { operation: 'copy' | 'move'; ids: string[] } | null
@@ -412,20 +413,27 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
 
 function ConversionJobs() {
   const [jobs, setJobs] = useState<ConversionJob[]>([])
+  const [extractions, setExtractions] = useState<ExtractionJob[]>([])
   useEffect(() => {
     let active = true
-    const refresh = () => api.conversionJobs().then(next => { if (active) setJobs(next) }).catch(() => {})
+    const refresh = () => Promise.all([api.conversionJobs(), api.extractionJobs()]).then(([nextJobs, nextExtractions]) => {
+      if (active) { setJobs(nextJobs); setExtractions(nextExtractions) }
+    }).catch(() => {})
     refresh()
     const timer = window.setInterval(refresh, 2000)
     return () => { active = false; window.clearInterval(timer) }
   }, [])
-  return <div className="conversion-jobs" aria-label="Compatibility conversion jobs">
-    <div className="conversion-jobs-heading"><Film /> <span>Conversions</span>{jobs.some(job => job.status === 'working') && <span className="conversion-pulse" title="Conversions in progress" />}</div>
+  const working = jobs.some(job => job.status === 'working') || extractions.some(job => job.status === 'working')
+  return <div className="conversion-jobs" aria-label="Media jobs">
+    <div className="conversion-jobs-heading"><Film /> <span>Media jobs</span>{working && <span className="conversion-pulse" title="Media work in progress" />}</div>
     <div className="conversion-job-list">
-      {jobs.length === 0 ? <p>No conversions yet.</p> : jobs.map(job => <div className={`conversion-job ${job.status}`} key={job.key} title={job.fileName}>
+      {jobs.length === 0 && extractions.length === 0 ? <p>No media jobs yet.</p> : <>{extractions.map(job => <div className={`conversion-job ${job.status}`} key={`extract-${job.key}`} title={job.fileName}>
+        <span className="conversion-status" aria-label={job.status} />
+        <div><strong>{job.result?.name ?? job.fileName}</strong><small>{job.status === 'failed' ? job.error ?? 'Extraction failed' : `${job.kind === 'frame' ? 'Frame extraction' : 'Clip extraction'}${job.status === 'ready' ? ' complete' : '…'}`}</small></div>
+      </div>)}{jobs.map(job => <div className={`conversion-job ${job.status}`} key={job.key} title={job.fileName}>
         <span className="conversion-status" aria-label={job.status} />
         <div><strong>{job.fileName}</strong><small>{job.status === 'failed' ? 'Conversion failed' : `${job.mode === 'remux' ? 'Remuxing' : job.mode === 'audio' ? 'Converting audio' : 'Converting video'}${job.status === 'ready' ? ' complete' : job.playable ? ' · playing' : '…'}`}</small></div>
-      </div>)}
+      </div>)}</>}
     </div>
   </div>
 }
@@ -748,20 +756,31 @@ function ViewerWindow({ entry, type, images, onNavigate, onClose }: { entry: Ent
         <img src={mediaUrl(entry.id)} alt={entry.name} style={{ transform: `scale(${zoom}) rotate(${rotate}deg)` }} />
         <button className="image-nav next" disabled={images.length < 2} aria-label="Next image" title="Next image (Right Arrow)" onClick={() => navigate(1)}><ChevronRight /></button>
       </div>
-    </> : <VideoPlayer entry={entry} />}
+    </> : <VideoPlayer entry={entry} editing />}
   </FloatingWindow>
 }
 
-function VideoPlayer({ entry, autoPlay = true }: { entry: Entry; autoPlay?: boolean }) {
+function VideoPlayer({ entry, autoPlay = true, editing = false }: { entry: Entry; autoPlay?: boolean; editing?: boolean }) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const hlsRef = useRef<Hls | null>(null)
   const cancelled = useRef(false)
   const fallbackStarted = useRef(false)
   const [message, setMessage] = useState('')
+  const [actionMessage, setActionMessage] = useState('')
+  const [currentTime, setCurrentTime] = useState(0)
+  const [duration, setDuration] = useState(0)
+  const [frameRate, setFrameRate] = useState<number>()
+  const [markIn, setMarkIn] = useState<number>()
+  const [markOut, setMarkOut] = useState<number>()
+  const [extracting, setExtracting] = useState(false)
   useEffect(() => {
     cancelled.current = false; fallbackStarted.current = false
+    setCurrentTime(0); setDuration(0); setFrameRate(undefined); setMarkIn(undefined); setMarkOut(undefined); setActionMessage(''); setExtracting(false)
+    if (editing) api.mediaInfo(entry.id).then(info => {
+      if (!cancelled.current) { setDuration(info.durationSeconds); setFrameRate(info.frameRate ?? undefined) }
+    }).catch(e => { if (!cancelled.current) setActionMessage(messageOf(e)) })
     return () => { cancelled.current = true; hlsRef.current?.destroy(); hlsRef.current = null }
-  }, [entry.id])
+  }, [editing, entry.id])
   const attach = (playlistUrl: string) => {
     const video = videoRef.current
     if (!video || cancelled.current) return
@@ -793,7 +812,76 @@ function VideoPlayer({ entry, autoPlay = true }: { entry: Entry; autoPlay?: bool
       setMessage('')
     } catch (e) { setMessage(messageOf(e)) }
   }
-  return <div className="video-stage"><video ref={videoRef} src={mediaUrl(entry.id)} controls muted autoPlay={autoPlay} preload={autoPlay ? 'auto' : 'metadata'} onError={fallback} />{message && <div className="video-message">{message}</div>}</div>
+  const step = (direction: -1 | 1) => {
+    const video = videoRef.current
+    if (!video || !frameRate || !duration) return
+    video.pause()
+    const next = stepFrame(video.currentTime, direction, frameRate, duration)
+    video.currentTime = next; setCurrentTime(next)
+  }
+  const awaitExtraction = async (job: ExtractionJob) => {
+    setExtracting(true)
+    setActionMessage(job.kind === 'frame' ? 'Extracting frame…' : 'Extracting segment…')
+    try {
+      let current = job
+      while (current.status === 'working' && !cancelled.current) {
+        await new Promise(resolve => setTimeout(resolve, 750))
+        current = await api.extractionStatus(current.key)
+      }
+      if (cancelled.current) return
+      if (current.status === 'failed') throw new Error(current.error || 'Extraction failed')
+      setActionMessage(`Created ${current.result?.name ?? 'extraction'}`)
+    } catch (error) { if (!cancelled.current) setActionMessage(messageOf(error)) }
+    finally { if (!cancelled.current) setExtracting(false) }
+  }
+  const extractFrame = () => {
+    const time = Math.min(currentTime, Math.max(0, duration - (frameRate ? 1 / frameRate : .001)))
+    setExtracting(true); setActionMessage('Starting frame extraction…')
+    void api.startExtraction({ id: entry.id, kind: 'frame', time }).then(awaitExtraction).catch(error => { setExtracting(false); setActionMessage(messageOf(error)) })
+  }
+  const extractSegment = () => {
+    if (!validSegment(markIn, markOut)) return
+    setExtracting(true); setActionMessage('Starting segment extraction…')
+    void api.startExtraction({ id: entry.id, kind: 'segment', startTime: markIn, endTime: markOut! }).then(awaitExtraction).catch(error => { setExtracting(false); setActionMessage(messageOf(error)) })
+  }
+  useEffect(() => {
+    if (!editing) return
+    const keyboard = (event: KeyboardEvent) => {
+      if (ignoresVideoShortcut(event.target) || event.metaKey || event.ctrlKey || event.altKey) return
+      if (event.key === ',') { event.preventDefault(); step(-1) }
+      else if (event.key === '.') { event.preventDefault(); step(1) }
+      else if (event.key.toLowerCase() === 'i' && !event.shiftKey) { event.preventDefault(); setMarkIn(currentTime) }
+      else if (event.key.toLowerCase() === 'o' && !event.shiftKey) { event.preventDefault(); setMarkOut(currentTime) }
+      else if (event.key.toLowerCase() === 'f' && event.shiftKey && !extracting) { event.preventDefault(); extractFrame() }
+      else if (event.key.toLowerCase() === 'x' && event.shiftKey && !extracting && validSegment(markIn, markOut)) { event.preventDefault(); extractSegment() }
+    }
+    addEventListener('keydown', keyboard)
+    return () => removeEventListener('keydown', keyboard)
+  }, [currentTime, duration, editing, extracting, frameRate, markIn, markOut])
+  return <div className={`video-player ${editing ? 'editing' : ''}`}>
+    <div className="video-stage"><video ref={videoRef} src={mediaUrl(entry.id)} controls muted autoPlay={autoPlay} preload={autoPlay ? 'auto' : 'metadata'} onError={fallback} onLoadedMetadata={event => { if (!duration && Number.isFinite(event.currentTarget.duration)) setDuration(event.currentTarget.duration) }} onTimeUpdate={event => setCurrentTime(event.currentTarget.currentTime)} onSeeked={event => setCurrentTime(event.currentTarget.currentTime)} />{message && <div className="video-message">{message}</div>}</div>
+    {editing && <div className="video-tools" aria-label="Video extraction controls">
+      <div className="frame-controls">
+        <button title="Previous frame (,)" aria-label="Previous frame" disabled={!frameRate} onClick={() => step(-1)}><ChevronLeft /></button>
+        <code>{formatMediaTime(currentTime)}</code>
+        <button title="Next frame (.)" aria-label="Next frame" disabled={!frameRate} onClick={() => step(1)}><ChevronRight /></button>
+        <span className="fps">{frameRate ? `${frameRate.toFixed(3)} fps` : 'FPS unavailable'}</span>
+      </div>
+      <div className="marker-controls">
+        <button title="Set In (I)" onClick={() => setMarkIn(currentTime)}>In</button>
+        <code>{markIn === undefined ? '--:--:--.---' : formatMediaTime(markIn)}</code>
+        <button title="Clear In" disabled={markIn === undefined} onClick={() => setMarkIn(undefined)}><X /></button>
+        <button title="Set Out (O)" onClick={() => setMarkOut(currentTime)}>Out</button>
+        <code>{markOut === undefined ? '--:--:--.---' : formatMediaTime(markOut)}</code>
+        <button title="Clear Out" disabled={markOut === undefined} onClick={() => setMarkOut(undefined)}><X /></button>
+      </div>
+      <div className="extract-controls">
+        <button title="Extract frame (Shift+F)" disabled={extracting || !duration} onClick={extractFrame}><Camera /> Frame</button>
+        <button title="Extract segment (Shift+X)" disabled={extracting || !validSegment(markIn, markOut)} onClick={extractSegment}><Scissors /> Segment</button>
+      </div>
+      {actionMessage && <div className="video-action-message" role="status">{actionMessage}</div>}
+    </div>}
+  </div>
 }
 
 function TrashWindow({ items, onClose, onChanged, onRestored, setError }: { items: TrashEntry[]; onClose: () => void; onChanged: () => Promise<void>; onRestored: (entry: Entry) => Promise<void>; setError: (s: string) => void }) {

@@ -32,6 +32,19 @@ export type FilesystemChange = { directoryIds: string[] }
 export type ConversionMode = 'remux' | 'audio' | 'full'
 export type ConversionJob = { key: string; fileName: string; status: 'working' | 'ready' | 'failed'; playable: boolean; mode: ConversionMode; startedAt: string }
 export type HlsJob = { key: string; status: 'working' | 'ready' | 'failed' | 'missing'; playlistUrl: string; playable: boolean; mode: ConversionMode }
+export type MediaInfo = { durationSeconds: number; frameRate: number | null }
+export type ExtractionJob = {
+  key: string
+  fileName: string
+  kind: 'frame' | 'segment'
+  status: 'working' | 'ready' | 'failed'
+  time?: number
+  startTime?: number
+  endTime?: number
+  startedAt: string
+  error?: string
+  result?: Entry
+}
 
 export class ApiFailure extends Error {
   constructor(public status: number, public code: string, message: string) { super(message) }
@@ -76,6 +89,11 @@ export const api = {
   startHls: (id: string) => request<HlsJob>('/media/hls', { method: 'POST', body: JSON.stringify({ id }) }),
   hlsStatus: (key: string) => request<HlsJob>(`/media/hls/${key}/status`),
   conversionJobs: () => request<ConversionJob[]>('/media/jobs'),
+  mediaInfo: (id: string) => request<MediaInfo>(`/media/info?id=${encodeURIComponent(id)}`),
+  startExtraction: (input: { id: string; kind: 'frame'; time: number } | { id: string; kind: 'segment'; startTime: number; endTime: number }) =>
+    request<ExtractionJob>('/media/extractions', { method: 'POST', body: JSON.stringify(input) }),
+  extractionJobs: () => request<ExtractionJob[]>('/media/extractions'),
+  extractionStatus: (key: string) => request<ExtractionJob>(`/media/extractions/${encodeURIComponent(key)}`),
 }
 
 export const contentUrl = (id: string) => `/api/v1/fs/content?id=${encodeURIComponent(id)}`
