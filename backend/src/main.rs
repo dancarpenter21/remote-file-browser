@@ -669,6 +669,13 @@ async fn list_entries(
     if query.direction.as_deref() == Some("desc") {
         entries.reverse();
     }
+    if let Some(index) = entries
+        .iter()
+        .position(|entry| is_readme_file(&entry.name, &entry.kind))
+    {
+        let readme = entries.remove(index);
+        entries.insert(0, readme);
+    }
     let total = entries.len();
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
     let page = entries
@@ -682,6 +689,10 @@ async fn list_entries(
         total,
         next_offset,
     }))
+}
+
+fn is_readme_file(name: &str, kind: &str) -> bool {
+    name == "README.md" && kind == "file"
 }
 
 #[derive(Deserialize)]
@@ -3150,6 +3161,12 @@ mod tests {
     #[test]
     fn traversal_is_rejected() {
         assert!(decode_path(&URL_SAFE_NO_PAD.encode(b"../etc")).is_err());
+    }
+    #[test]
+    fn only_an_exact_readme_file_is_pinned() {
+        assert!(is_readme_file("README.md", "file"));
+        assert!(!is_readme_file("readme.md", "file"));
+        assert!(!is_readme_file("README.md", "directory"));
     }
     #[test]
     fn submitted_paths_are_root_relative_and_normalized() {
