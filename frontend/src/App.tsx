@@ -8,7 +8,7 @@ import rehypeSanitize from 'rehype-sanitize'
 import Hls from 'hls.js'
 import {
   Camera, ChevronLeft, ChevronRight, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
-  Film, Folder, FolderOpen, Grid2X2, LogOut, Maximize2, Menu, MoreHorizontal,
+  Film, Folder, FolderOpen, Grid2X2, LogOut, Maximize2, Menu, MoreHorizontal, Play,
   ExternalLink, Link2, Minus, Move, Plus, RefreshCw, RotateCw, Save, Scissors, Search, Trash2, Upload, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import { api, ApiFailure, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, ExtractionJob, filesystemEventsUrl, FilesystemChange, mediaUrl, provenanceEventsUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
@@ -209,10 +209,12 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       try { schedule((JSON.parse((event as MessageEvent).data) as FilesystemChange).directoryIds) }
       catch { void refreshDirectories() }
     }
+    const videoReady = () => void refreshDirectories()
     events.addEventListener('filesystem', filesystem)
     events.addEventListener('resync', () => void refreshDirectories())
+    addEventListener('rfb:video-ready', videoReady)
     events.onopen = () => void refreshDirectories()
-    return () => { clearTimeout(timer); events.close() }
+    return () => { clearTimeout(timer); events.close(); removeEventListener('rfb:video-ready', videoReady) }
   }, [hidden])
 
   const refresh = async (id = currentDir) => {
@@ -414,10 +416,16 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
 function ConversionJobs() {
   const [jobs, setJobs] = useState<ConversionJob[]>([])
   const [extractions, setExtractions] = useState<ExtractionJob[]>([])
+  const statuses = useRef<Record<string, ConversionJob['status']>>({})
   useEffect(() => {
     let active = true
     const refresh = () => Promise.all([api.conversionJobs(), api.extractionJobs()]).then(([nextJobs, nextExtractions]) => {
-      if (active) { setJobs(nextJobs); setExtractions(nextExtractions) }
+      if (active) {
+        const becameReady = nextJobs.some(job => job.status === 'ready' && statuses.current[job.key] !== 'ready')
+        statuses.current = Object.fromEntries(nextJobs.map(job => [job.key, job.status]))
+        setJobs(nextJobs); setExtractions(nextExtractions)
+        if (becameReady) dispatchEvent(new Event('rfb:video-ready'))
+      }
     }).catch(() => {})
     refresh()
     const timer = window.setInterval(refresh, 2000)
@@ -641,7 +649,7 @@ function FileList({ rows, view, selected, setSelected, setPrimary, activate, ren
   return <div className={`preview-list ${view}`}>
     {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => selectEntry(entry, index, event)} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
       <button className="card-menu" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>
-      {entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : entry.mime.startsWith('image/') || (view !== 'small' && entry.mime.startsWith('video/')) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view)} loading="lazy" /></button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
+      {entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : entry.mime.startsWith('image/') || (view !== 'small' && entry.mime.startsWith('video/')) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view)} loading="lazy" />{entry.mime.startsWith('video/') && entry.browserReady && <VideoReadyBadge />}</button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
       <button className="filename" tabIndex={-1} title={entry.name}>{entry.name}</button>
       {view !== 'small' && <small>{formatBytes(entry.size)}</small>}
     </div>)}
@@ -767,6 +775,8 @@ function VideoPlayer({ entry, autoPlay = true, editing = false }: { entry: Entry
   const hlsRef = useRef<Hls | null>(null)
   const cancelled = useRef(false)
   const fallbackStarted = useRef(false)
+  const hlsFailure = useRef('')
+  const [hlsSource, setHlsSource] = useState<string>()
   const [message, setMessage] = useState('')
   const [actionMessage, setActionMessage] = useState('')
   const [currentTime, setCurrentTime] = useState(0)
@@ -776,7 +786,7 @@ function VideoPlayer({ entry, autoPlay = true, editing = false }: { entry: Entry
   const [markOut, setMarkOut] = useState<number>()
   const [extracting, setExtracting] = useState(false)
   useEffect(() => {
-    cancelled.current = false; fallbackStarted.current = false
+    cancelled.current = false; fallbackStarted.current = false; hlsFailure.current = ''; setHlsSource(undefined)
     setCurrentTime(0); setDuration(0); setFrameRate(undefined); setMarkIn(undefined); setMarkOut(undefined); setActionMessage(''); setExtracting(false)
     if (editing) api.mediaInfo(entry.id).then(info => {
       if (!cancelled.current) { setDuration(info.durationSeconds); setFrameRate(info.frameRate ?? undefined) }
@@ -784,17 +794,56 @@ function VideoPlayer({ entry, autoPlay = true, editing = false }: { entry: Entry
     return () => { cancelled.current = true; hlsRef.current?.destroy(); hlsRef.current = null }
   }, [editing, entry.id])
   const attach = (playlistUrl: string) => {
+    if (cancelled.current) return
+    hlsFailure.current = ''
+    setMessage('Loading browser-compatible stream…')
+    setHlsSource(playlistUrl)
+  }
+  useEffect(() => {
+    if (!hlsSource) return
     const video = videoRef.current
     if (!video || cancelled.current) return
-    if (video.canPlayType('application/vnd.apple.mpegurl')) video.src = playlistUrl
-    else if (Hls.isSupported()) {
-      hlsRef.current?.destroy()
+    let nativeReady: (() => void) | undefined
+    const startPlayback = () => {
+      if (cancelled.current) return
+      setMessage('')
+      if (autoPlay) void video.play().catch(() => {
+        if (!cancelled.current) setMessage('Stream ready. Press Play to start.')
+      })
+    }
+    if (Hls.isSupported()) {
+      let networkRecoveries = 0, mediaRecoveries = 0
       const hls = new Hls(); hlsRef.current = hls
-      hls.loadSource(playlistUrl); hls.attachMedia(video)
-    } else throw new Error('This browser cannot play HLS video')
-    setMessage('')
-    if (autoPlay) void video.play().catch(() => {})
-  }
+      hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(hlsSource))
+      hls.on(Hls.Events.MANIFEST_PARSED, startPlayback)
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (!data.fatal || cancelled.current) return
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRecoveries++ === 0) {
+          setMessage('Retrying the video stream…'); hls.startLoad(); return
+        }
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries++ === 0) {
+          setMessage('Recovering video playback…'); hls.recoverMediaError(); return
+        }
+        const reason = `${data.type}/${data.details}`
+        const detail = data.error?.message && data.error.message !== data.details ? `: ${data.error.message}` : ''
+        hlsFailure.current = `Video playback failed (${reason})${detail}`
+        setMessage(hlsFailure.current)
+        hls.destroy()
+        if (hlsRef.current === hls) hlsRef.current = null
+      })
+      hls.attachMedia(video)
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      nativeReady = startPlayback
+      video.addEventListener('canplay', nativeReady, { once: true })
+      video.src = hlsSource; video.load()
+    } else setMessage('This browser cannot play HLS video')
+    return () => {
+      if (nativeReady) video.removeEventListener('canplay', nativeReady)
+      const hls = hlsRef.current
+      hlsRef.current = null
+      hls?.destroy()
+    }
+  }, [autoPlay, hlsSource])
   const fallback = async () => {
     if (fallbackStarted.current) return
     fallbackStarted.current = true
@@ -811,8 +860,11 @@ function VideoPlayer({ entry, autoPlay = true, editing = false }: { entry: Entry
       if (cancelled.current) return
       if (current.status !== 'ready') throw new Error('Transcoding failed')
       if (!attached) attach(current.playlistUrl)
-      setMessage('')
     } catch (e) { setMessage(messageOf(e)) }
+  }
+  const handleVideoError = () => {
+    if (!hlsSource && !fallbackStarted.current) { void fallback(); return }
+    if (!hlsRef.current) setMessage(hlsFailure.current || mediaPlaybackError(videoRef.current?.error ?? null))
   }
   const step = (direction: -1 | 1) => {
     const video = videoRef.current
@@ -861,7 +913,7 @@ function VideoPlayer({ entry, autoPlay = true, editing = false }: { entry: Entry
     return () => removeEventListener('keydown', keyboard)
   }, [currentTime, duration, editing, extracting, frameRate, markIn, markOut])
   return <div className={`video-player ${editing ? 'editing' : ''}`}>
-    <div className="video-stage"><video ref={videoRef} src={mediaUrl(entry.id)} controls muted autoPlay={autoPlay} preload={autoPlay ? 'auto' : 'metadata'} onError={fallback} onLoadedMetadata={event => { if (!duration && Number.isFinite(event.currentTarget.duration)) setDuration(event.currentTarget.duration) }} onTimeUpdate={event => setCurrentTime(event.currentTarget.currentTime)} onSeeked={event => setCurrentTime(event.currentTarget.currentTime)} />{message && <div className="video-message">{message}</div>}</div>
+    <div className="video-stage"><video key={`${entry.id}:${hlsSource ? 'hls' : 'source'}`} ref={videoRef} src={hlsSource ? undefined : mediaUrl(entry.id)} controls muted autoPlay={!hlsSource && autoPlay} preload={autoPlay ? 'auto' : 'metadata'} onError={handleVideoError} onLoadedMetadata={event => { if (!duration && Number.isFinite(event.currentTarget.duration)) setDuration(event.currentTarget.duration) }} onTimeUpdate={event => setCurrentTime(event.currentTarget.currentTime)} onSeeked={event => setCurrentTime(event.currentTarget.currentTime)} />{message && <div className="video-message">{message}</div>}</div>
     {editing && <div className="video-tools" aria-label="Video extraction controls">
       <div className="frame-controls">
         <button title="Previous frame (,)" aria-label="Previous frame" disabled={!frameRate} onClick={() => step(-1)}><ChevronLeft /></button>
@@ -932,13 +984,23 @@ function FloatingWindow({ title, onClose, className = '', children }: { title: s
 
 function FileGlyph({ entry }: { entry: Pick<Entry, 'kind'> & Partial<Entry> }) {
   if (entry.kind === 'directory') return <Folder className="glyph folder" />
-  const icon = entry.mime?.startsWith('image/') ? <FileImage /> : entry.mime?.startsWith('video/') ? <Film /> : entry.mime?.startsWith('text/') ? <FileText /> : <File />
-  return <span className="file-glyph glyph">{icon}{entry.hasProvenance && <span className="provenance-check">✓</span>}</span>
+  const video = entry.mime?.startsWith('video/')
+  const icon = entry.mime?.startsWith('image/') ? <FileImage /> : video ? <Film /> : entry.mime?.startsWith('text/') ? <FileText /> : <File />
+  return <span className="file-glyph glyph">{icon}{video && entry.browserReady && <VideoReadyBadge />}{entry.hasProvenance && <span className="provenance-check">✓</span>}</span>
 }
+function VideoReadyBadge() { return <span className="browser-ready" aria-label="Ready to play in browser" title="Ready to play in browser"><Play aria-hidden="true" fill="currentColor" /></span> }
 function first<T>(set: Set<T>) { return set.values().next().value }
 function findEntry(id: string | undefined, root: EntryPage | null, pages: Record<string, EntryPage>) { if (id === undefined) return; return [...(root?.entries ?? []), ...Object.values(pages).flatMap(p => p.entries)].find(entry => entry.id === id) }
 function formatBytes(bytes: number) { if (bytes < 1024) return `${bytes} B`; const units = ['KB', 'MB', 'GB', 'TB']; let value = bytes / 1024, unit = 0; while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++ } return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}` }
 function formatDate(value?: string) { return value ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : '—' }
 function messageOf(error: unknown) { return error instanceof Error ? error.message : 'The operation failed' }
+function mediaPlaybackError(error: MediaError | null) {
+  if (!error) return 'Video playback failed.'
+  if (error.code === 1) return 'Video playback was aborted.'
+  if (error.code === 2) return 'The browser could not load the video stream.'
+  if (error.code === 3) return 'The browser could not decode the converted video.'
+  if (error.code === 4) return 'The converted video format is not supported by this browser.'
+  return error.message || 'Video playback failed.'
+}
 function clipboardError(text: string) { return `The browser denied clipboard access. Copy manually: ${text}` }
 function Empty({ label = 'This folder is empty' }: { label?: string }) { return <div className="empty"><FolderOpen /><strong>{label}</strong><span>Nothing to show here.</span></div> }

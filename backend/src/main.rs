@@ -57,6 +57,7 @@ struct AppState {
     sessions: Arc<DashMap<String, Session>>,
     login_attempts: Arc<DashMap<String, Vec<SystemTime>>>,
     media_jobs: Arc<DashMap<String, MediaJob>>,
+    direct_playable: Arc<DashMap<String, bool>>,
     extraction_jobs: Arc<DashMap<String, ExtractionJob>>,
     provenance: Arc<RwLock<HashMap<String, Vec<String>>>>,
     provenance_write: Arc<Mutex<()>>,
@@ -308,6 +309,7 @@ async fn main() {
         sessions: Arc::new(DashMap::new()),
         login_attempts: Arc::new(DashMap::new()),
         media_jobs: Arc::new(DashMap::new()),
+        direct_playable: Arc::new(DashMap::new()),
         extraction_jobs: Arc::new(DashMap::new()),
         provenance: Arc::new(RwLock::new(provenance)),
         provenance_write: Arc::new(Mutex::new(())),
@@ -602,6 +604,7 @@ struct Entry {
     symlink_target: Option<String>,
     etag: String,
     has_provenance: bool,
+    browser_ready: bool,
 }
 
 #[derive(Deserialize)]
@@ -1205,6 +1208,23 @@ async fn entry_from_path(state: &AppState, path: PathBuf) -> ApiResult<Entry> {
             .await
             .get(&id)
             .is_some_and(|urls| !urls.is_empty());
+    let browser_ready = if kind == "file" && mime.starts_with("video/") {
+        let key = hls_cache_key(&id, &meta);
+        if playlist_state(&config.cache.join("hls").join(&key)).1 {
+            true
+        } else if let Some(ready) = state.direct_playable.get(&key) {
+            *ready
+        } else {
+            let ready = probe_codec_info(&path)
+                .await
+                .as_ref()
+                .is_some_and(browser_compatible_source);
+            state.direct_playable.insert(key, ready);
+            ready
+        }
+    } else {
+        false
+    };
     Ok(Entry {
         id,
         parent_id: encode_path(parent.as_os_str()),
@@ -1231,6 +1251,7 @@ async fn entry_from_path(state: &AppState, path: PathBuf) -> ApiResult<Entry> {
         symlink_target,
         etag,
         has_provenance,
+        browser_ready,
     })
 }
 
@@ -2558,6 +2579,7 @@ impl ConversionMode {
 #[derive(Deserialize)]
 struct ProbeOutput {
     streams: Vec<ProbeStream>,
+    format: Option<ProbeFormat>,
 }
 
 #[derive(Deserialize)]
@@ -2565,6 +2587,11 @@ struct ProbeStream {
     codec_type: Option<String>,
     codec_name: Option<String>,
     pix_fmt: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProbeFormat {
+    format_name: Option<String>,
 }
 
 fn conversion_mode(probe: &ProbeOutput) -> ConversionMode {
@@ -2591,13 +2618,51 @@ fn conversion_mode(probe: &ProbeOutput) -> ConversionMode {
     }
 }
 
-async fn probe_conversion_mode(source: &Path) -> ConversionMode {
+fn browser_compatible_source(probe: &ProbeOutput) -> bool {
+    let formats = probe
+        .format
+        .as_ref()
+        .and_then(|format| format.format_name.as_deref())
+        .unwrap_or_default()
+        .split(',')
+        .collect::<Vec<_>>();
+    let video = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("video"));
+    let audio = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("audio"));
+    let Some(video) = video else {
+        return false;
+    };
+    if formats
+        .iter()
+        .any(|format| matches!(*format, "mov" | "mp4" | "m4a" | "3gp" | "3g2" | "mj2"))
+    {
+        return video.codec_name.as_deref() == Some("h264")
+            && matches!(video.pix_fmt.as_deref(), Some("yuv420p") | Some("yuvj420p"))
+            && audio.is_none_or(|stream| stream.codec_name.as_deref() == Some("aac"));
+    }
+    if formats.contains(&"webm") {
+        return matches!(
+            video.codec_name.as_deref(),
+            Some("vp8") | Some("vp9") | Some("av1")
+        ) && audio.is_none_or(|stream| {
+            matches!(stream.codec_name.as_deref(), Some("opus") | Some("vorbis"))
+        });
+    }
+    false
+}
+
+async fn probe_codec_info(source: &Path) -> Option<ProbeOutput> {
     let output = Command::new("ffprobe")
         .args([
             "-v",
             "error",
             "-show_entries",
-            "stream=codec_type,codec_name,pix_fmt",
+            "format=format_name:stream=codec_type,codec_name,pix_fmt",
             "-of",
             "json",
         ])
@@ -2605,13 +2670,17 @@ async fn probe_conversion_mode(source: &Path) -> ConversionMode {
         .output()
         .await;
     match output {
-        Ok(output) if output.status.success() => {
-            serde_json::from_slice::<ProbeOutput>(&output.stdout)
-                .map(|probe| conversion_mode(&probe))
-                .unwrap_or(ConversionMode::Full)
-        }
-        _ => ConversionMode::Full,
+        Ok(output) if output.status.success() => serde_json::from_slice(&output.stdout).ok(),
+        _ => None,
     }
+}
+
+async fn probe_conversion_mode(source: &Path) -> ConversionMode {
+    probe_codec_info(source)
+        .await
+        .as_ref()
+        .map(conversion_mode)
+        .unwrap_or(ConversionMode::Full)
 }
 
 fn playlist_state(directory: &Path) -> (bool, bool) {
@@ -2630,6 +2699,23 @@ fn playlist_state(directory: &Path) -> (bool, bool) {
         playable,
         playable && content.lines().any(|line| line == "#EXT-X-ENDLIST"),
     )
+}
+
+const HLS_CACHE_VERSION: &str = "ffmpeg-8.1.2-progressive-hls-v2";
+
+fn hls_cache_key(id: &str, source_meta: &std::fs::Metadata) -> String {
+    let fingerprint = format!(
+        "{}:{}:{:?}:{}",
+        id,
+        source_meta.len(),
+        source_meta.modified().ok(),
+        HLS_CACHE_VERSION
+    );
+    blake3::hash(fingerprint.as_bytes()).to_hex().to_string()
+}
+
+fn hls_cache_directory(cache: &Path, id: &str, source_meta: &std::fs::Metadata) -> PathBuf {
+    cache.join("hls").join(hls_cache_key(id, source_meta))
 }
 
 fn cached_mode(directory: &Path) -> String {
@@ -2672,14 +2758,8 @@ async fn start_hls(
         ));
     }
     let source_meta = fs::metadata(&source).await?;
-    let fingerprint = format!(
-        "{}:{}:{:?}:ffmpeg-8.1.2-progressive-hls-v2",
-        input.id,
-        source_meta.len(),
-        source_meta.modified().ok()
-    );
-    let key = blake3::hash(fingerprint.as_bytes()).to_hex().to_string();
-    let directory = state.config.cache.join("hls").join(&key);
+    let key = hls_cache_key(&input.id, &source_meta);
+    let directory = hls_cache_directory(&state.config.cache, &input.id, &source_meta);
     let playlist = directory.join("index.m3u8");
     let file_name = source
         .file_name()
@@ -3027,6 +3107,7 @@ mod tests {
             sessions: Arc::new(DashMap::new()),
             login_attempts: Arc::new(DashMap::new()),
             media_jobs: Arc::new(DashMap::new()),
+            direct_playable: Arc::new(DashMap::new()),
             extraction_jobs: Arc::new(DashMap::new()),
             provenance: Arc::new(RwLock::new(HashMap::new())),
             provenance_write: Arc::new(Mutex::new(())),
@@ -3048,7 +3129,12 @@ mod tests {
                 pix_fmt: None,
             });
         }
-        ProbeOutput { streams }
+        ProbeOutput {
+            streams,
+            format: Some(ProbeFormat {
+                format_name: Some("mov,mp4,m4a,3gp,3g2,mj2".into()),
+            }),
+        }
     }
     #[test]
     fn path_ids_round_trip_non_utf8() {
@@ -3203,6 +3289,22 @@ mod tests {
         );
     }
     #[test]
+    fn mp4_h264_aac_source_is_browser_compatible() {
+        assert!(browser_compatible_source(&probe(
+            ("h264", "yuv420p"),
+            Some("aac")
+        )));
+        let mut mislabeled_container = probe(("h264", "yuv420p"), Some("aac"));
+        mislabeled_container.format = Some(ProbeFormat {
+            format_name: Some("asf".into()),
+        });
+        assert!(!browser_compatible_source(&mislabeled_container));
+        assert!(!browser_compatible_source(&probe(
+            ("hevc", "yuv420p"),
+            Some("aac")
+        )));
+    }
+    #[test]
     fn compatible_video_with_other_audio_only_converts_audio() {
         assert_eq!(
             conversion_mode(&probe(("h264", "yuv420p"), Some("dts"))),
@@ -3270,5 +3372,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(playlist_state(directory.path()), (true, true));
+        std::fs::remove_file(directory.path().join("segment-00000.ts")).unwrap();
+        assert_eq!(playlist_state(directory.path()), (false, false));
+    }
+
+    #[tokio::test]
+    async fn video_entry_is_browser_ready_only_for_its_completed_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        let source = root.path().join("video.mp4");
+        std::fs::write(&source, b"video").unwrap();
+        let id = encode_path(OsStr::new("video.mp4"));
+        let source_meta = std::fs::metadata(&source).unwrap();
+        let directory = hls_cache_directory(&state.config.cache, &id, &source_meta);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("segment-00000.ts"), b"segment").unwrap();
+        std::fs::write(
+            directory.join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:4,\nsegment-00000.ts\n",
+        )
+        .unwrap();
+
+        assert!(
+            !entry_from_path(&state, source.clone())
+                .await
+                .unwrap()
+                .browser_ready
+        );
+
+        std::fs::write(
+            directory.join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:4,\nsegment-00000.ts\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        let ready = entry_from_path(&state, source.clone()).await.unwrap();
+        assert!(ready.browser_ready);
+        assert_eq!(serde_json::to_value(ready).unwrap()["browserReady"], true);
+
+        std::fs::write(&source, b"changed video").unwrap();
+        assert!(!entry_from_path(&state, source).await.unwrap().browser_ready);
+
+        let text = root.path().join("notes.txt");
+        std::fs::write(&text, b"notes").unwrap();
+        let text_id = encode_path(OsStr::new("notes.txt"));
+        let text_cache = hls_cache_directory(
+            &state.config.cache,
+            &text_id,
+            &std::fs::metadata(&text).unwrap(),
+        );
+        std::fs::create_dir_all(&text_cache).unwrap();
+        std::fs::write(text_cache.join("segment-00000.ts"), b"segment").unwrap();
+        std::fs::write(
+            text_cache.join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:4,\nsegment-00000.ts\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        assert!(!entry_from_path(&state, text).await.unwrap().browser_ready);
     }
 }

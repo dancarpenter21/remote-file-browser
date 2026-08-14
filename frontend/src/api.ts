@@ -16,6 +16,7 @@ export type Entry = {
   symlinkTarget?: string
   etag: string
   hasProvenance: boolean
+  browserReady: boolean
 }
 
 export type EntryPage = { entries: Entry[]; total: number; nextOffset?: number }
