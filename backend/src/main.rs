@@ -1210,7 +1210,7 @@ async fn entry_from_path(state: &AppState, path: PathBuf) -> ApiResult<Entry> {
             .is_some_and(|urls| !urls.is_empty());
     let browser_ready = if kind == "file" && mime.starts_with("video/") {
         let key = hls_cache_key(&id, &meta);
-        if playlist_state(&config.cache.join("hls").join(&key)).1 {
+        if playlist_state(&config.cache.join("hls").join(&key)).0 {
             true
         } else if let Some(ready) = state.direct_playable.get(&key) {
             *ready
@@ -3377,7 +3377,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn video_entry_is_browser_ready_only_for_its_completed_cache() {
+    async fn video_entry_is_browser_ready_once_its_cache_is_playable() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path(), None);
         let source = root.path().join("video.mp4");
@@ -3394,7 +3394,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            !entry_from_path(&state, source.clone())
+            entry_from_path(&state, source.clone())
                 .await
                 .unwrap()
                 .browser_ready

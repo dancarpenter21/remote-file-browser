@@ -416,15 +416,15 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
 function ConversionJobs() {
   const [jobs, setJobs] = useState<ConversionJob[]>([])
   const [extractions, setExtractions] = useState<ExtractionJob[]>([])
-  const statuses = useRef<Record<string, ConversionJob['status']>>({})
+  const playableJobs = useRef<Record<string, boolean>>({})
   useEffect(() => {
     let active = true
     const refresh = () => Promise.all([api.conversionJobs(), api.extractionJobs()]).then(([nextJobs, nextExtractions]) => {
       if (active) {
-        const becameReady = nextJobs.some(job => job.status === 'ready' && statuses.current[job.key] !== 'ready')
-        statuses.current = Object.fromEntries(nextJobs.map(job => [job.key, job.status]))
+        const becamePlayable = nextJobs.some(job => job.playable && !playableJobs.current[job.key])
+        playableJobs.current = Object.fromEntries(nextJobs.map(job => [job.key, job.playable]))
         setJobs(nextJobs); setExtractions(nextExtractions)
-        if (becameReady) dispatchEvent(new Event('rfb:video-ready'))
+        if (becamePlayable) dispatchEvent(new Event('rfb:video-ready'))
       }
     }).catch(() => {})
     refresh()
