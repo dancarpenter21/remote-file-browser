@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { formatMediaTime, stepFrame, validSegment } from './videoPlayerState'
+import { fitMediaWindow, formatMediaTime, stepFrame, validSegment } from './videoPlayerState'
 
 describe('video player state', () => {
   it('formats media time to milliseconds', () => {
@@ -12,6 +12,14 @@ describe('video player state', () => {
     expect(stepFrame(1, -1, 25, 10)).toBeCloseTo(.96)
     expect(stepFrame(0, -1, 25, 10)).toBe(0)
     expect(stepFrame(10, 1, 25, 10)).toBeCloseTo(9.96)
+    expect(stepFrame(1.039999, 1, 25, 10)).toBeCloseTo(1.08)
+    expect(stepFrame(1.039, 1, 25, 10)).toBeCloseTo(1.08)
+  })
+
+  it('fits intrinsic media dimensions without upscaling and caps them to the viewport', () => {
+    expect(fitMediaWindow(640, 480, 1200, 900, 100)).toEqual({ width: 640, height: 580 })
+    expect(fitMediaWindow(1920, 1080, 1200, 800, 100)).toEqual({ width: 1200, height: 775 })
+    expect(fitMediaWindow(0, 480, 1200, 800, 100)).toBeUndefined()
   })
 
   it('requires ordered in and out markers', () => {

@@ -12,9 +12,10 @@ import {
   ExternalLink, Link2, Minus, Move, Plus, RefreshCw, RotateCw, Save, Scissors, Search, Trash2, Upload, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import { api, ApiFailure, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, ExtractionJob, filesystemEventsUrl, FilesystemChange, mediaUrl, provenanceEventsUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
+import { deleteConfirmationMessage } from './deleteConfirmation'
 import { updateFinderPathForSelection } from './finderPath'
 import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState'
-import { formatMediaTime, ignoresVideoShortcut, stepFrame, validSegment } from './videoPlayerState'
+import { fitMediaWindow, formatMediaTime, ignoresVideoShortcut, stepFrame, validSegment } from './videoPlayerState'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type Clipboard = { operation: 'copy' | 'move'; ids: string[] } | null
@@ -37,7 +38,7 @@ function ConfirmProvider({ children }: { children: React.ReactNode }) {
     const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') answer(false) }
     addEventListener('keydown', escape); return () => removeEventListener('keydown', escape)
   }, [request])
-  return <ConfirmContext.Provider value={confirmAction}>{children}{request && <div className="modal-backdrop" role="presentation" onPointerDown={() => answer(false)}><section className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message" onPointerDown={event => event.stopPropagation()}><div className={`confirm-mark ${request.danger ? 'danger' : ''}`}>{request.danger ? <Trash2 /> : <FolderOpen />}</div><h2 id="confirm-title">{request.title ?? 'Confirm action'}</h2><p id="confirm-message">{request.message}</p><div className="confirm-actions"><button autoFocus onClick={() => answer(false)}>Cancel</button><button className={request.danger ? 'danger-confirm' : 'primary'} onClick={() => answer(true)}>{request.confirmLabel ?? 'Continue'}</button></div></section></div>}</ConfirmContext.Provider>
+  return <ConfirmContext.Provider value={confirmAction}>{children}{request && <div className="modal-backdrop" role="presentation" onPointerDown={() => answer(false)}><section className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message" onPointerDown={event => event.stopPropagation()}><div className={`confirm-mark ${request.danger ? 'danger' : ''}`}>{request.danger ? <Trash2 /> : <FolderOpen />}</div><h2 id="confirm-title">{request.title ?? 'Confirm action'}</h2><p id="confirm-message" className="confirm-message">{request.message}</p><div className="confirm-actions"><button autoFocus onClick={() => answer(false)}>Cancel</button><button className={request.danger ? 'danger-confirm' : 'primary'} onClick={() => answer(true)}>{request.confirmLabel ?? 'Continue'}</button></div></section></div>}</ConfirmContext.Provider>
 }
 function useConfirm() { return useContext(ConfirmContext) }
 
@@ -293,7 +294,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     setSelected(new Set([renamed.id])); setPrimary(renamed)
   }
   const deleteItems = async (ids: string[]) => {
-    if (!ids.length || !await confirmAction(`Move ${ids.length} selected item${ids.length === 1 ? '' : 's'} to Trash?`, { title: 'Delete selected items?', confirmLabel: 'Move to Trash', danger: true })) return
+    const names = ids.map(id => findEntry(id, root, expanded)?.name ?? id)
+    if (!ids.length || !await confirmAction(deleteConfirmationMessage(names), { title: ids.length === 1 ? 'Delete item?' : 'Delete selected items?', confirmLabel: 'Move to Trash', danger: true })) return
     const idSet = new Set(ids)
     const parents = new Set(ids.map(id => findEntry(id, root, expanded)?.parentId ?? ''))
     try {
@@ -741,13 +743,20 @@ function EditorWindow({ document, onClose, onSaved }: { document: DocumentFile; 
 function ViewerWindow({ entry, type, images, onNavigate, onClose }: { entry: Entry; type: 'image' | 'video'; images: Entry[]; onNavigate: (entry: Entry) => void; onClose: () => void }) {
   const [zoom, setZoom] = useState(1)
   const [rotate, setRotate] = useState(0)
+  const [mediaDimensions, setMediaDimensions] = useState<{ width: number; height: number }>()
+  const [viewport, setViewport] = useState(() => ({ width: innerWidth, height: innerHeight }))
   const imageIndex = images.findIndex(image => image.id === entry.id)
   const navigate = useCallback((direction: -1 | 1) => {
     if (images.length < 2) return
     const current = imageIndex >= 0 ? imageIndex : 0
     onNavigate(images[(current + direction + images.length) % images.length])
   }, [imageIndex, images, onNavigate])
-  useEffect(() => { setZoom(1); setRotate(0) }, [entry.id])
+  useEffect(() => { setZoom(1); setRotate(0); setMediaDimensions(undefined) }, [entry.id])
+  useEffect(() => {
+    const resized = () => setViewport({ width: innerWidth, height: innerHeight })
+    addEventListener('resize', resized)
+    return () => removeEventListener('resize', resized)
+  }, [])
   useEffect(() => {
     if (type !== 'image') return
     const keyboard = (event: KeyboardEvent) => {
@@ -758,19 +767,27 @@ function ViewerWindow({ entry, type, images, onNavigate, onClose }: { entry: Ent
     addEventListener('keydown', keyboard, { capture: true })
     return () => removeEventListener('keydown', keyboard, { capture: true })
   }, [navigate, type])
-  return <FloatingWindow title={entry.name} onClose={onClose} className="viewer-window">
+  const compact = viewport.width <= 800
+  const windowSize = mediaDimensions && fitMediaWindow(
+    mediaDimensions.width,
+    mediaDimensions.height,
+    Math.max(320, viewport.width - (compact ? 20 : 48)),
+    Math.max(260, viewport.height - (compact ? 80 : 48)),
+    type === 'image' ? 81 : 110,
+  )
+  return <FloatingWindow title={entry.name} onClose={onClose} className="viewer-window" size={windowSize}>
     {type === 'image' ? <>
       <div className="window-toolbar"><button onClick={() => setZoom(z => Math.max(.25, z - .25))}><ZoomOut /></button><span>{Math.round(zoom * 100)}%</span><button onClick={() => setZoom(z => Math.min(5, z + .25))}><ZoomIn /></button><button onClick={() => setRotate(r => r + 90)}><RotateCw /></button><a className="button" href={contentUrl(entry.id)}><Download /> Download</a></div>
       <div className="image-stage">
         <button className="image-nav previous" disabled={images.length < 2} aria-label="Previous image" title="Previous image (Left Arrow)" onClick={() => navigate(-1)}><ChevronLeft /></button>
-        <img src={mediaUrl(entry.id)} alt={entry.name} style={{ transform: `scale(${zoom}) rotate(${rotate}deg)` }} />
+        <img src={mediaUrl(entry.id)} alt={entry.name} style={{ transform: `scale(${zoom}) rotate(${rotate}deg)` }} onLoad={event => setMediaDimensions({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} />
         <button className="image-nav next" disabled={images.length < 2} aria-label="Next image" title="Next image (Right Arrow)" onClick={() => navigate(1)}><ChevronRight /></button>
       </div>
-    </> : <VideoPlayer entry={entry} editing />}
+    </> : <VideoPlayer entry={entry} editing onMediaSize={(width, height) => setMediaDimensions({ width, height })} />}
   </FloatingWindow>
 }
 
-function VideoPlayer({ entry, autoPlay = true, editing = false }: { entry: Entry; autoPlay?: boolean; editing?: boolean }) {
+function VideoPlayer({ entry, autoPlay = true, editing = false, onMediaSize }: { entry: Entry; autoPlay?: boolean; editing?: boolean; onMediaSize?: (width: number, height: number) => void }) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const hlsRef = useRef<Hls | null>(null)
   const cancelled = useRef(false)
@@ -913,7 +930,7 @@ function VideoPlayer({ entry, autoPlay = true, editing = false }: { entry: Entry
     return () => removeEventListener('keydown', keyboard)
   }, [currentTime, duration, editing, extracting, frameRate, markIn, markOut])
   return <div className={`video-player ${editing ? 'editing' : ''}`}>
-    <div className="video-stage"><video key={`${entry.id}:${hlsSource ? 'hls' : 'source'}`} ref={videoRef} src={hlsSource ? undefined : mediaUrl(entry.id)} controls muted autoPlay={!hlsSource && autoPlay} preload={autoPlay ? 'auto' : 'metadata'} onError={handleVideoError} onLoadedMetadata={event => { if (!duration && Number.isFinite(event.currentTarget.duration)) setDuration(event.currentTarget.duration) }} onTimeUpdate={event => setCurrentTime(event.currentTarget.currentTime)} onSeeked={event => setCurrentTime(event.currentTarget.currentTime)} />{message && <div className="video-message">{message}</div>}</div>
+    <div className="video-stage"><video key={`${entry.id}:${hlsSource ? 'hls' : 'source'}`} ref={videoRef} src={hlsSource ? undefined : mediaUrl(entry.id)} controls muted autoPlay={!hlsSource && autoPlay} preload={autoPlay ? 'auto' : 'metadata'} onError={handleVideoError} onLoadedMetadata={event => { const video = event.currentTarget; if (!duration && Number.isFinite(video.duration)) setDuration(video.duration); if (video.videoWidth > 0 && video.videoHeight > 0) onMediaSize?.(video.videoWidth, video.videoHeight) }} onTimeUpdate={event => setCurrentTime(event.currentTarget.currentTime)} onSeeked={event => setCurrentTime(event.currentTarget.currentTime)} />{message && <div className="video-message">{message}</div>}</div>
     {editing && <div className="video-tools" aria-label="Video extraction controls">
       <div className="frame-controls">
         <button title="Previous frame (,)" aria-label="Previous frame" disabled={!frameRate} onClick={() => step(-1)}><ChevronLeft /></button>
@@ -961,18 +978,23 @@ function TrashWindow({ items, onClose, onChanged, onRestored, setError }: { item
   </FloatingWindow>
 }
 
-function FloatingWindow({ title, onClose, className = '', children }: { title: string; onClose: () => void; className?: string; children: React.ReactNode }) {
-  const [position, setPosition] = useState({ x: Math.max(20, innerWidth * .12), y: 90 })
+function FloatingWindow({ title, onClose, className = '', size, children }: { title: string; onClose: () => void; className?: string; size?: { width: number; height: number }; children: React.ReactNode }) {
+  const [position, setPosition] = useState(() => ({ x: Math.max(20, innerWidth * .12), y: 90 }))
   const [minimized, setMinimized] = useState(false)
   const drag = useRef<{ x: number; y: number } | null>(null)
+  const moved = useRef(false)
+  useEffect(() => {
+    if (!size || moved.current) return
+    setPosition({ x: Math.max(10, (innerWidth - size.width) / 2), y: Math.max(10, (innerHeight - size.height) / 2) })
+  }, [size?.height, size?.width])
   const toggleMinimized = (event?: React.MouseEvent) => {
     event?.preventDefault(); event?.stopPropagation()
     setMinimized(value => !value)
   }
   const tray = minimized ? document.getElementById('window-tray') : null
   return <>
-    <div className={`floating ${minimized ? 'stashed' : ''} ${className}`} style={{ left: position.x, top: position.y }} aria-hidden={minimized}>
-      <div className="window-title" onDoubleClick={() => toggleMinimized()} onPointerDown={e => { drag.current = { x: e.clientX - position.x, y: e.clientY - position.y }; e.currentTarget.setPointerCapture(e.pointerId) }} onPointerMove={e => { if (drag.current) setPosition({ x: Math.max(0, e.clientX - drag.current.x), y: Math.max(0, e.clientY - drag.current.y) }) }} onPointerUp={() => { drag.current = null }}><span>{title}</span><div className="window-actions"><button type="button" aria-label={`Minimize ${title}`} title="Minimize to tray" onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={toggleMinimized}><Minus /></button><button type="button" aria-label={`Close ${title}`} title="Close" onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={onClose}><X /></button></div></div>
+    <div className={`floating ${minimized ? 'stashed' : ''} ${className}`} style={{ left: position.x, top: position.y, width: size?.width, height: size?.height }} aria-hidden={minimized}>
+      <div className="window-title" onDoubleClick={() => toggleMinimized()} onPointerDown={e => { moved.current = true; drag.current = { x: e.clientX - position.x, y: e.clientY - position.y }; e.currentTarget.setPointerCapture(e.pointerId) }} onPointerMove={e => { if (drag.current) setPosition({ x: Math.max(0, e.clientX - drag.current.x), y: Math.max(0, e.clientY - drag.current.y) }) }} onPointerUp={() => { drag.current = null }}><span>{title}</span><div className="window-actions"><button type="button" aria-label={`Minimize ${title}`} title="Minimize to tray" onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={toggleMinimized}><Minus /></button><button type="button" aria-label={`Close ${title}`} title="Close" onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={onClose}><X /></button></div></div>
       {children}
     </div>
     {tray && createPortal(<div className="window-tray-item">
