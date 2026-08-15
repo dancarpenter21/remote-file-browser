@@ -8,8 +8,15 @@ export default defineConfig({
     proxy: {
       '/api': {
         target: process.env.VITE_PROXY_TARGET ?? 'http://127.0.0.1:8080',
+        ws: true,
         configure(proxy) {
           proxy.on('proxyReq', proxyRequest => {
+            const cookie = proxyRequest.getHeader('cookie')
+            if (typeof cookie === 'string') {
+              proxyRequest.setHeader('cookie', cookie.replace(/(^|;\s*)rfb_dev_session=/, '$1rfb_session='))
+            }
+          })
+          proxy.on('proxyReqWs', proxyRequest => {
             const cookie = proxyRequest.getHeader('cookie')
             if (typeof cookie === 'string') {
               proxyRequest.setHeader('cookie', cookie.replace(/(^|;\s*)rfb_dev_session=/, '$1rfb_session='))
