@@ -17,6 +17,10 @@ export function stepFrame(current: number, direction: -1 | 1, frameRate: number,
   return Math.min(Math.max(0, duration - 1 / frameRate), Math.max(0, frame / frameRate))
 }
 
+export function shouldAutoLoop(duration: number) {
+  return Number.isFinite(duration) && duration > 0 && duration < 40
+}
+
 export function fitMediaWindow(mediaWidth: number, mediaHeight: number, maxWidth: number, maxHeight: number, chromeHeight: number) {
   if (![mediaWidth, mediaHeight, maxWidth, maxHeight].every(value => Number.isFinite(value) && value > 0)) return undefined
   const availableMediaHeight = Math.max(1, maxHeight - chromeHeight)

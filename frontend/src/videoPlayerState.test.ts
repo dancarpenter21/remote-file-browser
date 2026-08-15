@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { fitMediaWindow, formatMediaTime, stepFrame, validSegment } from './videoPlayerState'
+import { fitMediaWindow, formatMediaTime, shouldAutoLoop, stepFrame, validSegment } from './videoPlayerState'
 
 describe('video player state', () => {
   it('formats media time to milliseconds', () => {
@@ -14,6 +14,14 @@ describe('video player state', () => {
     expect(stepFrame(10, 1, 25, 10)).toBeCloseTo(9.96)
     expect(stepFrame(1.039999, 1, 25, 10)).toBeCloseTo(1.08)
     expect(stepFrame(1.039, 1, 25, 10)).toBeCloseTo(1.08)
+  })
+
+  it('auto-loops only finite videos shorter than 40 seconds', () => {
+    expect(shouldAutoLoop(.001)).toBe(true)
+    expect(shouldAutoLoop(39.999)).toBe(true)
+    expect(shouldAutoLoop(40)).toBe(false)
+    expect(shouldAutoLoop(0)).toBe(false)
+    expect(shouldAutoLoop(Infinity)).toBe(false)
   })
 
   it('fits intrinsic media dimensions without upscaling and caps them to the viewport', () => {

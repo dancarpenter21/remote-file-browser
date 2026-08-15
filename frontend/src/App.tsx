@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 import { createPortal } from 'react-dom'
 import CodeMirror from '@uiw/react-codemirror'
 import { markdown } from '@codemirror/lang-markdown'
+import { EditorView } from '@codemirror/view'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeSanitize from 'rehype-sanitize'
@@ -9,15 +10,16 @@ import Hls from 'hls.js'
 import {
   Camera, ChevronLeft, ChevronRight, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
   Film, Folder, FolderOpen, Grid2X2, LogOut, Maximize2, Menu, MoreHorizontal, Play,
-  ExternalLink, Link2, Minus, Move, Plus, RefreshCw, RotateCw, Save, Scissors, Search, Trash2, Upload, X, ZoomIn, ZoomOut,
+  ExternalLink, Link2, Minus, Move, Plus, RefreshCw, RotateCw, Save, Scissors, Search, Trash2, Upload, WrapText, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import { api, ApiFailure, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, ExtractionJob, filesystemEventsUrl, FilesystemChange, mediaUrl, provenanceEventsUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { deleteConfirmationMessage } from './deleteConfirmation'
 import { updateFinderPathForSelection } from './finderPath'
 import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState'
-import { fitMediaWindow, formatMediaTime, ignoresVideoShortcut, stepFrame, validSegment } from './videoPlayerState'
+import { fitMediaWindow, formatMediaTime, ignoresVideoShortcut, shouldAutoLoop, stepFrame, validSegment } from './videoPlayerState'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
+type EditorMode = 'edit' | 'split' | 'preview'
 type Clipboard = { operation: 'copy' | 'move'; ids: string[] } | null
 type ConfirmOptions = { title?: string; confirmLabel?: string; danger?: boolean }
 type ConfirmRequest = ConfirmOptions & { message: string; resolve: (answer: boolean) => void }
@@ -119,7 +121,15 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [error, setError] = useState('')
   const [folderMenu, setFolderMenu] = useState<{ directoryId: string; path: string; x: number; y: number } | null>(null)
   const [showPreview, setShowPreview] = useState(() => localStorage.getItem('rfb-column-preview') !== 'false')
-  const [columnWidth, setColumnWidth] = useState(() => Math.min(480, Math.max(180, Number(localStorage.getItem('rfb-column-width')) || 240)))
+  const [defaultColumnWidth] = useState(() => Math.min(480, Math.max(180, Number(localStorage.getItem('rfb-column-width')) || 240)))
+  const [columnWidths, setColumnWidths] = useState<Record<string, number>>(() => {
+    try {
+      const stored: unknown = JSON.parse(localStorage.getItem('rfb-column-widths') || '{}')
+      if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return {}
+      return Object.fromEntries(Object.entries(stored).filter((entry): entry is [string, number] => typeof entry[1] === 'number' && Number.isFinite(entry[1])))
+    }
+    catch { return {} }
+  })
   const inputRef = useRef<HTMLInputElement>(null)
   const liveState = useRef({ root, expanded })
   liveState.current = { root, expanded }
@@ -129,7 +139,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   useEffect(() => { localStorage.setItem('rfb-view', view) }, [view])
   useEffect(() => { localStorage.setItem('rfb-hidden', String(hidden)) }, [hidden])
   useEffect(() => { localStorage.setItem('rfb-column-preview', String(showPreview)) }, [showPreview])
-  useEffect(() => { localStorage.setItem('rfb-column-width', String(columnWidth)) }, [columnWidth])
+  useEffect(() => { localStorage.setItem('rfb-column-widths', JSON.stringify(columnWidths)) }, [columnWidths])
   useEffect(() => {
     const changed = (event: Event) => {
       const { id, urls } = (event as CustomEvent<ProvenanceChange>).detail
@@ -400,7 +410,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         {error && <div className="banner error"><span>{error}</span><button onClick={() => setError('')}><X size={15} /></button></div>}
         <div className="browser-body"><div className="browser-view" onContextMenu={view === 'details' ? undefined : event => showFolderMenu(event, currentDir, columnPath.at(-1)?.path ?? '/fs-root')}>
           {!root ? <div className="center"><span className="spinner" /></div> : view === 'details' ?
-            <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} primary={primary} columnWidth={columnWidth} setColumnWidth={setColumnWidth} navigate={navigateColumn} selectItems={selectColumnItems} selectParent={selectParentColumn} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} showFolderMenu={showFolderMenu} setError={setError} /> :
+            <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} primary={primary} defaultColumnWidth={defaultColumnWidth} columnWidths={columnWidths} setColumnWidth={(key, width) => setColumnWidths(previous => ({ ...previous, [key]: width }))} navigate={navigateColumn} selectItems={selectColumnItems} selectParent={selectParentColumn} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} showFolderMenu={showFolderMenu} setError={setError} /> :
             !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view={view} selected={selected} setSelected={setSelected} setPrimary={setPrimary} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} setError={setError} />}
         </div>{showPreview && <ColumnPreview entries={previewEntries} primary={primary} />}</div>
       </main>
@@ -449,9 +459,9 @@ function ConversionJobs() {
 }
 
 type BrowserColumn = { directoryId: string; page?: EntryPage; label: string }
-function ColumnBrowser({ root, path, pages, filter, selected, primary, columnWidth, setColumnWidth, navigate, selectItems, selectParent, activate, renameEntry, moveEntries, deleteEntry, showFolderMenu, setError }: {
+function ColumnBrowser({ root, path, pages, filter, selected, primary, defaultColumnWidth, columnWidths, setColumnWidth, navigate, selectItems, selectParent, activate, renameEntry, moveEntries, deleteEntry, showFolderMenu, setError }: {
   root: EntryPage; path: Entry[]; pages: Record<string, EntryPage>; filter: string; selected: Set<string>; primary: Entry | null
-  columnWidth: number; setColumnWidth: (width: number) => void
+  defaultColumnWidth: number; columnWidths: Record<string, number>; setColumnWidth: (key: string, width: number) => void
   navigate: (entry: Entry, columnIndex: number) => Promise<void>; selectItems: (ids: Set<string>, primary: Entry | null, columnIndex: number, directoryId: string, preserveCurrentBranch?: boolean) => void
   selectParent: (columnIndex: number) => void; activate: (entry: Entry) => void; renameEntry: (entry: Entry) => Promise<void>; moveEntries: (ids: string[], destinationId: string) => Promise<void>
   deleteEntry: (entry: Entry) => Promise<void>; showFolderMenu: (event: React.MouseEvent, directoryId: string, path: string) => void; setError: (message: string) => void
@@ -508,9 +518,9 @@ function ColumnBrowser({ root, path, pages, filter, selected, primary, columnWid
       event.preventDefault(); selectParent(columnIndex); setTimeout(() => columnRefs.current[columnIndex - 1]?.focus())
     } else if (event.key === 'Enter' && current) { event.preventDefault(); current.kind === 'directory' ? void navigate(current, columnIndex) : activate(current) }
   }
-  const startResize = (event: React.PointerEvent) => {
-    event.preventDefault(); const startX = event.clientX, startWidth = columnWidth
-    const move = (pointer: PointerEvent) => setColumnWidth(Math.min(480, Math.max(180, startWidth + pointer.clientX - startX)))
+  const startResize = (event: React.PointerEvent, key: string, width: number) => {
+    event.preventDefault(); event.stopPropagation(); const startX = event.clientX, startWidth = width
+    const move = (pointer: PointerEvent) => setColumnWidth(key, Math.min(480, Math.max(180, startWidth + pointer.clientX - startX)))
     const up = () => { removeEventListener('pointermove', move); removeEventListener('pointerup', up) }
     addEventListener('pointermove', move); addEventListener('pointerup', up)
   }
@@ -528,14 +538,15 @@ function ColumnBrowser({ root, path, pages, filter, selected, primary, columnWid
     if (!acceptDrop(event, id)) return
     const ids = draggedIds.current; draggedIds.current = []; setDropTarget(null); void moveEntries(ids, id)
   }
-  return <div className="column-browser" ref={scroller} style={{ '--column-width': `${columnWidth}px` } as React.CSSProperties}>
+  return <div className="column-browser" ref={scroller}>
     {columns.map((column, columnIndex) => {
       const entries = visibleEntries(column), targetKey = column.directoryId || '__root__', branchId = path[columnIndex]?.id
-      return <div className={`finder-column ${activeColumn === columnIndex ? 'active' : ''} ${dropTarget === targetKey ? 'drop-target' : ''}`} key={column.directoryId || '__root__'} ref={node => { columnRefs.current[columnIndex] = node }} tabIndex={0} role="listbox" aria-label={column.label} aria-multiselectable="true" onFocus={() => setActiveColumn(columnIndex)} onKeyDown={event => keyboard(event, columnIndex)} onContextMenu={event => showFolderMenu(event, column.directoryId, columnIndex === 0 ? '/fs-root' : path[columnIndex - 1].path)} onDragOver={event => acceptDrop(event, column.directoryId)} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null) }} onDrop={event => drop(event, column.directoryId)}>
+      const width = Math.min(480, Math.max(180, columnWidths[targetKey] || defaultColumnWidth))
+      return <div className={`finder-column ${activeColumn === columnIndex ? 'active' : ''} ${dropTarget === targetKey ? 'drop-target' : ''}`} style={{ '--column-width': `${width}px` } as React.CSSProperties} key={targetKey} ref={node => { columnRefs.current[columnIndex] = node }} tabIndex={0} role="listbox" aria-label={column.label} aria-multiselectable="true" onFocus={() => setActiveColumn(columnIndex)} onKeyDown={event => keyboard(event, columnIndex)} onContextMenu={event => showFolderMenu(event, column.directoryId, columnIndex === 0 ? '/fs-root' : path[columnIndex - 1].path)} onDragOver={event => acceptDrop(event, column.directoryId)} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null) }} onDrop={event => drop(event, column.directoryId)}>
         {!column.page ? <div className="column-state"><span className="spinner" /></div> : entries.length === 0 ? <div className="column-state">{filter ? 'No matches' : 'Empty folder'}</div> : entries.map((entry, entryIndex) => <div className={`column-row ${selected.has(entry.id) ? 'selected' : branchId === entry.id ? 'branch-selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} key={entry.id} role="option" aria-selected={selected.has(entry.id)} aria-current={branchId === entry.id ? 'location' : undefined} draggable onDragStart={event => startDrag(event, entry, columnIndex)} onDragEnd={() => { draggedIds.current = []; setDropTarget(null) }} onClick={event => choose(entry, columnIndex, entryIndex, event, true)} onDoubleClick={() => entry.kind === 'directory' ? void navigate(entry, columnIndex) : activate(entry)} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ entry, columnIndex, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 180) }) }} onDragOver={event => { if (entry.kind === 'directory') acceptDrop(event, entry.id) }} onDrop={event => { if (entry.kind === 'directory') drop(event, entry.id) }}>
           <FileGlyph entry={entry} /><span title={entry.name}>{entry.name}</span>{entry.kind === 'directory' && <ChevronRight className="column-arrow" />}
         </div>)}
-        <div className="column-resizer" role="separator" aria-orientation="vertical" title="Resize columns" onPointerDown={startResize} />
+        <div className="column-resizer" role="separator" aria-orientation="vertical" aria-label={`Resize ${column.label} column`} title="Resize column" onPointerDown={event => startResize(event, targetKey, width)} />
       </div>
     })}
     {menu && <ContextMenu entry={menu.entry} x={menu.x} y={menu.y} close={() => setMenu(null)} open={() => menu.entry.kind === 'directory' ? void navigate(menu.entry, menu.columnIndex) : activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} setError={setError} />}
@@ -730,13 +741,28 @@ function ViewSelector({ view, setView }: { view: ViewMode; setView: (view: ViewM
 function EditorWindow({ document, onClose, onSaved }: { document: DocumentFile; onClose: () => void; onSaved: (doc: DocumentFile) => void }) {
   const confirmAction = useConfirm()
   const [content, setContent] = useState(document.content)
-  const [preview, setPreview] = useState(document.mime.includes('markdown') || document.id.endsWith('bWQ'))
+  const isMarkdown = document.mime.includes('markdown') || document.id.endsWith('bWQ')
+  const [mode, setMode] = useState<EditorMode>(isMarkdown ? 'split' : 'edit')
+  const [wordWrap, setWordWrap] = useState(() => localStorage.getItem('rfb-editor-word-wrap') === 'true')
   const [error, setError] = useState('')
+  useEffect(() => { localStorage.setItem('rfb-editor-word-wrap', String(wordWrap)) }, [wordWrap])
   const save = async () => { try { onSaved(await api.saveDocument({ ...document, content })); setError('') } catch (e) { setError(messageOf(e)) } }
   return <FloatingWindow title="Text editor" onClose={async () => { if (content === document.content || await confirmAction('Your unsaved edits will be lost.', { title: 'Discard unsaved changes?', confirmLabel: 'Discard', danger: true })) onClose() }} className="editor-window">
-    <div className="window-toolbar"><button className="primary compact" onClick={save}><Save size={15} /> Save</button><button className={preview ? 'active' : ''} onClick={() => setPreview(!preview)}><Eye size={15} /> Markdown preview</button><span className="toolbar-spacer" /><code>{document.mime}</code></div>
+    <div className="window-toolbar">
+      <button className="primary compact" onClick={save}><Save size={15} /> Save</button>
+      {isMarkdown && <div className="editor-mode-selector" role="group" aria-label="Markdown view">
+        <button className={mode === 'edit' ? 'active' : ''} aria-pressed={mode === 'edit'} onClick={() => setMode('edit')}><Edit3 size={15} /> Edit</button>
+        <button className={mode === 'split' ? 'active' : ''} aria-pressed={mode === 'split'} onClick={() => setMode('split')}><Columns3 size={15} /> Split</button>
+        <button className={mode === 'preview' ? 'active' : ''} aria-pressed={mode === 'preview'} onClick={() => setMode('preview')}><Eye size={15} /> Preview</button>
+      </div>}
+      <button className={wordWrap ? 'active' : ''} aria-pressed={wordWrap} disabled={mode === 'preview'} title={mode === 'preview' ? 'Word wrap applies to the editor' : 'Toggle editor word wrap'} onClick={() => setWordWrap(value => !value)}><WrapText size={15} /> Word wrap</button>
+      <span className="toolbar-spacer" /><code>{document.mime}</code>
+    </div>
     {error && <div className="banner error">{error}</div>}
-    <div className={`editor-body ${preview ? 'split' : ''}`}><CodeMirror value={content} height="100%" theme="dark" extensions={[markdown()]} onChange={setContent} />{preview && <article className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]}>{content}</ReactMarkdown></article>}</div>
+    <div className={`editor-body mode-${mode}`}>
+      <CodeMirror value={content} height="100%" theme="dark" extensions={[...(isMarkdown ? [markdown()] : []), ...(wordWrap ? [EditorView.lineWrapping] : [])]} onChange={setContent} />
+      {mode !== 'edit' && <article className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]}>{content}</ReactMarkdown></article>}
+    </div>
   </FloatingWindow>
 }
 
@@ -930,7 +956,7 @@ function VideoPlayer({ entry, autoPlay = true, editing = false, onMediaSize }: {
     return () => removeEventListener('keydown', keyboard)
   }, [currentTime, duration, editing, extracting, frameRate, markIn, markOut])
   return <div className={`video-player ${editing ? 'editing' : ''}`}>
-    <div className="video-stage"><video key={`${entry.id}:${hlsSource ? 'hls' : 'source'}`} ref={videoRef} src={hlsSource ? undefined : mediaUrl(entry.id)} controls muted autoPlay={!hlsSource && autoPlay} preload={autoPlay ? 'auto' : 'metadata'} onError={handleVideoError} onLoadedMetadata={event => { const video = event.currentTarget; if (!duration && Number.isFinite(video.duration)) setDuration(video.duration); if (video.videoWidth > 0 && video.videoHeight > 0) onMediaSize?.(video.videoWidth, video.videoHeight) }} onTimeUpdate={event => setCurrentTime(event.currentTarget.currentTime)} onSeeked={event => setCurrentTime(event.currentTarget.currentTime)} />{message && <div className="video-message">{message}</div>}</div>
+    <div className="video-stage"><video key={`${entry.id}:${hlsSource ? 'hls' : 'source'}`} ref={videoRef} src={hlsSource ? undefined : mediaUrl(entry.id)} controls muted autoPlay={!hlsSource && autoPlay} loop={shouldAutoLoop(duration)} preload={autoPlay ? 'auto' : 'metadata'} onError={handleVideoError} onLoadedMetadata={event => { const video = event.currentTarget; if (!duration && Number.isFinite(video.duration)) setDuration(video.duration); if (video.videoWidth > 0 && video.videoHeight > 0) onMediaSize?.(video.videoWidth, video.videoHeight) }} onTimeUpdate={event => setCurrentTime(event.currentTarget.currentTime)} onSeeked={event => setCurrentTime(event.currentTarget.currentTime)} />{message && <div className="video-message">{message}</div>}</div>
     {editing && <div className="video-tools" aria-label="Video extraction controls">
       <div className="frame-controls">
         <button title="Previous frame (,)" aria-label="Previous frame" disabled={!frameRate} onClick={() => step(-1)}><ChevronLeft /></button>
