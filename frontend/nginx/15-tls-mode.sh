@@ -9,7 +9,7 @@ common_locations='root /usr/share/nginx/html;
     add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
     add_header Content-Security-Policy "default-src '\''self'\''; img-src '\''self'\'' blob: data:; media-src '\''self'\'' blob:; style-src '\''self'\'' '\''unsafe-inline'\''; script-src '\''self'\''; connect-src '\''self'\''" always;
     location ^~ /api/docs/ { proxy_pass http://backend; proxy_http_version 1.1; proxy_set_header Host $host; add_header X-Content-Type-Options nosniff always; add_header Referrer-Policy no-referrer always; add_header Content-Security-Policy "default-src '\''self'\''; img-src '\''self'\'' data:; style-src '\''self'\'' '\''unsafe-inline'\''; script-src '\''self'\'' '\''unsafe-inline'\''; connect-src '\''self'\''" always; }
-    location /api/ { proxy_pass http://backend; proxy_http_version 1.1; proxy_set_header Host $host; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto $scheme; proxy_read_timeout 3600s; proxy_request_buffering off; }
+    location /api/ { proxy_pass http://backend; proxy_http_version 1.1; proxy_set_header Host $host; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection $connection_upgrade; proxy_read_timeout 3600s; proxy_request_buffering off; }
     location / { try_files $uri $uri/ /index.html; }'
 
 if [ "${RFB_TLS_MODE:-https}" = "https" ]; then

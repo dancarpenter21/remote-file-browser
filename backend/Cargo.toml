@@ -6,13 +6,12 @@ license = "MIT"
 
 [dependencies]
 argon2 = "0.5"
-axum = { version = "0.8", features = ["multipart"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 axum-extra = { version = "0.10", features = ["cookie"] }
 base64 = "0.22"
 blake3 = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
-futures-util = "0.3"
 http = "1"
 mime_guess = "2"
 notify = "8.2"
@@ -23,7 +22,6 @@ subtle = "2"
 thiserror = "2"
 time = "0.3"
 tokio = { version = "1", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["trace", "limit"] }
 tracing = "0.1"

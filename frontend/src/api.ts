@@ -29,9 +29,8 @@ export type TrashEntry = {
 }
 export type Provenance = { urls: string[] }
 export type ProvenanceChange = { id: string; path?: string; urls: string[] }
-export type FilesystemChange = { directoryIds: string[] }
 export type ConversionMode = 'remux' | 'audio' | 'full'
-export type ConversionJob = { key: string; fileName: string; status: 'working' | 'ready' | 'failed'; playable: boolean; mode: ConversionMode; startedAt: string }
+export type ConversionJob = { key: string; fileName: string; status: 'working' | 'ready' | 'failed'; playable: boolean; mode: ConversionMode; startedAt: string; progress: number | null }
 export type HlsJob = { key: string; status: 'working' | 'ready' | 'failed' | 'missing'; playlistUrl: string; playable: boolean; mode: ConversionMode }
 export type MediaInfo = { durationSeconds: number; frameRate: number | null }
 export type ExtractionJob = {
@@ -43,9 +42,19 @@ export type ExtractionJob = {
   startTime?: number
   endTime?: number
   startedAt: string
+  progress: number | null
   error?: string
   result?: Entry
 }
+export type CacheCleanupReport = { artifactsRemoved: number; recordsRemoved: number; bytesReclaimed: number }
+export type LiveEvent =
+  | { type: 'resync' }
+  | { type: 'filesystem'; directoryIds: string[] }
+  | { type: 'provenance'; change: ProvenanceChange }
+  | { type: 'mediaSnapshot'; jobs: ConversionJob[]; extractions: ExtractionJob[] }
+  | { type: 'mediaJob'; job: ConversionJob }
+  | { type: 'extractionJob'; job: ExtractionJob }
+  | { type: 'cacheCleanup'; state: 'started' | 'complete' | 'failed'; report?: CacheCleanupReport | null; error?: string | null }
 
 export class ApiFailure extends Error {
   constructor(public status: number, public code: string, message: string) { super(message) }
@@ -90,6 +99,7 @@ export const api = {
   startHls: (id: string) => request<HlsJob>('/media/hls', { method: 'POST', body: JSON.stringify({ id }) }),
   hlsStatus: (key: string) => request<HlsJob>(`/media/hls/${key}/status`),
   conversionJobs: () => request<ConversionJob[]>('/media/jobs'),
+  cleanupCache: () => request<CacheCleanupReport>('/media/cache/cleanup', { method: 'POST' }),
   mediaInfo: (id: string) => request<MediaInfo>(`/media/info?id=${encodeURIComponent(id)}`),
   startExtraction: (input: { id: string; kind: 'frame'; time: number } | { id: string; kind: 'segment'; startTime: number; endTime: number }) =>
     request<ExtractionJob>('/media/extractions', { method: 'POST', body: JSON.stringify(input) }),
@@ -100,5 +110,4 @@ export const api = {
 export const contentUrl = (id: string) => `/api/v1/fs/content?id=${encodeURIComponent(id)}`
 export const mediaUrl = (id: string) => `/api/v1/media/file?id=${encodeURIComponent(id)}`
 export const thumbnailUrl = (id: string, size: string) => `/api/v1/previews/thumbnail?id=${encodeURIComponent(id)}&size=${size}`
-export const provenanceEventsUrl = '/api/v1/fs/provenance/events'
-export const filesystemEventsUrl = '/api/v1/fs/events'
+export const liveEventsUrl = () => `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/v1/events`

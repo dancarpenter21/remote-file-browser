@@ -1,11 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
-    convert::Infallible,
     ffi::{OsStr, OsString},
     io::SeekFrom,
     os::unix::ffi::{OsStrExt, OsStringExt},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Component, Path, PathBuf},
+    process::Stdio,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -17,29 +17,27 @@ use argon2::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, State},
-    http::{HeaderMap, StatusCode, header},
-    response::{
-        IntoResponse, Response,
-        sse::{Event, KeepAlive, Sse},
+    extract::{
+        DefaultBodyLimit, Multipart, Path as AxumPath, Query, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
     },
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use futures_util::StreamExt;
 use notify::{EventKind, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::{Mutex, RwLock, broadcast},
 };
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
@@ -61,8 +59,10 @@ struct AppState {
     extraction_jobs: Arc<DashMap<String, ExtractionJob>>,
     provenance: Arc<RwLock<HashMap<String, Vec<String>>>>,
     provenance_write: Arc<Mutex<()>>,
-    provenance_events: broadcast::Sender<ProvenanceEvent>,
-    filesystem_events: broadcast::Sender<FilesystemEvent>,
+    cache_index: Arc<RwLock<CacheIndex>>,
+    cache_write: Arc<Mutex<()>>,
+    cache_cleanup: Arc<Mutex<()>>,
+    live_events: broadcast::Sender<LiveEvent>,
     provenance_api_token: Option<Arc<String>>,
 }
 
@@ -77,6 +77,31 @@ struct Config {
     upload_max: u64,
     cache_max: u64,
     cache_age_days: u64,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheIndex {
+    records: HashMap<String, CacheRecord>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheRecord {
+    kind: String,
+    key: String,
+    source_id: String,
+    source_size: u64,
+    source_modified_ns: u64,
+    dimension: Option<u32>,
+}
+
+#[derive(Clone, Default, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct CacheCleanupReport {
+    artifacts_removed: u64,
+    records_removed: u64,
+    bytes_reclaimed: u64,
 }
 
 #[derive(Clone)]
@@ -164,8 +189,7 @@ type ApiResult<T> = Result<T, ApiError>;
         get_provenance,
         set_provenance,
         submit_provenance,
-        provenance_events,
-        filesystem_events,
+        live_events,
         content,
         create_item,
         upload,
@@ -185,6 +209,7 @@ type ApiResult<T> = Result<T, ApiError>;
         extraction_status,
         start_hls,
         list_media_jobs,
+        request_cache_cleanup,
         hls_status,
         hls_file
     ),
@@ -197,7 +222,6 @@ type ApiResult<T> = Result<T, ApiError>;
         Provenance,
         ProvenanceSubmission,
         ProvenanceEvent,
-        FilesystemEvent,
         CreateRequest,
         OperationRequest,
         DeleteRequest,
@@ -211,7 +235,8 @@ type ApiResult<T> = Result<T, ApiError>;
         MediaJob,
         MediaInfo,
         ExtractionRequest,
-        ExtractionJob
+        ExtractionJob,
+        CacheCleanupReport
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -274,9 +299,9 @@ async fn main() {
         .await
         .expect("create media cache");
     let provenance = load_provenance(&cache).await;
+    let cache_index = load_cache_index(&cache).await;
     let provenance_api_token = read_optional_token("RFB_PROVENANCE_API_TOKEN_FILE").await;
-    let (provenance_event_tx, _) = broadcast::channel(256);
-    let (filesystem_event_tx, _) = broadcast::channel(256);
+    let (live_event_tx, _) = broadcast::channel(512);
 
     let password = read_secret().await;
     assert!(
@@ -313,8 +338,10 @@ async fn main() {
         extraction_jobs: Arc::new(DashMap::new()),
         provenance: Arc::new(RwLock::new(provenance)),
         provenance_write: Arc::new(Mutex::new(())),
-        provenance_events: provenance_event_tx,
-        filesystem_events: filesystem_event_tx,
+        cache_index: Arc::new(RwLock::new(cache_index)),
+        cache_write: Arc::new(Mutex::new(())),
+        cache_cleanup: Arc::new(Mutex::new(())),
+        live_events: live_event_tx,
         provenance_api_token: provenance_api_token.map(Arc::new),
     };
 
@@ -333,8 +360,7 @@ async fn main() {
                 .put(set_provenance)
                 .post(submit_provenance),
         )
-        .route("/fs/provenance/events", get(provenance_events))
-        .route("/fs/events", get(filesystem_events))
+        .route("/events", get(live_events))
         .route("/fs/content", get(content))
         .route("/fs/items", post(create_item))
         .route("/fs/uploads", post(upload))
@@ -354,6 +380,7 @@ async fn main() {
         .route("/media/extractions/{key}", get(extraction_status))
         .route("/media/hls", post(start_hls))
         .route("/media/jobs", get(list_media_jobs))
+        .route("/media/cache/cleanup", post(request_cache_cleanup))
         .route("/media/hls/{key}/status", get(hls_status))
         .route("/media/hls/{key}/{file}", get(hls_file));
 
@@ -731,10 +758,35 @@ struct ProvenanceEvent {
     urls: Vec<String>,
 }
 
-#[derive(Clone, Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-struct FilesystemEvent {
-    directory_ids: Vec<String>,
+#[derive(Clone, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum LiveEvent {
+    Resync,
+    Filesystem {
+        directory_ids: Vec<String>,
+    },
+    Provenance {
+        change: ProvenanceEvent,
+    },
+    MediaSnapshot {
+        jobs: Vec<MediaJob>,
+        extractions: Vec<ExtractionJob>,
+    },
+    MediaJob {
+        job: Box<MediaJob>,
+    },
+    ExtractionJob {
+        job: Box<ExtractionJob>,
+    },
+    CacheCleanup {
+        state: String,
+        report: Option<CacheCleanupReport>,
+        error: Option<String>,
+    },
 }
 
 async fn load_provenance(cache: &Path) -> HashMap<String, Vec<String>> {
@@ -749,6 +801,95 @@ async fn load_provenance(cache: &Path) -> HashMap<String, Vec<String>> {
             HashMap::new()
         }
     }
+}
+
+async fn load_cache_index(cache: &Path) -> CacheIndex {
+    match fs::read(cache.join("cache-index.json")).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            warn!(%error, "could not parse cache index");
+            CacheIndex::default()
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CacheIndex::default(),
+        Err(error) => {
+            warn!(%error, "could not read cache index");
+            CacheIndex::default()
+        }
+    }
+}
+
+fn source_modified_ns(meta: &std::fs::Metadata) -> u64 {
+    let value = i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec());
+    value.max(0).min(i128::from(u64::MAX)) as u64
+}
+
+fn cache_record_id(kind: &str, key: &str) -> String {
+    format!("{kind}:{key}")
+}
+
+fn cache_record_matches(
+    record: &CacheRecord,
+    kind: &str,
+    id: &str,
+    meta: &std::fs::Metadata,
+    dimension: Option<u32>,
+) -> bool {
+    record.kind == kind
+        && record.source_id == id
+        && record.source_size == meta.len()
+        && record.source_modified_ns == source_modified_ns(meta)
+        && record.dimension == dimension
+}
+
+async fn find_cache_key(
+    state: &AppState,
+    kind: &str,
+    id: &str,
+    meta: &std::fs::Metadata,
+    dimension: Option<u32>,
+) -> Option<String> {
+    state
+        .cache_index
+        .read()
+        .await
+        .records
+        .values()
+        .find(|record| cache_record_matches(record, kind, id, meta, dimension))
+        .map(|record| record.key.clone())
+}
+
+async fn persist_cache_index(cache: &Path, index: &CacheIndex) -> ApiResult<()> {
+    let bytes = serde_json::to_vec_pretty(index).map_err(ApiError::internal)?;
+    let temporary = cache.join(".cache-index.json.tmp");
+    fs::write(&temporary, bytes).await?;
+    fs::rename(temporary, cache.join("cache-index.json")).await?;
+    Ok(())
+}
+
+async fn register_cache_record(state: &AppState, record: CacheRecord) -> ApiResult<()> {
+    let record_id = cache_record_id(&record.kind, &record.key);
+    if state
+        .cache_index
+        .read()
+        .await
+        .records
+        .get(&record_id)
+        .is_some_and(|existing| {
+            existing.kind == record.kind
+                && existing.key == record.key
+                && existing.source_id == record.source_id
+                && existing.source_size == record.source_size
+                && existing.source_modified_ns == record.source_modified_ns
+                && existing.dimension == record.dimension
+        })
+    {
+        return Ok(());
+    }
+    let _write = state.cache_write.lock().await;
+    let mut index = state.cache_index.read().await.clone();
+    index.records.insert(record_id, record);
+    persist_cache_index(&state.config.cache, &index).await?;
+    *state.cache_index.write().await = index;
+    Ok(())
 }
 
 async fn persist_provenance_records(
@@ -813,10 +954,12 @@ async fn commit_provenance(
     persist_provenance_records(&state.config.cache, &records).await?;
     *state.provenance.write().await = records;
     drop(_write);
-    let _ = state.provenance_events.send(ProvenanceEvent {
-        id,
-        path,
-        urls: urls.clone(),
+    let _ = state.live_events.send(LiveEvent::Provenance {
+        change: ProvenanceEvent {
+            id,
+            path,
+            urls: urls.clone(),
+        },
     });
     Ok(Provenance { urls })
 }
@@ -848,10 +991,12 @@ async fn append_provenance(
     persist_provenance_records(&state.config.cache, &records).await?;
     *state.provenance.write().await = records;
     drop(_write);
-    let _ = state.provenance_events.send(ProvenanceEvent {
-        id,
-        path,
-        urls: urls.clone(),
+    let _ = state.live_events.send(LiveEvent::Provenance {
+        change: ProvenanceEvent {
+            id,
+            path,
+            urls: urls.clone(),
+        },
     });
     Ok(Provenance { urls })
 }
@@ -983,64 +1128,70 @@ async fn submit_provenance(
     ))
 }
 
-#[utoipa::path(get, path = "/api/v1/fs/provenance/events", tag = "provenance", security(("sessionCookie" = [])), responses((status = 200, description = "SSE stream of provenance and resync events", content_type = "text/event-stream"), (status = 401, body = Problem)))]
-async fn provenance_events(
-    State(state): State<AppState>,
-    jar: CookieJar,
-) -> ApiResult<(
-    HeaderMap,
-    Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
-)> {
-    require_session(&state, &jar)?;
-    let stream = BroadcastStream::new(state.provenance_events.subscribe()).filter_map(|message| {
-        futures_util::future::ready(match message {
-            Ok(change) => Some(Ok(Event::default()
-                .event("provenance")
-                .data(serde_json::to_string(&change).unwrap()))),
-            Err(_) => Some(Ok(Event::default().event("resync").data("{}"))),
-        })
-    });
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
-    headers.insert("x-accel-buffering", "no".parse().unwrap());
-    Ok((
-        headers,
-        Sse::new(stream).keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("keepalive"),
-        ),
-    ))
+fn media_snapshot(state: &AppState) -> LiveEvent {
+    let mut jobs = state
+        .media_jobs
+        .iter()
+        .map(|job| job.value().clone())
+        .collect::<Vec<_>>();
+    jobs.sort_by_key(|job| std::cmp::Reverse(job.started_at));
+    jobs.truncate(20);
+    let mut extractions = state
+        .extraction_jobs
+        .iter()
+        .map(|job| job.value().clone())
+        .collect::<Vec<_>>();
+    extractions.sort_by_key(|job| std::cmp::Reverse(job.started_at));
+    extractions.truncate(20);
+    LiveEvent::MediaSnapshot { jobs, extractions }
 }
 
-#[utoipa::path(get, path = "/api/v1/fs/events", tag = "filesystem", security(("sessionCookie" = [])), responses((status = 200, description = "SSE stream identifying directories changed outside the browser", content_type = "text/event-stream"), (status = 401, body = Problem)))]
-async fn filesystem_events(
+async fn send_live_event(socket: &mut WebSocket, event: &LiveEvent) -> bool {
+    let Ok(json) = serde_json::to_string(event) else {
+        return false;
+    };
+    socket.send(Message::Text(json.into())).await.is_ok()
+}
+
+async fn live_socket(mut socket: WebSocket, state: AppState) {
+    let mut events = state.live_events.subscribe();
+    if !send_live_event(&mut socket, &LiveEvent::Resync).await
+        || !send_live_event(&mut socket, &media_snapshot(&state)).await
+    {
+        return;
+    }
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Ping(payload))) => {
+                    if socket.send(Message::Pong(payload)).await.is_err() { return; }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                _ => {}
+            },
+            event = events.recv() => match event {
+                Ok(event) => if !send_live_event(&mut socket, &event).await { return; },
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    if !send_live_event(&mut socket, &LiveEvent::Resync).await
+                        || !send_live_event(&mut socket, &media_snapshot(&state)).await
+                    { return; }
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    }
+}
+
+#[utoipa::path(get, path = "/api/v1/events", tag = "system", security(("sessionCookie" = [])), responses((status = 101, description = "Authenticated WebSocket stream for filesystem, provenance, media, and cache events"), (status = 401, body = Problem)))]
+async fn live_events(
     State(state): State<AppState>,
     jar: CookieJar,
-) -> ApiResult<(
-    HeaderMap,
-    Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
-)> {
+    upgrade: WebSocketUpgrade,
+) -> ApiResult<Response> {
     require_session(&state, &jar)?;
-    let stream = BroadcastStream::new(state.filesystem_events.subscribe()).filter_map(|message| {
-        futures_util::future::ready(match message {
-            Ok(change) => Some(Ok(Event::default()
-                .event("filesystem")
-                .data(serde_json::to_string(&change).unwrap()))),
-            Err(_) => Some(Ok(Event::default().event("resync").data("{}"))),
-        })
-    });
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
-    headers.insert("x-accel-buffering", "no".parse().unwrap());
-    Ok((
-        headers,
-        Sse::new(stream).keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("keepalive"),
-        ),
-    ))
+    Ok(upgrade
+        .on_upgrade(move |socket| live_socket(socket, state))
+        .into_response())
 }
 
 fn spawn_filesystem_watcher(state: AppState) {
@@ -1104,8 +1255,8 @@ fn spawn_filesystem_watcher(state: AppState) {
                 let mut directory_ids = directory_ids.into_iter().collect::<Vec<_>>();
                 directory_ids.sort();
                 let _ = state
-                    .filesystem_events
-                    .send(FilesystemEvent { directory_ids });
+                    .live_events
+                    .send(LiveEvent::Filesystem { directory_ids });
             }
         }
     });
@@ -1168,7 +1319,116 @@ async fn remap_provenance(
     *state.provenance.write().await = records;
     drop(_write);
     for event in events {
-        let _ = state.provenance_events.send(event);
+        let _ = state
+            .live_events
+            .send(LiveEvent::Provenance { change: event });
+    }
+    Ok(())
+}
+
+fn remapped_source_id(config: &Config, id: &str, source: &Path, target: &Path) -> Option<String> {
+    let path = config.root.join(decode_path(id).ok()?);
+    let suffix = path.strip_prefix(source).ok()?;
+    let remapped = if suffix.as_os_str().is_empty() {
+        target.to_path_buf()
+    } else {
+        target.join(suffix)
+    };
+    Some(encode_path(
+        remapped.strip_prefix(&config.root).ok()?.as_os_str(),
+    ))
+}
+
+fn cache_artifact_path(cache: &Path, record: &CacheRecord) -> PathBuf {
+    if record.kind == "hls" {
+        cache.join("hls").join(&record.key)
+    } else {
+        cache
+            .join("thumbnails")
+            .join(format!("{}.webp", record.key))
+    }
+}
+
+async fn invalidate_cache_prefix(state: &AppState, path: &Path) -> ApiResult<()> {
+    let _write = state.cache_write.lock().await;
+    let mut index = state.cache_index.read().await.clone();
+    let removed = index
+        .records
+        .iter()
+        .filter_map(|(record_id, record)| {
+            let source = state.config.root.join(decode_path(&record.source_id).ok()?);
+            source
+                .starts_with(path)
+                .then_some((record_id.clone(), record.clone()))
+        })
+        .collect::<Vec<_>>();
+    for (record_id, _) in &removed {
+        index.records.remove(record_id);
+    }
+    persist_cache_index(&state.config.cache, &index).await?;
+    *state.cache_index.write().await = index;
+    drop(_write);
+    for (_, record) in removed {
+        let active = record.kind == "hls"
+            && state
+                .media_jobs
+                .get(&record.key)
+                .is_some_and(|job| job.status == "working");
+        if active {
+            continue;
+        }
+        let artifact = cache_artifact_path(&state.config.cache, &record);
+        if record.kind == "hls" {
+            let _ = fs::remove_dir_all(artifact).await;
+        } else {
+            let _ = fs::remove_file(artifact).await;
+        }
+    }
+    Ok(())
+}
+
+async fn remap_cache(state: &AppState, source: &Path, target: &Path) -> ApiResult<()> {
+    let _write = state.cache_write.lock().await;
+    let mut index = state.cache_index.read().await.clone();
+    for record in index.records.values_mut() {
+        let Some(new_id) = remapped_source_id(&state.config, &record.source_id, source, target)
+        else {
+            continue;
+        };
+        let new_path = state.config.root.join(decode_path(&new_id)?);
+        let meta = match fs::metadata(&new_path).await {
+            Ok(meta) if meta.is_file() => meta,
+            _ => continue,
+        };
+        record.source_id = new_id;
+        record.source_size = meta.len();
+        record.source_modified_ns = source_modified_ns(&meta);
+    }
+    persist_cache_index(&state.config.cache, &index).await?;
+    *state.cache_index.write().await = index;
+    drop(_write);
+
+    let updates = state
+        .media_jobs
+        .iter()
+        .filter_map(|job| {
+            remapped_source_id(&state.config, &job.source_id, source, target)
+                .map(|new_id| (job.key.clone(), new_id))
+        })
+        .collect::<Vec<_>>();
+    for (key, new_id) in updates {
+        let file_name = state
+            .config
+            .root
+            .join(decode_path(&new_id)?)
+            .file_name()
+            .unwrap_or_else(|| OsStr::new("video"))
+            .to_string_lossy()
+            .into_owned();
+        emit_media_job(state, &key, |job| {
+            job.source_id = new_id;
+            job.file_name = file_name;
+        });
     }
     Ok(())
 }
@@ -1220,7 +1480,9 @@ async fn entry_from_path(state: &AppState, path: PathBuf) -> ApiResult<Entry> {
             .get(&id)
             .is_some_and(|urls| !urls.is_empty());
     let browser_ready = if kind == "file" && mime.starts_with("video/") {
-        let key = hls_cache_key(&id, &meta);
+        let key = find_cache_key(state, "hls", &id, &meta, None)
+            .await
+            .unwrap_or_else(|| hls_cache_key(&id, &meta));
         if playlist_state(&config.cache.join("hls").join(&key)).0 {
             true
         } else if let Some(ready) = state.direct_playable.get(&key) {
@@ -1546,6 +1808,9 @@ async fn upload(
                 ));
             }
             move_to_trash(&state.config, &target).await?;
+            if let Err(error) = invalidate_cache_prefix(&state, &target).await {
+                warn!(?error, path = %target.display(), "could not invalidate replaced cache");
+            }
         }
         let temporary = parent.join(format!(".rfb-upload-{}", Uuid::new_v4()));
         let mut file = fs::OpenOptions::new()
@@ -1664,6 +1929,9 @@ async fn operation(
                 }
                 if !merge_directories {
                     remap_provenance(&state, &source, &target, false).await?;
+                    if let Err(error) = remap_cache(&state, &source, &target).await {
+                        warn!(?error, source = %source.display(), target = %target.display(), "could not remap cache after move");
+                    }
                 }
             }
             "copy" => {
@@ -1704,6 +1972,10 @@ async fn merge_directory_trees(state: &AppState, source: &Path, target: &Path) -
                                 remove_recursively(&source_item).await?;
                             }
                             remap_provenance(state, &source_item, &target_item, false).await?;
+                            if let Err(error) = remap_cache(state, &source_item, &target_item).await
+                            {
+                                warn!(?error, source = %source_item.display(), target = %target_item.display(), "could not remap merged cache");
+                            }
                         }
                         Ok(target_meta) => {
                             let source_meta = fs::symlink_metadata(&source_item).await?;
@@ -1711,11 +1983,21 @@ async fn merge_directory_trees(state: &AppState, source: &Path, target: &Path) -
                                 tasks.push(MergeTask::Merge(source_item, target_item));
                             } else {
                                 move_to_trash(&state.config, &target_item).await?;
+                                if let Err(error) =
+                                    invalidate_cache_prefix(state, &target_item).await
+                                {
+                                    warn!(?error, path = %target_item.display(), "could not invalidate replaced cache");
+                                }
                                 if fs::rename(&source_item, &target_item).await.is_err() {
                                     copy_recursively(&source_item, &target_item).await?;
                                     remove_recursively(&source_item).await?;
                                 }
                                 remap_provenance(state, &source_item, &target_item, false).await?;
+                                if let Err(error) =
+                                    remap_cache(state, &source_item, &target_item).await
+                                {
+                                    warn!(?error, source = %source_item.display(), target = %target_item.display(), "could not remap merged cache");
+                                }
                             }
                         }
                         Err(error) => return Err(error.into()),
@@ -2057,6 +2339,20 @@ struct PreviewQuery {
     size: Option<String>,
 }
 
+fn thumbnail_cache_key(id: &str, meta: &std::fs::Metadata, dimension: u32) -> String {
+    blake3::hash(
+        format!(
+            "{}:{}:{}:{dimension}",
+            id,
+            meta.len(),
+            source_modified_ns(meta)
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string()
+}
+
 #[utoipa::path(get, path = "/api/v1/previews/thumbnail", tag = "media", params(("id" = String, Query), ("size" = Option<String>, Query)), security(("sessionCookie" = [])), responses((status = 200, description = "WebP thumbnail", content_type = "image/webp"), (status = 400, body = Problem)))]
 async fn thumbnail(
     State(state): State<AppState>,
@@ -2078,21 +2374,9 @@ async fn thumbnail(
         Some("large") => 384,
         _ => 192,
     };
-    let key = blake3::hash(
-        format!(
-            "{}:{}:{}:{dimension}",
-            query.id,
-            meta.len(),
-            meta.modified()
-                .ok()
-                .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        )
-        .as_bytes(),
-    )
-    .to_hex()
-    .to_string();
+    let key = find_cache_key(&state, "thumbnail", &query.id, &meta, Some(dimension))
+        .await
+        .unwrap_or_else(|| thumbnail_cache_key(&query.id, &meta, dimension));
     let output = state
         .config
         .cache
@@ -2133,6 +2417,18 @@ async fn thumbnail(
         }
         fs::rename(temporary, &output).await?;
     }
+    register_cache_record(
+        &state,
+        CacheRecord {
+            kind: "thumbnail".into(),
+            key: key.clone(),
+            source_id: query.id,
+            source_size: meta.len(),
+            source_modified_ns: source_modified_ns(&meta),
+            dimension: Some(dimension),
+        },
+    )
+    .await?;
     serve_file(output, &headers, true).await
 }
 
@@ -2274,6 +2570,7 @@ struct ExtractionJob {
     start_time: Option<f64>,
     end_time: Option<f64>,
     started_at: DateTime<Utc>,
+    progress: Option<f64>,
     error: Option<String>,
     result: Option<Entry>,
 }
@@ -2323,6 +2620,7 @@ async fn publish_extraction(
 
 async fn run_extraction(
     state: &AppState,
+    key: &str,
     request: &ExtractionRequest,
     source: &Path,
 ) -> ApiResult<Entry> {
@@ -2339,7 +2637,16 @@ async fn run_extraction(
         let temporary = directory.join(format!(".rfb-extraction-{}.png", Uuid::new_v4()));
         let mut command = Command::new("ffmpeg");
         command
-            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                "-i",
+            ])
             .arg(source)
             .args([
                 "-ss",
@@ -2363,7 +2670,16 @@ async fn run_extraction(
         let temporary = directory.join(format!(".rfb-extraction-{}.mp4", Uuid::new_v4()));
         let mut command = Command::new("ffmpeg");
         command
-            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                "-i",
+            ])
             .arg(source)
             .args([
                 "-ss",
@@ -2393,8 +2709,30 @@ async fn run_extraction(
             .arg(&temporary);
         (base, "mp4", temporary, command)
     };
-    let output = match command.output().await {
-        Ok(output) => output,
+    let output = match command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(mut child) => {
+            let progress = if request.kind == "segment" {
+                child.stdout.take().map(|stdout| {
+                    tokio::spawn(track_extraction_progress(
+                        stdout,
+                        state.clone(),
+                        key.to_owned(),
+                        request.end_time.unwrap() - request.start_time.unwrap(),
+                    ))
+                })
+            } else {
+                None
+            };
+            let output = child.wait_with_output().await;
+            if let Some(progress) = progress {
+                let _ = progress.await;
+            }
+            output.map_err(ApiError::internal)?
+        }
         Err(error) => {
             let _ = fs::remove_file(&temporary).await;
             return Err(ApiError::internal(error));
@@ -2475,10 +2813,14 @@ async fn start_extraction(
         start_time: request.start_time,
         end_time: request.end_time,
         started_at: Utc::now(),
+        progress: (request.kind == "segment").then_some(0.0),
         error: None,
         result: None,
     };
     state.extraction_jobs.insert(key.clone(), job.clone());
+    let _ = state.live_events.send(LiveEvent::ExtractionJob {
+        job: Box::new(job.clone()),
+    });
     if state.extraction_jobs.len() > 100 {
         let mut oldest = state
             .extraction_jobs
@@ -2496,19 +2838,18 @@ async fn start_extraction(
     }
     let task_state = state.clone();
     tokio::spawn(async move {
-        let outcome = run_extraction(&task_state, &request, &source).await;
-        if let Some(mut job) = task_state.extraction_jobs.get_mut(&key) {
-            match outcome {
-                Ok(entry) => {
-                    job.status = "ready".into();
-                    job.result = Some(entry);
-                }
-                Err(error) => {
-                    job.status = "failed".into();
-                    job.error = Some(error.2);
-                }
+        let outcome = run_extraction(&task_state, &key, &request, &source).await;
+        emit_extraction_job(&task_state, &key, |job| match outcome {
+            Ok(entry) => {
+                job.status = "ready".into();
+                job.progress = (job.kind == "segment").then_some(1.0);
+                job.result = Some(entry);
             }
-        }
+            Err(error) => {
+                job.status = "failed".into();
+                job.error = Some(error.2);
+            }
+        });
     });
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
@@ -2568,6 +2909,89 @@ struct MediaJob {
     playable: bool,
     mode: String,
     started_at: DateTime<Utc>,
+    progress: Option<f64>,
+    #[serde(skip)]
+    #[schema(ignore)]
+    source_id: String,
+}
+
+fn emit_media_job(state: &AppState, key: &str, update: impl FnOnce(&mut MediaJob)) {
+    let job = state.media_jobs.get_mut(key).map(|mut job| {
+        update(&mut job);
+        job.clone()
+    });
+    if let Some(job) = job {
+        let _ = state
+            .live_events
+            .send(LiveEvent::MediaJob { job: Box::new(job) });
+    }
+}
+
+fn emit_extraction_job(state: &AppState, key: &str, update: impl FnOnce(&mut ExtractionJob)) {
+    let job = state.extraction_jobs.get_mut(key).map(|mut job| {
+        update(&mut job);
+        job.clone()
+    });
+    if let Some(job) = job {
+        let _ = state
+            .live_events
+            .send(LiveEvent::ExtractionJob { job: Box::new(job) });
+    }
+}
+
+fn ffmpeg_progress_seconds(line: &str) -> Option<f64> {
+    let value = line.strip_prefix("out_time_us=")?.parse::<f64>().ok()? / 1_000_000.0;
+    (value.is_finite() && value >= 0.0).then_some(value)
+}
+
+async fn track_media_progress(
+    reader: tokio::process::ChildStdout,
+    state: AppState,
+    key: String,
+    duration: f64,
+) {
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Some(seconds) = ffmpeg_progress_seconds(&line) else {
+            continue;
+        };
+        let progress = (seconds / duration).clamp(0.0, 0.995);
+        let should_emit = state
+            .media_jobs
+            .get(&key)
+            .and_then(|job| job.progress)
+            .is_none_or(|previous| progress >= previous + 0.002);
+        if should_emit {
+            emit_media_job(&state, &key, |job| {
+                job.progress = Some(progress.max(job.progress.unwrap_or(0.0)))
+            });
+        }
+    }
+}
+
+async fn track_extraction_progress(
+    reader: tokio::process::ChildStdout,
+    state: AppState,
+    key: String,
+    duration: f64,
+) {
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Some(seconds) = ffmpeg_progress_seconds(&line) else {
+            continue;
+        };
+        let progress = (seconds / duration).clamp(0.0, 0.995);
+        let should_emit = state
+            .extraction_jobs
+            .get(&key)
+            .and_then(|job| job.progress)
+            .is_some_and(|previous| progress >= previous + 0.002);
+        if should_emit {
+            emit_extraction_job(&state, &key, |job| {
+                job.progress = Some(progress.max(job.progress.unwrap_or(0.0)))
+            });
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2725,6 +3149,7 @@ fn hls_cache_key(id: &str, source_meta: &std::fs::Metadata) -> String {
     blake3::hash(fingerprint.as_bytes()).to_hex().to_string()
 }
 
+#[cfg(test)]
 fn hls_cache_directory(cache: &Path, id: &str, source_meta: &std::fs::Metadata) -> PathBuf {
     cache.join("hls").join(hls_cache_key(id, source_meta))
 }
@@ -2769,8 +3194,10 @@ async fn start_hls(
         ));
     }
     let source_meta = fs::metadata(&source).await?;
-    let key = hls_cache_key(&input.id, &source_meta);
-    let directory = hls_cache_directory(&state.config.cache, &input.id, &source_meta);
+    let key = find_cache_key(&state, "hls", &input.id, &source_meta, None)
+        .await
+        .unwrap_or_else(|| hls_cache_key(&input.id, &source_meta));
+    let directory = state.config.cache.join("hls").join(&key);
     let playlist = directory.join("index.m3u8");
     let file_name = source
         .file_name()
@@ -2779,6 +3206,18 @@ async fn start_hls(
         .into_owned();
     let (cached_playable, cached_ready) = playlist_state(&directory);
     if cached_ready {
+        register_cache_record(
+            &state,
+            CacheRecord {
+                kind: "hls".into(),
+                key: key.clone(),
+                source_id: input.id.clone(),
+                source_size: source_meta.len(),
+                source_modified_ns: source_modified_ns(&source_meta),
+                dimension: None,
+            },
+        )
+        .await?;
         let mode = cached_mode(&directory);
         state.media_jobs.insert(
             key.clone(),
@@ -2789,8 +3228,15 @@ async fn start_hls(
                 playable: true,
                 mode: mode.clone(),
                 started_at: Utc::now(),
+                progress: Some(1.0),
+                source_id: input.id.clone(),
             },
         );
+        if let Some(job) = state.media_jobs.get(&key).map(|job| job.value().clone()) {
+            let _ = state
+                .live_events
+                .send(LiveEvent::MediaJob { job: Box::new(job) });
+        }
         return Ok((
             StatusCode::OK,
             Json(HlsResponse {
@@ -2808,11 +3254,24 @@ async fn start_hls(
         .map(|job| job.status != "working")
         .unwrap_or(true);
     if should_start {
+        let duration = probe_media(&source).await?.duration_seconds;
         state.media_jobs.remove(&key);
         if fs::metadata(&directory).await.is_ok() {
             fs::remove_dir_all(&directory).await?;
         }
         fs::create_dir_all(&directory).await?;
+        register_cache_record(
+            &state,
+            CacheRecord {
+                kind: "hls".into(),
+                key: key.clone(),
+                source_id: input.id.clone(),
+                source_size: source_meta.len(),
+                source_modified_ns: source_modified_ns(&source_meta),
+                dimension: None,
+            },
+        )
+        .await?;
         let mode = probe_conversion_mode(&source).await;
         fs::write(directory.join("mode"), mode.as_str()).await?;
         state.media_jobs.insert(
@@ -2824,9 +3283,16 @@ async fn start_hls(
                 playable: false,
                 mode: mode.as_str().into(),
                 started_at: Utc::now(),
+                progress: Some(0.0),
+                source_id: input.id.clone(),
             },
         );
-        let jobs = state.media_jobs.clone();
+        if let Some(job) = state.media_jobs.get(&key).map(|job| job.value().clone()) {
+            let _ = state
+                .live_events
+                .send(LiveEvent::MediaJob { job: Box::new(job) });
+        }
+        let task_state = state.clone();
         let job_key = key.clone();
         tokio::spawn(async move {
             let segment = directory.join("segment-%05d.ts");
@@ -2837,6 +3303,9 @@ async fn start_hls(
                     "-hide_banner",
                     "-loglevel",
                     "error",
+                    "-progress",
+                    "pipe:1",
+                    "-nostats",
                     "-protocol_whitelist",
                     "file,pipe",
                     "-i",
@@ -2879,32 +3348,54 @@ async fn start_hls(
                 ])
                 .arg(segment)
                 .arg(&playlist);
-            let child = command.spawn();
+            let child = command.stdout(Stdio::piped()).spawn();
             let status = match child {
-                Ok(mut child) => loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) => break Some(status),
-                        Ok(None) => {
-                            let (playable, _) = playlist_state(&directory);
-                            if playable && let Some(mut job) = jobs.get_mut(&job_key) {
-                                job.playable = true;
+                Ok(mut child) => {
+                    let progress = child.stdout.take().map(|stdout| {
+                        tokio::spawn(track_media_progress(
+                            stdout,
+                            task_state.clone(),
+                            job_key.clone(),
+                            duration,
+                        ))
+                    });
+                    let status = loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) => break Some(status),
+                            Ok(None) => {
+                                let (playable, _) = playlist_state(&directory);
+                                let became_playable = playable
+                                    && task_state
+                                        .media_jobs
+                                        .get(&job_key)
+                                        .is_some_and(|job| !job.playable);
+                                if became_playable {
+                                    emit_media_job(&task_state, &job_key, |job| {
+                                        job.playable = true
+                                    });
+                                }
+                                tokio::time::sleep(Duration::from_millis(500)).await;
                             }
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            Err(_) => break None,
                         }
-                        Err(_) => break None,
+                    };
+                    if let Some(progress) = progress {
+                        let _ = progress.await;
                     }
-                },
+                    status
+                }
                 Err(_) => None,
             };
             let (playable, ready) = playlist_state(&directory);
-            if let Some(mut job) = jobs.get_mut(&job_key) {
+            emit_media_job(&task_state, &job_key, |job| {
                 job.playable = playable;
-                job.status = if status.map(|s| s.success()).unwrap_or(false) && ready {
-                    "ready".into()
+                if status.map(|s| s.success()).unwrap_or(false) && ready {
+                    job.status = "ready".into();
+                    job.progress = Some(1.0);
                 } else {
-                    "failed".into()
-                };
-            }
+                    job.status = "failed".into();
+                }
+            });
         });
     }
     Ok((
@@ -2994,45 +3485,167 @@ async fn hls_file(
 fn spawn_cache_cleanup(state: AppState) {
     tokio::spawn(async move {
         loop {
-            if let Err(error) = cleanup_cache(&state).await {
-                error!(?error, "cache cleanup failed");
+            let _ = state.live_events.send(LiveEvent::CacheCleanup {
+                state: "started".into(),
+                report: None,
+                error: None,
+            });
+            match cleanup_cache(&state).await {
+                Ok(report) => {
+                    let _ = state.live_events.send(LiveEvent::CacheCleanup {
+                        state: "complete".into(),
+                        report: Some(report),
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    error!(?error, "cache cleanup failed");
+                    let _ = state.live_events.send(LiveEvent::CacheCleanup {
+                        state: "failed".into(),
+                        report: None,
+                        error: Some(error.2),
+                    });
+                }
             }
             tokio::time::sleep(Duration::from_secs(60 * 60)).await;
         }
     });
 }
 
-async fn cleanup_cache(state: &AppState) -> ApiResult<()> {
+fn directory_stats(path: &Path) -> (u64, SystemTime) {
+    let mut size = 0;
+    let mut access = SystemTime::UNIX_EPOCH;
+    if let Ok(read) = std::fs::read_dir(path) {
+        for item in read.flatten() {
+            if let Ok(meta) = item.metadata() {
+                if meta.is_dir() {
+                    let (child_size, child_access) = directory_stats(&item.path());
+                    size += child_size;
+                    access = access.max(child_access);
+                } else {
+                    size += meta.len();
+                    access = access.max(meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH));
+                }
+            }
+        }
+    }
+    (size, access)
+}
+
+fn remove_artifact(path: &Path, directory: bool) -> std::io::Result<()> {
+    if directory {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+async fn reconcile_cache(
+    state: &AppState,
+    active: &HashSet<String>,
+) -> ApiResult<CacheCleanupReport> {
+    let root = state.config.root.clone();
+    let cache = state.config.cache.clone();
+    let index = state.cache_index.read().await.clone();
+    let active = active.clone();
+    let (index, report) = tokio::task::spawn_blocking(move || {
+        let mut index = index;
+        let mut report = CacheCleanupReport::default();
+        let stale = index
+            .records
+            .iter()
+            .filter_map(|(record_id, record)| {
+                let active_record = record.kind == "hls" && active.contains(&record.key);
+                if active_record {
+                    return None;
+                }
+                let artifact = cache_artifact_path(&cache, record);
+                let source = decode_path(&record.source_id)
+                    .ok()
+                    .map(|path| root.join(path));
+                let source_valid = source
+                    .and_then(|path| std::fs::metadata(path).ok())
+                    .is_some_and(|meta| {
+                        meta.is_file()
+                            && meta.len() == record.source_size
+                            && source_modified_ns(&meta) == record.source_modified_ns
+                    });
+                let artifact_valid =
+                    artifact.exists() && (record.kind != "hls" || playlist_state(&artifact).1);
+                (!source_valid || !artifact_valid).then_some((record_id.clone(), record.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (record_id, record) in stale {
+            let artifact = cache_artifact_path(&cache, &record);
+            if artifact.exists() {
+                let bytes = if record.kind == "hls" {
+                    directory_stats(&artifact).0
+                } else {
+                    std::fs::metadata(&artifact)
+                        .map(|meta| meta.len())
+                        .unwrap_or(0)
+                };
+                if remove_artifact(&artifact, record.kind == "hls").is_ok() {
+                    report.artifacts_removed += 1;
+                    report.bytes_reclaimed += bytes;
+                }
+            }
+            index.records.remove(&record_id);
+            report.records_removed += 1;
+        }
+        let referenced_hls = index
+            .records
+            .values()
+            .filter(|record| record.kind == "hls")
+            .map(|record| record.key.clone())
+            .collect::<HashSet<_>>();
+        let referenced_thumbnails = index
+            .records
+            .values()
+            .filter(|record| record.kind == "thumbnail")
+            .map(|record| format!("{}.webp", record.key))
+            .collect::<HashSet<_>>();
+        if let Ok(read) = std::fs::read_dir(cache.join("hls")) {
+            for item in read.flatten() {
+                let key = item.file_name().to_string_lossy().into_owned();
+                if referenced_hls.contains(&key) || active.contains(&key) {
+                    continue;
+                }
+                let bytes = directory_stats(&item.path()).0;
+                if remove_artifact(&item.path(), true).is_ok() {
+                    report.artifacts_removed += 1;
+                    report.bytes_reclaimed += bytes;
+                }
+            }
+        }
+        if let Ok(read) = std::fs::read_dir(cache.join("thumbnails")) {
+            for item in read.flatten() {
+                let name = item.file_name().to_string_lossy().into_owned();
+                if referenced_thumbnails.contains(&name) {
+                    continue;
+                }
+                let bytes = item.metadata().map(|meta| meta.len()).unwrap_or(0);
+                if remove_artifact(&item.path(), false).is_ok() {
+                    report.artifacts_removed += 1;
+                    report.bytes_reclaimed += bytes;
+                }
+            }
+        }
+        std::io::Result::Ok((index, report))
+    })
+    .await
+    .map_err(ApiError::internal)??;
+    persist_cache_index(&state.config.cache, &index).await?;
+    *state.cache_index.write().await = index;
+    Ok(report)
+}
+
+async fn evict_cache(state: &AppState, active: HashSet<String>) -> ApiResult<(u64, u64)> {
     let max_age = Duration::from_secs(state.config.cache_age_days * 24 * 60 * 60);
     let cache = state.config.cache.clone();
     let max_bytes = state.config.cache_max;
-    let active = state
-        .media_jobs
-        .iter()
-        .filter(|job| job.status == "working")
-        .map(|job| job.key.clone())
-        .collect::<std::collections::HashSet<_>>();
     tokio::task::spawn_blocking(move || {
         let mut units = Vec::<(PathBuf, u64, SystemTime, bool)>::new();
-        fn directory_stats(path: &Path) -> (u64, SystemTime) {
-            let mut size = 0;
-            let mut access = SystemTime::UNIX_EPOCH;
-            if let Ok(read) = std::fs::read_dir(path) {
-                for item in read.flatten() {
-                    if let Ok(meta) = item.metadata() {
-                        if meta.is_dir() {
-                            let (child_size, child_access) = directory_stats(&item.path());
-                            size += child_size;
-                            access = access.max(child_access);
-                        } else {
-                            size += meta.len();
-                            access = access.max(meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH));
-                        }
-                    }
-                }
-            }
-            (size, access)
-        }
         if let Ok(read) = std::fs::read_dir(cache.join("thumbnails")) {
             for item in read.flatten() {
                 if let Ok(meta) = item.metadata()
@@ -3058,12 +3671,18 @@ async fn cleanup_cache(state: &AppState) -> ApiResult<()> {
             }
         }
         let now = SystemTime::now();
+        let mut removed_count = 0;
+        let mut reclaimed = 0;
         for (path, _, access, directory) in &units {
             if now.duration_since(*access).unwrap_or_default() > max_age {
-                if *directory {
-                    let _ = std::fs::remove_dir_all(path);
-                } else {
-                    let _ = std::fs::remove_file(path);
+                let bytes = units
+                    .iter()
+                    .find(|(candidate, _, _, _)| candidate == path)
+                    .map(|(_, size, _, _)| *size)
+                    .unwrap_or(0);
+                if remove_artifact(path, *directory).is_ok() {
+                    removed_count += 1;
+                    reclaimed += bytes;
                 }
             }
         }
@@ -3081,13 +3700,71 @@ async fn cleanup_cache(state: &AppState) -> ApiResult<()> {
             };
             if removed.is_ok() {
                 total = total.saturating_sub(size);
+                removed_count += 1;
+                reclaimed += size;
             }
         }
-        std::io::Result::Ok(())
+        std::io::Result::Ok((removed_count, reclaimed))
     })
     .await
-    .map_err(ApiError::internal)??;
-    Ok(())
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::internal)
+}
+
+async fn cleanup_cache(state: &AppState) -> ApiResult<CacheCleanupReport> {
+    let _cleanup = state.cache_cleanup.lock().await;
+    let _write = state.cache_write.lock().await;
+    let active = state
+        .media_jobs
+        .iter()
+        .filter(|job| job.status == "working")
+        .map(|job| job.key.clone())
+        .collect::<HashSet<_>>();
+    let mut report = reconcile_cache(state, &active).await?;
+    let (evicted, reclaimed) = evict_cache(state, active).await?;
+    report.artifacts_removed += evicted;
+    report.bytes_reclaimed += reclaimed;
+    let mut index = state.cache_index.read().await.clone();
+    let before = index.records.len();
+    index
+        .records
+        .retain(|_, record| cache_artifact_path(&state.config.cache, record).exists());
+    report.records_removed += (before - index.records.len()) as u64;
+    persist_cache_index(&state.config.cache, &index).await?;
+    *state.cache_index.write().await = index;
+    Ok(report)
+}
+
+#[utoipa::path(post, path = "/api/v1/media/cache/cleanup", tag = "media", params(("x-csrf-token" = String, Header)), security(("sessionCookie" = []), ("csrfToken" = [])), responses((status = 200, body = CacheCleanupReport), (status = 401, body = Problem), (status = 403, body = Problem)))]
+async fn request_cache_cleanup(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> ApiResult<Json<CacheCleanupReport>> {
+    require_csrf(&state, &jar, &headers)?;
+    let _ = state.live_events.send(LiveEvent::CacheCleanup {
+        state: "started".into(),
+        report: None,
+        error: None,
+    });
+    match cleanup_cache(&state).await {
+        Ok(report) => {
+            let _ = state.live_events.send(LiveEvent::CacheCleanup {
+                state: "complete".into(),
+                report: Some(report.clone()),
+                error: None,
+            });
+            Ok(Json(report))
+        }
+        Err(error) => {
+            let _ = state.live_events.send(LiveEvent::CacheCleanup {
+                state: "failed".into(),
+                report: None,
+                error: Some(error.2.clone()),
+            });
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3100,7 +3777,6 @@ mod tests {
         let trash = root.join(".trash");
         std::fs::create_dir_all(trash.join("items")).unwrap();
         let (events, _) = broadcast::channel(16);
-        let (filesystem_events, _) = broadcast::channel(16);
         AppState {
             config: Arc::new(Config {
                 root: root.to_path_buf(),
@@ -3122,8 +3798,10 @@ mod tests {
             extraction_jobs: Arc::new(DashMap::new()),
             provenance: Arc::new(RwLock::new(HashMap::new())),
             provenance_write: Arc::new(Mutex::new(())),
-            provenance_events: events,
-            filesystem_events,
+            cache_index: Arc::new(RwLock::new(CacheIndex::default())),
+            cache_write: Arc::new(Mutex::new(())),
+            cache_cleanup: Arc::new(Mutex::new(())),
+            live_events: events,
             provenance_api_token: token.map(|value| Arc::new(value.to_string())),
         }
     }
@@ -3216,7 +3894,7 @@ mod tests {
     async fn concurrent_appends_preserve_urls_and_broadcast_changes() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path(), None);
-        let mut events = state.provenance_events.subscribe();
+        let mut events = state.live_events.subscribe();
         let first = append_provenance(
             &state,
             "file".into(),
@@ -3254,8 +3932,7 @@ mod tests {
             ("/api/v1/fs/entries", &["get"][..]),
             ("/api/v1/fs/metadata", &["get"][..]),
             ("/api/v1/fs/provenance", &["get", "put", "post"][..]),
-            ("/api/v1/fs/provenance/events", &["get"][..]),
-            ("/api/v1/fs/events", &["get"][..]),
+            ("/api/v1/events", &["get"][..]),
             ("/api/v1/fs/content", &["get"][..]),
             ("/api/v1/fs/items", &["post"][..]),
             ("/api/v1/fs/uploads", &["post"][..]),
@@ -3272,6 +3949,7 @@ mod tests {
             ("/api/v1/media/extractions/{key}", &["get"][..]),
             ("/api/v1/media/hls", &["post"][..]),
             ("/api/v1/media/jobs", &["get"][..]),
+            ("/api/v1/media/cache/cleanup", &["post"][..]),
             ("/api/v1/media/hls/{key}/status", &["get"][..]),
             ("/api/v1/media/hls/{key}/{file}", &["get"][..]),
         ] {
@@ -3353,6 +4031,122 @@ mod tests {
         assert!(!valid_media_time(10.0, 10.0));
         assert!(!valid_media_time(f64::NAN, 10.0));
         assert_eq!(timestamp_label(3661.234), "01-01-01.234");
+    }
+    #[test]
+    fn ffmpeg_progress_is_parsed_in_seconds() {
+        assert_eq!(ffmpeg_progress_seconds("out_time_us=1250000"), Some(1.25));
+        assert_eq!(ffmpeg_progress_seconds("progress=continue"), None);
+        assert_eq!(ffmpeg_progress_seconds("out_time_us=-1"), None);
+    }
+    #[test]
+    fn live_events_use_tagged_camel_case_messages() {
+        assert_eq!(
+            serde_json::to_value(LiveEvent::Resync).unwrap(),
+            serde_json::json!({ "type": "resync" })
+        );
+        assert_eq!(
+            serde_json::to_value(LiveEvent::Filesystem {
+                directory_ids: vec!["folder".into()]
+            })
+            .unwrap(),
+            serde_json::json!({ "type": "filesystem", "directoryIds": ["folder"] })
+        );
+    }
+    #[tokio::test]
+    async fn cache_association_and_active_job_follow_a_ui_move() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        let source = root.path().join("source.mp4");
+        let target = root.path().join("renamed.mp4");
+        std::fs::write(&source, b"video").unwrap();
+        let source_id = encode_path(OsStr::new("source.mp4"));
+        let target_id = encode_path(OsStr::new("renamed.mp4"));
+        let meta = std::fs::metadata(&source).unwrap();
+        let key = "abc123".to_string();
+        let directory = state.config.cache.join("hls").join(&key);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("segment-00000.ts"), b"segment").unwrap();
+        std::fs::write(
+            directory.join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:4,\nsegment-00000.ts\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        register_cache_record(
+            &state,
+            CacheRecord {
+                kind: "hls".into(),
+                key: key.clone(),
+                source_id: source_id.clone(),
+                source_size: meta.len(),
+                source_modified_ns: source_modified_ns(&meta),
+                dimension: None,
+            },
+        )
+        .await
+        .unwrap();
+        state.media_jobs.insert(
+            key.clone(),
+            MediaJob {
+                key: key.clone(),
+                file_name: "source.mp4".into(),
+                status: "working".into(),
+                playable: true,
+                mode: "full".into(),
+                started_at: Utc::now(),
+                progress: Some(0.5),
+                source_id,
+            },
+        );
+        std::fs::rename(&source, &target).unwrap();
+        remap_cache(&state, &source, &target).await.unwrap();
+        let target_meta = std::fs::metadata(&target).unwrap();
+        assert_eq!(
+            find_cache_key(&state, "hls", &target_id, &target_meta, None)
+                .await
+                .as_deref(),
+            Some("abc123")
+        );
+        let job = state.media_jobs.get(&key).unwrap();
+        assert_eq!(job.source_id, target_id);
+        assert_eq!(job.file_name, "renamed.mp4");
+        assert!(directory.exists());
+    }
+    #[tokio::test]
+    async fn cache_cleanup_removes_orphans_but_preserves_valid_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        let source = root.path().join("video.mp4");
+        std::fs::write(&source, b"video").unwrap();
+        let meta = std::fs::metadata(&source).unwrap();
+        let valid = state.config.cache.join("hls/abc123");
+        std::fs::create_dir_all(&valid).unwrap();
+        std::fs::write(valid.join("segment-00000.ts"), b"segment").unwrap();
+        std::fs::write(
+            valid.join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:4,\nsegment-00000.ts\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        register_cache_record(
+            &state,
+            CacheRecord {
+                kind: "hls".into(),
+                key: "abc123".into(),
+                source_id: encode_path(OsStr::new("video.mp4")),
+                source_size: meta.len(),
+                source_modified_ns: source_modified_ns(&meta),
+                dimension: None,
+            },
+        )
+        .await
+        .unwrap();
+        let orphan = state.config.cache.join("hls/def456");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("junk"), b"junk").unwrap();
+        let report = cleanup_cache(&state).await.unwrap();
+        assert!(!orphan.exists());
+        assert!(valid.exists());
+        assert_eq!(report.artifacts_removed, 1);
+        assert_eq!(state.cache_index.read().await.records.len(), 1);
     }
     #[tokio::test]
     async fn extraction_publication_never_overwrites() {

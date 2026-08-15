@@ -12,11 +12,12 @@ import {
   Film, Folder, FolderOpen, Grid2X2, LogOut, Maximize2, Menu, MoreHorizontal, Play,
   ExternalLink, Link2, Minus, Move, Plus, RefreshCw, RotateCw, Save, Scissors, Search, Trash2, Upload, WrapText, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
-import { api, ApiFailure, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, ExtractionJob, filesystemEventsUrl, FilesystemChange, mediaUrl, provenanceEventsUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
+import { api, ApiFailure, CacheCleanupReport, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, ExtractionJob, LiveEvent, liveEventsUrl, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { deleteConfirmationMessage } from './deleteConfirmation'
 import { updateFinderPathForSelection } from './finderPath'
 import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState'
 import { fitMediaWindow, formatMediaTime, ignoresVideoShortcut, shouldAutoLoop, stepFrame, validSegment } from './videoPlayerState'
+import { progressPercent, upsertJob } from './mediaJobState'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type EditorMode = 'edit' | 'split' | 'preview'
@@ -156,28 +157,11 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     return () => removeEventListener('rfb:provenance-changed', changed)
   }, [])
   useEffect(() => {
-    const events = new EventSource(provenanceEventsUrl, { withCredentials: true })
-    const resync = async () => {
-      const directoryIds = ['', ...Object.keys(liveState.current.expanded)]
-      await Promise.all(directoryIds.map(async id => {
-        try {
-          const page = await api.list(id, hidden)
-          if (id === '') setRoot(page); else setExpanded(previous => ({ ...previous, [id]: page }))
-        } catch { /* the ordinary UI error path handles inaccessible directories */ }
-      }))
-      dispatchEvent(new Event('rfb:provenance-resync'))
-    }
-    const provenance = (event: Event) => {
-      try { dispatchEvent(new CustomEvent<ProvenanceChange>('rfb:provenance-changed', { detail: JSON.parse((event as MessageEvent).data) })) } catch { void resync() }
-    }
-    events.addEventListener('provenance', provenance)
-    events.addEventListener('resync', () => void resync())
-    events.onopen = () => void resync()
-    return () => events.close()
-  }, [hidden])
-  useEffect(() => {
-    const events = new EventSource(filesystemEventsUrl, { withCredentials: true })
     let timer: ReturnType<typeof setTimeout> | undefined
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined
+    let socket: WebSocket | undefined
+    let stopped = false
+    let retry = 1000
     const pending = new Set<string>()
     const refreshDirectories = async (ids?: string[]) => {
       const loaded = new Set(['', ...Object.keys(liveState.current.expanded)])
@@ -216,16 +200,36 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         const ids = [...pending]; pending.clear(); void refreshDirectories(ids)
       }, 100)
     }
-    const filesystem = (event: Event) => {
-      try { schedule((JSON.parse((event as MessageEvent).data) as FilesystemChange).directoryIds) }
-      catch { void refreshDirectories() }
+    const resync = () => {
+      void refreshDirectories()
+      dispatchEvent(new Event('rfb:provenance-resync'))
+      dispatchEvent(new Event('rfb:media-resync'))
+    }
+    const connect = () => {
+      socket = new WebSocket(liveEventsUrl())
+      socket.onopen = () => { retry = 1000 }
+      socket.onmessage = message => {
+        try {
+          const event = JSON.parse(message.data) as LiveEvent
+          if (event.type === 'resync') resync()
+          else if (event.type === 'filesystem') schedule(event.directoryIds)
+          else if (event.type === 'provenance') dispatchEvent(new CustomEvent<ProvenanceChange>('rfb:provenance-changed', { detail: event.change }))
+          else dispatchEvent(new CustomEvent<LiveEvent>('rfb:media-live', { detail: event }))
+        } catch { resync() }
+      }
+      socket.onclose = () => {
+        if (stopped) return
+        reconnectTimer = setTimeout(connect, retry)
+        retry = Math.min(30000, retry * 2)
+      }
     }
     const videoReady = () => void refreshDirectories()
-    events.addEventListener('filesystem', filesystem)
-    events.addEventListener('resync', () => void refreshDirectories())
     addEventListener('rfb:video-ready', videoReady)
-    events.onopen = () => void refreshDirectories()
-    return () => { clearTimeout(timer); events.close(); removeEventListener('rfb:video-ready', videoReady) }
+    connect()
+    return () => {
+      stopped = true; clearTimeout(timer); clearTimeout(reconnectTimer); socket?.close()
+      removeEventListener('rfb:video-ready', videoReady)
+    }
   }, [hidden])
 
   const refresh = async (id = currentDir) => {
@@ -428,6 +432,9 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
 function ConversionJobs() {
   const [jobs, setJobs] = useState<ConversionJob[]>([])
   const [extractions, setExtractions] = useState<ExtractionJob[]>([])
+  const [cleaning, setCleaning] = useState(false)
+  const [cleanupReport, setCleanupReport] = useState<CacheCleanupReport>()
+  const [cleanupError, setCleanupError] = useState('')
   const playableJobs = useRef<Record<string, boolean>>({})
   useEffect(() => {
     let active = true
@@ -439,21 +446,50 @@ function ConversionJobs() {
         if (becamePlayable) dispatchEvent(new Event('rfb:video-ready'))
       }
     }).catch(() => {})
-    refresh()
-    const timer = window.setInterval(refresh, 2000)
-    return () => { active = false; window.clearInterval(timer) }
+    const live = (message: Event) => {
+      const event = (message as CustomEvent<LiveEvent>).detail
+      if (event.type === 'mediaSnapshot') {
+        const becamePlayable = event.jobs.some(job => job.playable && !playableJobs.current[job.key])
+        playableJobs.current = Object.fromEntries(event.jobs.map(job => [job.key, job.playable]))
+        setJobs(event.jobs); setExtractions(event.extractions)
+        if (becamePlayable) dispatchEvent(new Event('rfb:video-ready'))
+      } else if (event.type === 'mediaJob') {
+        const becamePlayable = event.job.playable && !playableJobs.current[event.job.key]
+        playableJobs.current[event.job.key] = event.job.playable
+        setJobs(previous => upsertJob(previous, event.job))
+        if (becamePlayable) dispatchEvent(new Event('rfb:video-ready'))
+      } else if (event.type === 'extractionJob') {
+        setExtractions(previous => upsertJob(previous, event.job))
+      } else if (event.type === 'cacheCleanup') {
+        setCleaning(event.state === 'started')
+        if (event.report) { setCleanupReport(event.report); setCleanupError('') }
+        if (event.error) setCleanupError(event.error)
+      }
+    }
+    const resync = () => void refresh()
+    refresh(); addEventListener('rfb:media-live', live); addEventListener('rfb:media-resync', resync)
+    return () => { active = false; removeEventListener('rfb:media-live', live); removeEventListener('rfb:media-resync', resync) }
   }, [])
-  const working = jobs.some(job => job.status === 'working') || extractions.some(job => job.status === 'working')
+  const cleanup = async () => {
+    setCleaning(true); setCleanupError(''); setCleanupReport(undefined)
+    try { setCleanupReport(await api.cleanupCache()) }
+    catch (error) { setCleanupError(messageOf(error)) }
+    finally { setCleaning(false) }
+  }
+  const working = cleaning || jobs.some(job => job.status === 'working') || extractions.some(job => job.status === 'working')
+  const progressLabel = (progress: number | null) => `${progressPercent(progress)}%`
   return <div className="conversion-jobs" aria-label="Media jobs">
-    <div className="conversion-jobs-heading"><Film /> <span>Media jobs</span>{working && <span className="conversion-pulse" title="Media work in progress" />}</div>
+    <div className="conversion-jobs-heading"><Film /> <span>Media jobs</span>{working && <span className="conversion-pulse" title="Media work in progress" />}<button className="cache-cleanup" disabled={cleaning} title="Reconcile and clean stale media cache" aria-label="Clean stale media cache" onClick={() => void cleanup()}><RefreshCw /></button></div>
     <div className="conversion-job-list">
       {jobs.length === 0 && extractions.length === 0 ? <p>No media jobs yet.</p> : <>{extractions.map(job => <div className={`conversion-job ${job.status}`} key={`extract-${job.key}`} title={job.fileName}>
         <span className="conversion-status" aria-label={job.status} />
-        <div><strong>{job.result?.name ?? job.fileName}</strong><small>{job.status === 'failed' ? job.error ?? 'Extraction failed' : `${job.kind === 'frame' ? 'Frame extraction' : 'Clip extraction'}${job.status === 'ready' ? ' complete' : '…'}`}</small></div>
+        <div><strong>{job.result?.name ?? job.fileName}</strong><small>{job.status === 'failed' ? job.error ?? 'Extraction failed' : `${job.kind === 'frame' ? 'Frame extraction' : 'Clip extraction'}${job.status === 'ready' ? ' complete' : job.progress === null ? '…' : ` · ${progressLabel(job.progress)}`}`}</small>{job.status === 'working' && job.progress !== null && <progress max={1} value={job.progress} aria-label={`Clip extraction ${progressLabel(job.progress)}`} />}</div>
       </div>)}{jobs.map(job => <div className={`conversion-job ${job.status}`} key={job.key} title={job.fileName}>
         <span className="conversion-status" aria-label={job.status} />
-        <div><strong>{job.fileName}</strong><small>{job.status === 'failed' ? 'Conversion failed' : `${job.mode === 'remux' ? 'Remuxing' : job.mode === 'audio' ? 'Converting audio' : 'Converting video'}${job.status === 'ready' ? ' complete' : job.playable ? ' · playing' : '…'}`}</small></div>
+        <div><strong>{job.fileName}</strong><small>{job.status === 'failed' ? 'Conversion failed' : `${job.mode === 'remux' ? 'Remuxing' : job.mode === 'audio' ? 'Converting audio' : 'Converting video'}${job.status === 'ready' ? ' complete' : ` · ${progressLabel(job.progress ?? 0)}${job.playable ? ' · playing' : ''}`}`}</small>{job.status === 'working' && <progress max={1} value={job.progress ?? 0} aria-label={`Conversion ${progressLabel(job.progress ?? 0)}`} />}</div>
       </div>)}</>}
+      {cleanupReport && <p className="cache-cleanup-result">Removed {cleanupReport.artifactsRemoved} item{cleanupReport.artifactsRemoved === 1 ? '' : 's'} · {formatBytes(cleanupReport.bytesReclaimed)}</p>}
+      {cleanupError && <p className="provenance-error">{cleanupError}</p>}
     </div>
   </div>
 }
