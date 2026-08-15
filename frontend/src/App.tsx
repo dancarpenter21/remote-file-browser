@@ -382,7 +382,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   return <div className="app-shell">
     <header className="topbar">
       <div className="brand"><FolderOpen size={20} /><strong>Remote Files</strong><span>/fs-root</span></div>
-      <div className="search"><Search size={16} /><input placeholder="Filter visible files" value={filter} onChange={e => setFilter(e.target.value)} /></div>
+      <div className="search"><Search size={16} /><input placeholder="Filter visible files" value={filter} onChange={e => setFilter(e.target.value)} />{filter && <button type="button" className="search-clear" title="Clear file filter" aria-label="Clear file filter" onClick={() => setFilter('')}><X /></button>}</div>
       <button className="icon-button" title="Sign out" onClick={logout}><LogOut size={18} /></button>
     </header>
     <div className="workspace">
@@ -438,15 +438,22 @@ function ConversionJobs() {
   const playableJobs = useRef<Record<string, boolean>>({})
   useEffect(() => {
     let active = true
-    const refresh = () => Promise.all([api.conversionJobs(), api.extractionJobs()]).then(([nextJobs, nextExtractions]) => {
-      if (active) {
-        const becamePlayable = nextJobs.some(job => job.playable && !playableJobs.current[job.key])
-        playableJobs.current = Object.fromEntries(nextJobs.map(job => [job.key, job.playable]))
-        setJobs(nextJobs); setExtractions(nextExtractions)
-        if (becamePlayable) dispatchEvent(new Event('rfb:video-ready'))
-      }
-    }).catch(() => {})
+    let liveRevision = 0
+    let refreshRevision = 0
+    const refresh = () => {
+      const request = ++refreshRevision
+      const revision = liveRevision
+      return Promise.all([api.conversionJobs(), api.extractionJobs()]).then(([nextJobs, nextExtractions]) => {
+        if (active && request === refreshRevision && revision === liveRevision) {
+          const becamePlayable = nextJobs.some(job => job.playable && !playableJobs.current[job.key])
+          playableJobs.current = Object.fromEntries(nextJobs.map(job => [job.key, job.playable]))
+          setJobs(nextJobs); setExtractions(nextExtractions)
+          if (becamePlayable) dispatchEvent(new Event('rfb:video-ready'))
+        }
+      }).catch(() => {})
+    }
     const live = (message: Event) => {
+      liveRevision += 1
       const event = (message as CustomEvent<LiveEvent>).detail
       if (event.type === 'mediaSnapshot') {
         const becamePlayable = event.jobs.some(job => job.playable && !playableJobs.current[job.key])
@@ -467,8 +474,9 @@ function ConversionJobs() {
       }
     }
     const resync = () => void refresh()
-    refresh(); addEventListener('rfb:media-live', live); addEventListener('rfb:media-resync', resync)
-    return () => { active = false; removeEventListener('rfb:media-live', live); removeEventListener('rfb:media-resync', resync) }
+    addEventListener('rfb:media-live', live); addEventListener('rfb:media-resync', resync); void refresh()
+    const reconciliationTimer = window.setInterval(refresh, 15000)
+    return () => { active = false; window.clearInterval(reconciliationTimer); removeEventListener('rfb:media-live', live); removeEventListener('rfb:media-resync', resync) }
   }, [])
   const cleanup = async () => {
     setCleaning(true); setCleanupError(''); setCleanupReport(undefined)
