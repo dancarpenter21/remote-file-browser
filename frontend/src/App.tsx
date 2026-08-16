@@ -19,6 +19,7 @@ import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState
 import { fitMediaWindow, formatMediaTime, ignoresVideoShortcut, shouldAutoLoop, stepFrame, validSegment } from './videoPlayerState'
 import { progressPercent, upsertJob } from './mediaJobState'
 import { fitContextMenuToViewport } from './contextMenuPosition'
+import { moveConfirmationMessage, springLoadedPath } from './columnDrag'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type EditorMode = 'edit' | 'split' | 'preview'
@@ -239,6 +240,14 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       if (id === '') setRoot(page); else setExpanded(previous => ({ ...previous, [id]: page }))
     } catch (e) { setError(messageOf(e)) }
   }
+  const loadDirectory = async (entry: Entry) => {
+    if (liveState.current.expanded[entry.id]) return true
+    try {
+      const page = await api.list(entry.id, hidden)
+      setExpanded(previous => ({ ...previous, [entry.id]: page }))
+      return true
+    } catch (e) { setError(messageOf(e)); return false }
+  }
   const navigateGrid = async (entry: Entry) => {
     setSelected(new Set()); setPrimary(null); setCurrentDir(entry.id)
     setColumnPath(previous => {
@@ -339,14 +348,22 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     if (clipboard.operation === 'move') setClipboard(null)
     await refresh(currentDir)
   }
-  const moveByDrag = async (ids: string[], destinationId: string) => {
+  const moveByDrag = async (ids: string[], destinationId: string, requireConfirmation = false) => {
     const movableIds = ids.filter(id => findEntry(id, root, expanded)?.parentId !== destinationId)
-    if (!movableIds.length) return
+    if (!movableIds.length) return false
     const destination = findEntry(destinationId, root, expanded)
     if (destination && movableIds.some(id => {
       const source = findEntry(id, root, expanded)
       return source?.kind === 'directory' && destination.path.startsWith(`${source.path}/`)
-    })) { setError('A directory cannot be moved inside itself.'); return }
+    })) { setError('A directory cannot be moved inside itself.'); return false }
+    if (requireConfirmation) {
+      const names = movableIds.map(id => findEntry(id, root, expanded)?.name ?? id)
+      const confirmed = await confirmAction(moveConfirmationMessage(names, destination?.path ?? '/fs-root'), {
+        title: movableIds.length === 1 ? 'Move item?' : 'Move selected items?',
+        confirmLabel: 'Move',
+      })
+      if (!confirmed) return false
+    }
     const sourceParents = new Set(movableIds.map(id => findEntry(id, root, expanded)?.parentId ?? ''))
     const perform = (replace = false, merge = false) => api.operate('move', movableIds, destinationId, undefined, replace, merge)
     setError('')
@@ -355,20 +372,21 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     } catch (e) {
       if (e instanceof ApiFailure && e.code === 'folder_merge_conflict') {
         const choice = await chooseMerge(e.message)
-        if (choice === 'cancel') return
-        try { await perform(choice === 'replace', choice === 'merge') } catch (retryError) { setError(messageOf(retryError)); return }
+        if (choice === 'cancel') return false
+        try { await perform(choice === 'replace', choice === 'merge') } catch (retryError) { setError(messageOf(retryError)); return false }
       } else {
         if (!(e instanceof ApiFailure) || e.code !== 'already_exists' ||
             !await confirmAction(`${e.message}. Replace it and move the old item to Trash?`, { title: 'Replace existing item?', confirmLabel: 'Replace', danger: true })) {
-          setError(messageOf(e)); return
+          setError(messageOf(e)); return false
         }
-        try { await perform(true) } catch (retryError) { setError(messageOf(retryError)); return }
+        try { await perform(true) } catch (retryError) { setError(messageOf(retryError)); return false }
       }
     }
     const pathIndex = columnPath.findIndex(entry => movableIds.includes(entry.id))
     if (pathIndex >= 0) { setColumnPath(previous => previous.slice(0, pathIndex)); setCurrentDir(columnPath[pathIndex]?.parentId ?? '') }
     setSelected(new Set()); setPrimary(null)
     await Promise.all(Array.from(new Set([...sourceParents, destinationId])).map(id => refresh(id)))
+    return true
   }
   const openTrash = async () => { try { setTrash(await api.listTrash()) } catch (e) { setError(messageOf(e)) } }
   const logout = async () => { try { await api.logout() } finally { onLogout() } }
@@ -415,7 +433,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         {error && <div className="banner error"><span>{error}</span><button onClick={() => setError('')}><X size={15} /></button></div>}
         <div className="browser-body"><div className="browser-view" onContextMenu={view === 'details' ? undefined : event => showFolderMenu(event, currentDir, columnPath.at(-1)?.path ?? '/fs-root')}>
           {!root ? <div className="center"><span className="spinner" /></div> : view === 'details' ?
-            <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} primary={primary} defaultColumnWidth={defaultColumnWidth} columnWidths={columnWidths} setColumnWidth={(key, width) => setColumnWidths(previous => ({ ...previous, [key]: width }))} navigate={navigateColumn} selectItems={selectColumnItems} selectParent={selectParentColumn} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} showFolderMenu={showFolderMenu} setError={setError} /> :
+            <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} primary={primary} defaultColumnWidth={defaultColumnWidth} columnWidths={columnWidths} setColumnWidth={(key, width) => setColumnWidths(previous => ({ ...previous, [key]: width }))} navigate={navigateColumn} loadDirectory={loadDirectory} selectItems={selectColumnItems} selectDragItems={(ids, entry) => { setSelected(ids); setPrimary(entry) }} selectParent={selectParentColumn} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} showFolderMenu={showFolderMenu} setError={setError} /> :
             !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view={view} selected={selected} setSelected={setSelected} setPrimary={setPrimary} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} setError={setError} />}
         </div>{showPreview && <ColumnPreview entries={previewEntries} primary={primary} />}</div>
       </main>
@@ -504,25 +522,63 @@ function ConversionJobs() {
 }
 
 type BrowserColumn = { directoryId: string; page?: EntryPage; label: string }
-function ColumnBrowser({ root, path, pages, filter, selected, primary, defaultColumnWidth, columnWidths, setColumnWidth, navigate, selectItems, selectParent, activate, renameEntry, moveEntries, deleteEntry, showFolderMenu, setError }: {
+function ColumnBrowser({ root, path, pages, filter, selected, primary, defaultColumnWidth, columnWidths, setColumnWidth, navigate, loadDirectory, selectItems, selectDragItems, selectParent, activate, renameEntry, moveEntries, deleteEntry, showFolderMenu, setError }: {
   root: EntryPage; path: Entry[]; pages: Record<string, EntryPage>; filter: string; selected: Set<string>; primary: Entry | null
   defaultColumnWidth: number; columnWidths: Record<string, number>; setColumnWidth: (key: string, width: number) => void
-  navigate: (entry: Entry, columnIndex: number) => Promise<void>; selectItems: (ids: Set<string>, primary: Entry | null, columnIndex: number, directoryId: string, preserveCurrentBranch?: boolean) => void
-  selectParent: (columnIndex: number) => void; activate: (entry: Entry) => void; renameEntry: (entry: Entry) => Promise<void>; moveEntries: (ids: string[], destinationId: string) => Promise<void>
+  navigate: (entry: Entry, columnIndex: number) => Promise<void>; loadDirectory: (entry: Entry) => Promise<boolean>
+  selectItems: (ids: Set<string>, primary: Entry | null, columnIndex: number, directoryId: string, preserveCurrentBranch?: boolean) => void
+  selectDragItems: (ids: Set<string>, primary: Entry | null) => void; selectParent: (columnIndex: number) => void
+  activate: (entry: Entry) => void; renameEntry: (entry: Entry) => Promise<void>; moveEntries: (ids: string[], destinationId: string, requireConfirmation?: boolean) => Promise<boolean>
   deleteEntry: (entry: Entry) => Promise<void>; showFolderMenu: (event: React.MouseEvent, directoryId: string, path: string) => void; setError: (message: string) => void
 }) {
-  const columns: BrowserColumn[] = [{ directoryId: '', page: root, label: 'fs-root' }, ...path.map(entry => ({ directoryId: entry.id, page: pages[entry.id], label: entry.name }))]
+  const [dragPath, setDragPath] = useState<Entry[] | null>(null)
+  const visiblePath = dragPath ?? path
+  const columns: BrowserColumn[] = [{ directoryId: '', page: root, label: 'fs-root' }, ...visiblePath.map(entry => ({ directoryId: entry.id, page: pages[entry.id], label: entry.name }))]
   const [activeColumn, setActiveColumn] = useState(0)
   const [menu, setMenu] = useState<{ entry: Entry; columnIndex: number; x: number; y: number } | null>(null)
   const [dropTarget, setDropTarget] = useState<string | null>(null)
   const anchor = useRef<{ column: number; index: number } | null>(null)
   const draggedIds = useRef<string[]>([])
+  const dragOrigin = useRef<{ selected: Set<string>; primary: Entry | null } | null>(null)
+  const didDrop = useRef(false)
+  const dragSession = useRef(0)
+  const hoverTarget = useRef<string | null>(null)
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const edgeDirection = useRef<-1 | 0 | 1>(0)
+  const edgeFrame = useRef<number | undefined>(undefined)
   const scroller = useRef<HTMLDivElement>(null)
   const columnRefs = useRef<Array<HTMLDivElement | null>>([])
+  const cancelSpringOpen = (targetId?: string) => {
+    if (targetId && hoverTarget.current !== targetId) return
+    clearTimeout(hoverTimer.current); hoverTimer.current = undefined; hoverTarget.current = null
+  }
+  const setEdgeScroll = (direction: -1 | 0 | 1) => {
+    if (edgeDirection.current === direction) return
+    edgeDirection.current = direction
+    if (!direction) {
+      if (edgeFrame.current !== undefined) cancelAnimationFrame(edgeFrame.current)
+      edgeFrame.current = undefined
+      return
+    }
+    if (edgeFrame.current !== undefined) return
+    const scroll = () => {
+      if (!edgeDirection.current) { edgeFrame.current = undefined; return }
+      if (scroller.current) scroller.current.scrollLeft += edgeDirection.current * 12
+      edgeFrame.current = requestAnimationFrame(scroll)
+    }
+    edgeFrame.current = requestAnimationFrame(scroll)
+  }
+  const resetDragVisuals = () => {
+    dragSession.current += 1; cancelSpringOpen(); setEdgeScroll(0); setDropTarget(null); setDragPath(null)
+  }
   useEffect(() => {
-    setActiveColumn(Math.min(path.length, columns.length - 1))
+    setActiveColumn(Math.min(visiblePath.length, columns.length - 1))
     requestAnimationFrame(() => scroller.current?.scrollTo({ left: scroller.current.scrollWidth, behavior: 'smooth' }))
-  }, [path.length])
+  }, [visiblePath.length])
+  useEffect(() => () => {
+    clearTimeout(hoverTimer.current)
+    if (edgeFrame.current !== undefined) cancelAnimationFrame(edgeFrame.current)
+  }, [])
   useEffect(() => {
     if (!menu) return
     const close = () => setMenu(null)
@@ -569,26 +625,63 @@ function ColumnBrowser({ root, path, pages, filter, selected, primary, defaultCo
     const up = () => { removeEventListener('pointermove', move); removeEventListener('pointerup', up) }
     addEventListener('pointermove', move); addEventListener('pointerup', up)
   }
-  const startDrag = (event: React.DragEvent, entry: Entry, columnIndex: number) => {
+  const startDrag = (event: React.DragEvent, entry: Entry) => {
     const ids = selected.has(entry.id) ? Array.from(selected) : [entry.id]
-    draggedIds.current = ids
-    if (!selected.has(entry.id)) selectItems(new Set([entry.id]), entry, columnIndex, entry.parentId)
+    dragSession.current += 1; draggedIds.current = ids; didDrop.current = false
+    dragOrigin.current = { selected: new Set(selected), primary }
+    setDragPath(path)
+    if (!selected.has(entry.id)) selectDragItems(new Set([entry.id]), entry)
     event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('application/x-remote-file-browser', ids.join(',')); event.dataTransfer.setData('text/plain', entry.name)
+  }
+  const endDrag = () => {
+    const origin = dragOrigin.current
+    const restoreSelection = !didDrop.current && origin
+    draggedIds.current = []; resetDragVisuals()
+    if (restoreSelection) { selectDragItems(origin.selected, origin.primary); dragOrigin.current = null }
   }
   const acceptDrop = (event: React.DragEvent, id: string) => {
     if (!draggedIds.current.length || draggedIds.current.includes(id)) return false
     event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move'; setDropTarget(id || '__root__'); return true
   }
+  const scheduleSpringOpen = (entry: Entry, columnIndex: number) => {
+    if (visiblePath[columnIndex]?.id === entry.id) { cancelSpringOpen(); return }
+    if (hoverTarget.current === entry.id) return
+    cancelSpringOpen(); hoverTarget.current = entry.id
+    const session = dragSession.current
+    hoverTimer.current = setTimeout(() => {
+      hoverTimer.current = undefined
+      if (session !== dragSession.current || hoverTarget.current !== entry.id) return
+      setDragPath(current => springLoadedPath(current ?? path, entry, columnIndex))
+      void loadDirectory(entry).then(loaded => {
+        if (!loaded && session === dragSession.current) {
+          setDragPath(current => current?.[columnIndex]?.id === entry.id ? current.slice(0, columnIndex) : current)
+        }
+      })
+    }, 600)
+  }
   const drop = (event: React.DragEvent, id: string) => {
     if (!acceptDrop(event, id)) return
-    const ids = draggedIds.current; draggedIds.current = []; setDropTarget(null); void moveEntries(ids, id)
+    const ids = draggedIds.current
+    const origin = dragOrigin.current
+    didDrop.current = true; draggedIds.current = []; resetDragVisuals()
+    void moveEntries(ids, id, true).then(moved => {
+      if (!moved && origin) selectDragItems(origin.selected, origin.primary)
+      dragOrigin.current = null
+    })
   }
-  return <div className="column-browser" ref={scroller}>
+  const trackEdgeScroll = (event: React.DragEvent) => {
+    if (!draggedIds.current.length || !scroller.current) return
+    const bounds = scroller.current.getBoundingClientRect()
+    setEdgeScroll(event.clientX < bounds.left + 48 ? -1 : event.clientX > bounds.right - 48 ? 1 : 0)
+  }
+  return <div className="column-browser" ref={scroller} onDragOverCapture={trackEdgeScroll} onDragLeave={event => {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) { cancelSpringOpen(); setEdgeScroll(0); setDropTarget(null) }
+  }}>
     {columns.map((column, columnIndex) => {
-      const entries = visibleEntries(column), targetKey = column.directoryId || '__root__', branchId = path[columnIndex]?.id
+      const entries = visibleEntries(column), targetKey = column.directoryId || '__root__', branchId = visiblePath[columnIndex]?.id
       const width = Math.min(480, Math.max(180, columnWidths[targetKey] || defaultColumnWidth))
-      return <div className={`finder-column ${activeColumn === columnIndex ? 'active' : ''} ${dropTarget === targetKey ? 'drop-target' : ''}`} style={{ '--column-width': `${width}px` } as React.CSSProperties} key={targetKey} ref={node => { columnRefs.current[columnIndex] = node }} tabIndex={0} role="listbox" aria-label={column.label} aria-multiselectable="true" onFocus={() => setActiveColumn(columnIndex)} onKeyDown={event => keyboard(event, columnIndex)} onContextMenu={event => showFolderMenu(event, column.directoryId, columnIndex === 0 ? '/fs-root' : path[columnIndex - 1].path)} onDragOver={event => acceptDrop(event, column.directoryId)} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null) }} onDrop={event => drop(event, column.directoryId)}>
-        {!column.page ? <div className="column-state"><span className="spinner" /></div> : entries.length === 0 ? <div className="column-state">{filter ? 'No matches' : 'Empty folder'}</div> : entries.map((entry, entryIndex) => <div className={`column-row ${selected.has(entry.id) ? 'selected' : branchId === entry.id ? 'branch-selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} key={entry.id} role="option" aria-selected={selected.has(entry.id)} aria-current={branchId === entry.id ? 'location' : undefined} draggable onDragStart={event => startDrag(event, entry, columnIndex)} onDragEnd={() => { draggedIds.current = []; setDropTarget(null) }} onClick={event => choose(entry, columnIndex, entryIndex, event, true)} onDoubleClick={() => entry.kind === 'directory' ? void navigate(entry, columnIndex) : activate(entry)} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ entry, columnIndex, x: event.clientX, y: event.clientY }) }} onDragOver={event => { if (entry.kind === 'directory') acceptDrop(event, entry.id) }} onDrop={event => { if (entry.kind === 'directory') drop(event, entry.id) }}>
+      return <div className={`finder-column ${activeColumn === columnIndex ? 'active' : ''} ${dropTarget === targetKey ? 'drop-target' : ''}`} style={{ '--column-width': `${width}px` } as React.CSSProperties} key={targetKey} ref={node => { columnRefs.current[columnIndex] = node }} tabIndex={0} role="listbox" aria-label={column.label} aria-multiselectable="true" onFocus={() => setActiveColumn(columnIndex)} onKeyDown={event => keyboard(event, columnIndex)} onContextMenu={event => showFolderMenu(event, column.directoryId, columnIndex === 0 ? '/fs-root' : visiblePath[columnIndex - 1].path)} onDragOver={event => { cancelSpringOpen(); acceptDrop(event, column.directoryId) }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null) }} onDrop={event => drop(event, column.directoryId)}>
+        {!column.page ? <div className="column-state"><span className="spinner" /></div> : entries.length === 0 ? <div className="column-state">{filter ? 'No matches' : 'Empty folder'}</div> : entries.map((entry, entryIndex) => <div className={`column-row ${selected.has(entry.id) ? 'selected' : branchId === entry.id ? 'branch-selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} key={entry.id} role="option" aria-selected={selected.has(entry.id)} aria-current={branchId === entry.id ? 'location' : undefined} draggable onDragStart={event => startDrag(event, entry)} onDragEnd={endDrag} onClick={event => choose(entry, columnIndex, entryIndex, event, true)} onDoubleClick={() => entry.kind === 'directory' ? void navigate(entry, columnIndex) : activate(entry)} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ entry, columnIndex, x: event.clientX, y: event.clientY }) }} onDragOver={event => { if (entry.kind === 'directory' && acceptDrop(event, entry.id)) scheduleSpringOpen(entry, columnIndex) }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) { cancelSpringOpen(entry.id); setDropTarget(current => current === entry.id ? null : current) } }} onDrop={event => { if (entry.kind === 'directory') drop(event, entry.id) }}>
           <FileGlyph entry={entry} /><span title={entry.name}>{entry.name}</span>{entry.kind === 'directory' && <ChevronRight className="column-arrow" />}
         </div>)}
         <div className="column-resizer" role="separator" aria-orientation="vertical" aria-label={`Resize ${column.label} column`} title="Resize column" onPointerDown={event => startResize(event, targetKey, width)} />
@@ -648,7 +741,7 @@ type Row = { entry: Entry; depth: number }
 function FileList({ rows, view, selected, setSelected, setPrimary, activate, renameEntry, moveEntries, deleteEntry, setError }: {
   rows: Row[]; view: ViewMode; selected: Set<string>; setSelected: (value: Set<string>) => void; setPrimary: (entry: Entry | null) => void
   activate: (entry: Entry) => void; renameEntry: (entry: Entry) => Promise<void>
-  moveEntries: (ids: string[], destinationId: string) => Promise<void>
+  moveEntries: (ids: string[], destinationId: string) => Promise<boolean>
   deleteEntry: (entry: Entry) => Promise<void>; setError: (message: string) => void
 }) {
   const [menu, setMenu] = useState<{ entry: Entry; x: number; y: number } | null>(null)
