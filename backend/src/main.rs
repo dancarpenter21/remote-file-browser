@@ -2590,6 +2590,27 @@ fn timestamp_label(seconds: f64) -> String {
     )
 }
 
+fn frame_extraction_command(source: &Path, target: &Path, time: f64) -> Command {
+    let mut command = Command::new("ffmpeg");
+    command
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-ss",
+        ])
+        .arg(format!("{time:.6}"))
+        .args(["-accurate_seek", "-i"])
+        .arg(source)
+        .args(["-map", "0:v:0", "-frames:v", "1", "-y"])
+        .arg(target);
+    command
+}
+
 async fn publish_extraction(
     temporary: &Path,
     directory: &Path,
@@ -2635,29 +2656,7 @@ async fn run_extraction(
         let time = request.time.unwrap();
         let base = format!("{stem}-frame-{}", timestamp_label(time));
         let temporary = directory.join(format!(".rfb-extraction-{}.png", Uuid::new_v4()));
-        let mut command = Command::new("ffmpeg");
-        command
-            .args([
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-progress",
-                "pipe:1",
-                "-nostats",
-                "-i",
-            ])
-            .arg(source)
-            .args([
-                "-ss",
-                &format!("{time:.6}"),
-                "-map",
-                "0:v:0",
-                "-frames:v",
-                "1",
-                "-y",
-            ])
-            .arg(&temporary);
+        let command = frame_extraction_command(source, &temporary, time);
         (base, "png", temporary, command)
     } else {
         let start = request.start_time.unwrap();
@@ -4031,6 +4030,42 @@ mod tests {
         assert!(!valid_media_time(10.0, 10.0));
         assert!(!valid_media_time(f64::NAN, 10.0));
         assert_eq!(timestamp_label(3661.234), "01-01-01.234");
+    }
+    #[test]
+    fn frame_extraction_seeks_accurately_before_opening_the_input() {
+        let command = frame_extraction_command(
+            Path::new("/videos/source.mp4"),
+            Path::new("/videos/frame.png"),
+            12.3456789,
+        );
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            [
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                "-ss",
+                "12.345679",
+                "-accurate_seek",
+                "-i",
+                "/videos/source.mp4",
+                "-map",
+                "0:v:0",
+                "-frames:v",
+                "1",
+                "-y",
+                "/videos/frame.png",
+            ]
+        );
     }
     #[test]
     fn ffmpeg_progress_is_parsed_in_seconds() {
