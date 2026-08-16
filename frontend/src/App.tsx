@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import CodeMirror from '@uiw/react-codemirror'
 import { markdown } from '@codemirror/lang-markdown'
@@ -18,6 +18,7 @@ import { updateFinderPathForSelection } from './finderPath'
 import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState'
 import { fitMediaWindow, formatMediaTime, ignoresVideoShortcut, shouldAutoLoop, stepFrame, validSegment } from './videoPlayerState'
 import { progressPercent, upsertJob } from './mediaJobState'
+import { fitContextMenuToViewport } from './contextMenuPosition'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type EditorMode = 'edit' | 'split' | 'preview'
@@ -284,7 +285,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     await mutate(() => api.create(directoryId, name, kind), directoryId, () => api.create(directoryId, name, kind, true))
   }
   const showFolderMenu = (event: React.MouseEvent, directoryId: string, path: string) => {
-    event.preventDefault(); event.stopPropagation(); setFolderMenu({ directoryId, path, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 150) })
+    event.preventDefault(); event.stopPropagation(); setFolderMenu({ directoryId, path, x: event.clientX, y: event.clientY })
   }
   const rename = async (target?: Entry) => {
     const entry = target ?? findEntry(first(selected), root, expanded); if (!entry) return
@@ -587,7 +588,7 @@ function ColumnBrowser({ root, path, pages, filter, selected, primary, defaultCo
       const entries = visibleEntries(column), targetKey = column.directoryId || '__root__', branchId = path[columnIndex]?.id
       const width = Math.min(480, Math.max(180, columnWidths[targetKey] || defaultColumnWidth))
       return <div className={`finder-column ${activeColumn === columnIndex ? 'active' : ''} ${dropTarget === targetKey ? 'drop-target' : ''}`} style={{ '--column-width': `${width}px` } as React.CSSProperties} key={targetKey} ref={node => { columnRefs.current[columnIndex] = node }} tabIndex={0} role="listbox" aria-label={column.label} aria-multiselectable="true" onFocus={() => setActiveColumn(columnIndex)} onKeyDown={event => keyboard(event, columnIndex)} onContextMenu={event => showFolderMenu(event, column.directoryId, columnIndex === 0 ? '/fs-root' : path[columnIndex - 1].path)} onDragOver={event => acceptDrop(event, column.directoryId)} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null) }} onDrop={event => drop(event, column.directoryId)}>
-        {!column.page ? <div className="column-state"><span className="spinner" /></div> : entries.length === 0 ? <div className="column-state">{filter ? 'No matches' : 'Empty folder'}</div> : entries.map((entry, entryIndex) => <div className={`column-row ${selected.has(entry.id) ? 'selected' : branchId === entry.id ? 'branch-selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} key={entry.id} role="option" aria-selected={selected.has(entry.id)} aria-current={branchId === entry.id ? 'location' : undefined} draggable onDragStart={event => startDrag(event, entry, columnIndex)} onDragEnd={() => { draggedIds.current = []; setDropTarget(null) }} onClick={event => choose(entry, columnIndex, entryIndex, event, true)} onDoubleClick={() => entry.kind === 'directory' ? void navigate(entry, columnIndex) : activate(entry)} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ entry, columnIndex, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 180) }) }} onDragOver={event => { if (entry.kind === 'directory') acceptDrop(event, entry.id) }} onDrop={event => { if (entry.kind === 'directory') drop(event, entry.id) }}>
+        {!column.page ? <div className="column-state"><span className="spinner" /></div> : entries.length === 0 ? <div className="column-state">{filter ? 'No matches' : 'Empty folder'}</div> : entries.map((entry, entryIndex) => <div className={`column-row ${selected.has(entry.id) ? 'selected' : branchId === entry.id ? 'branch-selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} key={entry.id} role="option" aria-selected={selected.has(entry.id)} aria-current={branchId === entry.id ? 'location' : undefined} draggable onDragStart={event => startDrag(event, entry, columnIndex)} onDragEnd={() => { draggedIds.current = []; setDropTarget(null) }} onClick={event => choose(entry, columnIndex, entryIndex, event, true)} onDoubleClick={() => entry.kind === 'directory' ? void navigate(entry, columnIndex) : activate(entry)} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ entry, columnIndex, x: event.clientX, y: event.clientY }) }} onDragOver={event => { if (entry.kind === 'directory') acceptDrop(event, entry.id) }} onDrop={event => { if (entry.kind === 'directory') drop(event, entry.id) }}>
           <FileGlyph entry={entry} /><span title={entry.name}>{entry.name}</span>{entry.kind === 'directory' && <ChevronRight className="column-arrow" />}
         </div>)}
         <div className="column-resizer" role="separator" aria-orientation="vertical" aria-label={`Resize ${column.label} column`} title="Resize column" onPointerDown={event => startResize(event, targetKey, width)} />
@@ -663,7 +664,7 @@ function FileList({ rows, view, selected, setSelected, setPrimary, activate, ren
   }, [menu])
   const showMenu = (event: React.MouseEvent, entry: Entry) => {
     event.preventDefault(); event.stopPropagation()
-    setMenu({ entry, x: Math.min(event.clientX, innerWidth - 198), y: Math.min(event.clientY, innerHeight - 180) })
+    setMenu({ entry, x: event.clientX, y: event.clientY })
   }
   const selectEntry = (entry: Entry, index: number, event: React.MouseEvent) => {
     if (event.shiftKey && anchor.current !== null) {
@@ -714,6 +715,28 @@ function FileList({ rows, view, selected, setSelected, setPrimary, activate, ren
   </div>
 }
 
+function PositionedContextMenu({ x, y, children }: { x: number; y: number; children: React.ReactNode }) {
+  const menuRef = useRef<HTMLDivElement>(null)
+  const [position, setPosition] = useState({ x, y })
+  useLayoutEffect(() => {
+    const place = () => {
+      const menu = menuRef.current
+      if (!menu) return
+      const bounds = menu.getBoundingClientRect()
+      const next = fitContextMenuToViewport(
+        { x, y },
+        { width: bounds.width, height: bounds.height },
+        { width: innerWidth, height: innerHeight },
+      )
+      setPosition(current => current.x === next.x && current.y === next.y ? current : next)
+    }
+    place()
+    addEventListener('resize', place)
+    return () => removeEventListener('resize', place)
+  }, [x, y])
+  return <div ref={menuRef} className="context-menu" style={{ left: position.x, top: position.y }} role="menu" onPointerDown={event => event.stopPropagation()}>{children}</div>
+}
+
 function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, setError }: { entry: Entry; x: number; y: number; close: () => void; open: () => void; renameEntry: (entry: Entry) => Promise<void>; deleteEntry: (entry: Entry) => Promise<void>; setError: (message: string) => void }) {
   const promptAction = usePrompt()
   const copyPath = async () => {
@@ -745,7 +768,7 @@ function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, setEr
       dispatchEvent(new CustomEvent<ProvenanceChange>('rfb:provenance-changed', { detail: { id: entry.id, urls: next.urls } }))
     } catch (error) { setError(messageOf(error)) }
   }
-  return <div className="context-menu" style={{ left: x, top: y }} role="menu" onPointerDown={event => event.stopPropagation()}>
+  return <PositionedContextMenu x={x} y={y}>
     <button role="menuitem" autoFocus onClick={() => { close(); open() }}><FolderOpen /> Open</button>
     <button role="menuitem" onClick={rename}><Edit3 /> Rename</button>
     <button role="menuitem" onClick={copyPath}><Copy /> Copy path</button>
@@ -753,7 +776,7 @@ function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, setEr
     {entry.kind === 'file' && <button role="menuitem" onClick={() => void addProvenance()}><Link2 /> Add provenance URL</button>}
     {entry.kind === 'file' && entry.hasProvenance && <button role="menuitem" onClick={() => void copyProvenance()}><Copy /> Copy Provenance URL</button>}
     <button role="menuitem" className="danger" onClick={remove}><Trash2 /> Delete</button>
-  </div>
+  </PositionedContextMenu>
 }
 
 function FolderContextMenu({ directoryId, path, x, y, close, createItem, setError }: { directoryId: string; path: string; x: number; y: number; close: () => void; createItem: (kind: 'file' | 'directory', directoryId?: string) => Promise<void>; setError: (message: string) => void }) {
@@ -768,12 +791,12 @@ function FolderContextMenu({ directoryId, path, x, y, close, createItem, setErro
     try { await navigator.clipboard.writeText(path) } catch { setError(clipboardError(path)) }
     close()
   }
-  return <div className="context-menu" style={{ left: x, top: y }} role="menu" onPointerDown={event => event.stopPropagation()}>
+  return <PositionedContextMenu x={x} y={y}>
     <button role="menuitem" autoFocus onClick={() => create('directory')}><Folder /> New Folder</button>
     <button role="menuitem" onClick={() => create('file')}><File /> New File</button>
     <span className="context-divider" />
     <button role="menuitem" onClick={copyPath}><Copy /> Copy Path</button>
-  </div>
+  </PositionedContextMenu>
 }
 
 function ViewSelector({ view, setView }: { view: ViewMode; setView: (view: ViewMode) => void }) {
