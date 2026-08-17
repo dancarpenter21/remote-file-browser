@@ -632,6 +632,10 @@ struct Entry {
     etag: String,
     has_provenance: bool,
     browser_ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    child_file_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    child_directory_count: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -735,7 +739,39 @@ async fn metadata(
 ) -> ApiResult<Json<Entry>> {
     require_session(&state, &jar)?;
     let path = resolve_existing(&state.config, &query.id).await?;
-    Ok(Json(entry_from_path(&state, path).await?))
+    let mut entry = entry_from_path(&state, path.clone()).await?;
+    if entry.kind == "directory" {
+        match directory_child_counts(&path, &state.config).await {
+            Ok((files, directories)) => {
+                entry.child_file_count = Some(files);
+                entry.child_directory_count = Some(directories);
+            }
+            Err(error) => {
+                warn!(%error, path = %path.display(), "could not count directory contents");
+            }
+        }
+    }
+    Ok(Json(entry))
+}
+
+async fn directory_child_counts(
+    directory: &Path,
+    config: &Config,
+) -> std::io::Result<(usize, usize)> {
+    let mut files = 0;
+    let mut directories = 0;
+    let mut reader = fs::read_dir(directory).await?;
+    while let Some(item) = reader.next_entry().await? {
+        if is_internal(directory, config, &item.file_name()) {
+            continue;
+        }
+        if item.file_type().await?.is_dir() {
+            directories += 1;
+        } else {
+            files += 1;
+        }
+    }
+    Ok((files, directories))
 }
 
 #[derive(Serialize, Deserialize, Clone, Default, utoipa::ToSchema)]
@@ -1525,6 +1561,8 @@ async fn entry_from_path(state: &AppState, path: PathBuf) -> ApiResult<Entry> {
         etag,
         has_provenance,
         browser_ready,
+        child_file_count: None,
+        child_directory_count: None,
     })
 }
 
@@ -3970,6 +4008,48 @@ mod tests {
     #[test]
     fn permissions_are_symbolic() {
         assert_eq!(permission_string(0o754, "file"), "-rwxr-xr--");
+    }
+    #[tokio::test]
+    async fn directory_property_counts_are_immediate_and_hide_internal_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        std::fs::write(root.path().join("visible.txt"), b"visible").unwrap();
+        std::fs::write(root.path().join(".hidden"), b"hidden").unwrap();
+        std::fs::create_dir(root.path().join("folder")).unwrap();
+        std::fs::write(root.path().join("folder/nested.txt"), b"nested").unwrap();
+        std::os::unix::fs::symlink("visible.txt", root.path().join("link")).unwrap();
+
+        assert_eq!(
+            directory_child_counts(root.path(), &state.config)
+                .await
+                .unwrap(),
+            (3, 2)
+        );
+
+        std::fs::write(root.path().join(".cache/user.txt"), b"user cache").unwrap();
+        assert_eq!(
+            directory_child_counts(&root.path().join(".cache"), &state.config)
+                .await
+                .unwrap(),
+            (1, 0)
+        );
+    }
+    #[tokio::test]
+    async fn directory_property_counts_are_optional_entry_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        let path = root.path().join("folder");
+        std::fs::create_dir(&path).unwrap();
+        let mut entry = entry_from_path(&state, path).await.unwrap();
+        let ordinary = serde_json::to_value(&entry).unwrap();
+        assert!(ordinary.get("childFileCount").is_none());
+        assert!(ordinary.get("childDirectoryCount").is_none());
+
+        entry.child_file_count = Some(2);
+        entry.child_directory_count = Some(1);
+        let properties = serde_json::to_value(entry).unwrap();
+        assert_eq!(properties["childFileCount"], 2);
+        assert_eq!(properties["childDirectoryCount"], 1);
     }
     #[test]
     fn compatible_h264_is_remuxed() {

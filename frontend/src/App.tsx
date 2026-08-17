@@ -9,7 +9,7 @@ import rehypeSanitize from 'rehype-sanitize'
 import Hls from 'hls.js'
 import {
   Camera, ChevronLeft, ChevronRight, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
-  Film, Folder, FolderOpen, Grid2X2, LogOut, Maximize2, Menu, MoreHorizontal, Play,
+  Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal, Play,
   ExternalLink, Link2, Minus, Move, Plus, RefreshCw, RotateCw, Save, Scissors, Search, Trash2, Upload, WrapText, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import { api, ApiFailure, CacheCleanupReport, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, ExtractionJob, LiveEvent, liveEventsUrl, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
@@ -20,6 +20,7 @@ import { fitMediaWindow, formatMediaTime, ignoresVideoShortcut, shouldAutoLoop, 
 import { progressPercent, upsertJob } from './mediaJobState'
 import { fitContextMenuToViewport } from './contextMenuPosition'
 import { moveConfirmationMessage, springLoadedPath } from './columnDrag'
+import { directoryContentsLabel, propertyTypeLabel } from './propertiesState'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type EditorMode = 'edit' | 'split' | 'preview'
@@ -123,6 +124,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [trash, setTrash] = useState<TrashEntry[] | null>(null)
   const [error, setError] = useState('')
   const [folderMenu, setFolderMenu] = useState<{ directoryId: string; path: string; x: number; y: number } | null>(null)
+  const [properties, setProperties] = useState<{ id: string; initial?: Entry } | null>(null)
   const [showPreview, setShowPreview] = useState(() => localStorage.getItem('rfb-column-preview') !== 'false')
   const [defaultColumnWidth] = useState(() => Math.min(480, Math.max(180, Number(localStorage.getItem('rfb-column-width')) || 240)))
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>(() => {
@@ -296,6 +298,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const showFolderMenu = (event: React.MouseEvent, directoryId: string, path: string) => {
     event.preventDefault(); event.stopPropagation(); setFolderMenu({ directoryId, path, x: event.clientX, y: event.clientY })
   }
+  const showProperties = (id: string, initial?: Entry) => setProperties({ id, initial })
   const rename = async (target?: Entry) => {
     const entry = target ?? findEntry(first(selected), root, expanded); if (!entry) return
     const name = await promptAction({ title: 'Rename Item', label: 'Name', initialValue: entry.name, submitLabel: 'Rename' }); if (!name || name === entry.name) return
@@ -433,8 +436,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         {error && <div className="banner error"><span>{error}</span><button onClick={() => setError('')}><X size={15} /></button></div>}
         <div className="browser-body"><div className="browser-view" onContextMenu={view === 'details' ? undefined : event => showFolderMenu(event, currentDir, columnPath.at(-1)?.path ?? '/fs-root')}>
           {!root ? <div className="center"><span className="spinner" /></div> : view === 'details' ?
-            <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} primary={primary} defaultColumnWidth={defaultColumnWidth} columnWidths={columnWidths} setColumnWidth={(key, width) => setColumnWidths(previous => ({ ...previous, [key]: width }))} navigate={navigateColumn} loadDirectory={loadDirectory} selectItems={selectColumnItems} selectDragItems={(ids, entry) => { setSelected(ids); setPrimary(entry) }} selectParent={selectParentColumn} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} showFolderMenu={showFolderMenu} setError={setError} /> :
-            !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view={view} selected={selected} setSelected={setSelected} setPrimary={setPrimary} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} setError={setError} />}
+            <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} primary={primary} defaultColumnWidth={defaultColumnWidth} columnWidths={columnWidths} setColumnWidth={(key, width) => setColumnWidths(previous => ({ ...previous, [key]: width }))} navigate={navigateColumn} loadDirectory={loadDirectory} selectItems={selectColumnItems} selectDragItems={(ids, entry) => { setSelected(ids); setPrimary(entry) }} selectParent={selectParentColumn} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} showFolderMenu={showFolderMenu} showProperties={entry => showProperties(entry.id, entry)} setError={setError} /> :
+            !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view={view} selected={selected} setSelected={setSelected} setPrimary={setPrimary} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} showProperties={entry => showProperties(entry.id, entry)} setError={setError} />}
         </div>{showPreview && <ColumnPreview entries={previewEntries} primary={primary} />}</div>
       </main>
     </div>
@@ -443,7 +446,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       setViewer({ entry, type: 'image' }); setSelected(new Set([entry.id])); setPrimary(entry)
     }} onClose={() => setViewer(null)} />}
     {trash && <TrashWindow items={trash} onClose={() => setTrash(null)} onChanged={async () => setTrash(await api.listTrash())} onRestored={entry => refresh(entry.parentId)} setError={setError} />}
-    {folderMenu && <FolderContextMenu {...folderMenu} close={() => setFolderMenu(null)} createItem={createItem} setError={setError} />}
+    {folderMenu && <FolderContextMenu {...folderMenu} close={() => setFolderMenu(null)} createItem={createItem} showProperties={id => showProperties(id)} setError={setError} />}
+    {properties && <PropertiesDialog {...properties} onClose={() => setProperties(null)} />}
     <div id="window-tray" className="window-tray" role="region" aria-label="Minimized windows" />
   </div>
 }
@@ -522,14 +526,15 @@ function ConversionJobs() {
 }
 
 type BrowserColumn = { directoryId: string; page?: EntryPage; label: string }
-function ColumnBrowser({ root, path, pages, filter, selected, primary, defaultColumnWidth, columnWidths, setColumnWidth, navigate, loadDirectory, selectItems, selectDragItems, selectParent, activate, renameEntry, moveEntries, deleteEntry, showFolderMenu, setError }: {
+function ColumnBrowser({ root, path, pages, filter, selected, primary, defaultColumnWidth, columnWidths, setColumnWidth, navigate, loadDirectory, selectItems, selectDragItems, selectParent, activate, renameEntry, moveEntries, deleteEntry, showFolderMenu, showProperties, setError }: {
   root: EntryPage; path: Entry[]; pages: Record<string, EntryPage>; filter: string; selected: Set<string>; primary: Entry | null
   defaultColumnWidth: number; columnWidths: Record<string, number>; setColumnWidth: (key: string, width: number) => void
   navigate: (entry: Entry, columnIndex: number) => Promise<void>; loadDirectory: (entry: Entry) => Promise<boolean>
   selectItems: (ids: Set<string>, primary: Entry | null, columnIndex: number, directoryId: string, preserveCurrentBranch?: boolean) => void
   selectDragItems: (ids: Set<string>, primary: Entry | null) => void; selectParent: (columnIndex: number) => void
   activate: (entry: Entry) => void; renameEntry: (entry: Entry) => Promise<void>; moveEntries: (ids: string[], destinationId: string, requireConfirmation?: boolean) => Promise<boolean>
-  deleteEntry: (entry: Entry) => Promise<void>; showFolderMenu: (event: React.MouseEvent, directoryId: string, path: string) => void; setError: (message: string) => void
+  deleteEntry: (entry: Entry) => Promise<void>; showFolderMenu: (event: React.MouseEvent, directoryId: string, path: string) => void
+  showProperties: (entry: Entry) => void; setError: (message: string) => void
 }) {
   const [dragPath, setDragPath] = useState<Entry[] | null>(null)
   const visiblePath = dragPath ?? path
@@ -687,7 +692,7 @@ function ColumnBrowser({ root, path, pages, filter, selected, primary, defaultCo
         <div className="column-resizer" role="separator" aria-orientation="vertical" aria-label={`Resize ${column.label} column`} title="Resize column" onPointerDown={event => startResize(event, targetKey, width)} />
       </div>
     })}
-    {menu && <ContextMenu entry={menu.entry} x={menu.x} y={menu.y} close={() => setMenu(null)} open={() => menu.entry.kind === 'directory' ? void navigate(menu.entry, menu.columnIndex) : activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} setError={setError} />}
+    {menu && <ContextMenu entry={menu.entry} x={menu.x} y={menu.y} close={() => setMenu(null)} open={() => menu.entry.kind === 'directory' ? void navigate(menu.entry, menu.columnIndex) : activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} showProperties={showProperties} setError={setError} />}
   </div>
 }
 
@@ -738,11 +743,11 @@ function ProvenanceEditor({ entry }: { entry: Entry }) {
 
 type Row = { entry: Entry; depth: number }
 
-function FileList({ rows, view, selected, setSelected, setPrimary, activate, renameEntry, moveEntries, deleteEntry, setError }: {
+function FileList({ rows, view, selected, setSelected, setPrimary, activate, renameEntry, moveEntries, deleteEntry, showProperties, setError }: {
   rows: Row[]; view: ViewMode; selected: Set<string>; setSelected: (value: Set<string>) => void; setPrimary: (entry: Entry | null) => void
   activate: (entry: Entry) => void; renameEntry: (entry: Entry) => Promise<void>
   moveEntries: (ids: string[], destinationId: string) => Promise<boolean>
-  deleteEntry: (entry: Entry) => Promise<void>; setError: (message: string) => void
+  deleteEntry: (entry: Entry) => Promise<void>; showProperties: (entry: Entry) => void; setError: (message: string) => void
 }) {
   const [menu, setMenu] = useState<{ entry: Entry; x: number; y: number } | null>(null)
   const [dropTarget, setDropTarget] = useState<string | null>(null)
@@ -796,7 +801,7 @@ function FileList({ rows, view, selected, setSelected, setPrimary, activate, ren
       void moveEntries(ids, entry.id)
     },
   })
-  const contextMenu = menu && <ContextMenu {...menu} close={() => setMenu(null)} open={() => activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} setError={setError} />
+  const contextMenu = menu && <ContextMenu {...menu} close={() => setMenu(null)} open={() => activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} showProperties={showProperties} setError={setError} />
   return <div className={`preview-list ${view}`}>
     {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => selectEntry(entry, index, event)} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
       <button className="card-menu" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>
@@ -830,7 +835,7 @@ function PositionedContextMenu({ x, y, children }: { x: number; y: number; child
   return <div ref={menuRef} className="context-menu" style={{ left: position.x, top: position.y }} role="menu" onPointerDown={event => event.stopPropagation()}>{children}</div>
 }
 
-function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, setError }: { entry: Entry; x: number; y: number; close: () => void; open: () => void; renameEntry: (entry: Entry) => Promise<void>; deleteEntry: (entry: Entry) => Promise<void>; setError: (message: string) => void }) {
+function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, showProperties, setError }: { entry: Entry; x: number; y: number; close: () => void; open: () => void; renameEntry: (entry: Entry) => Promise<void>; deleteEntry: (entry: Entry) => Promise<void>; showProperties: (entry: Entry) => void; setError: (message: string) => void }) {
   const promptAction = usePrompt()
   const copyPath = async () => {
     try { await navigator.clipboard.writeText(entry.path) } catch { setError(clipboardError(entry.path)) }
@@ -851,6 +856,7 @@ function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, setEr
     try { await deleteEntry(entry) } catch (error) { setError(messageOf(error)) }
   }
   const rename = () => { close(); void renameEntry(entry) }
+  const properties = () => { close(); showProperties(entry) }
   const addProvenance = async () => {
     close()
     const url = await promptAction({ title: 'Add provenance URL', label: 'Source URL', submitLabel: 'Add', placeholder: 'https://example.com/source' })
@@ -865,6 +871,7 @@ function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, setEr
     <button role="menuitem" autoFocus onClick={() => { close(); open() }}><FolderOpen /> Open</button>
     <button role="menuitem" onClick={rename}><Edit3 /> Rename</button>
     <button role="menuitem" onClick={copyPath}><Copy /> Copy path</button>
+    <button role="menuitem" onClick={properties}><Info /> Properties</button>
     <span className="context-divider" />
     {entry.kind === 'file' && <button role="menuitem" onClick={() => void addProvenance()}><Link2 /> Add provenance URL</button>}
     {entry.kind === 'file' && entry.hasProvenance && <button role="menuitem" onClick={() => void copyProvenance()}><Copy /> Copy Provenance URL</button>}
@@ -872,7 +879,7 @@ function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, setEr
   </PositionedContextMenu>
 }
 
-function FolderContextMenu({ directoryId, path, x, y, close, createItem, setError }: { directoryId: string; path: string; x: number; y: number; close: () => void; createItem: (kind: 'file' | 'directory', directoryId?: string) => Promise<void>; setError: (message: string) => void }) {
+function FolderContextMenu({ directoryId, path, x, y, close, createItem, showProperties, setError }: { directoryId: string; path: string; x: number; y: number; close: () => void; createItem: (kind: 'file' | 'directory', directoryId?: string) => Promise<void>; showProperties: (id: string) => void; setError: (message: string) => void }) {
   useEffect(() => {
     const dismiss = () => close()
     const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') close() }
@@ -884,12 +891,60 @@ function FolderContextMenu({ directoryId, path, x, y, close, createItem, setErro
     try { await navigator.clipboard.writeText(path) } catch { setError(clipboardError(path)) }
     close()
   }
+  const properties = () => { close(); showProperties(directoryId) }
   return <PositionedContextMenu x={x} y={y}>
     <button role="menuitem" autoFocus onClick={() => create('directory')}><Folder /> New Folder</button>
     <button role="menuitem" onClick={() => create('file')}><File /> New File</button>
     <span className="context-divider" />
     <button role="menuitem" onClick={copyPath}><Copy /> Copy Path</button>
+    <button role="menuitem" onClick={properties}><Info /> Properties</button>
   </PositionedContextMenu>
+}
+
+function PropertiesDialog({ id, initial, onClose }: { id: string; initial?: Entry; onClose: () => void }) {
+  const [entry, setEntry] = useState<Entry | undefined>(initial)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    let active = true
+    setEntry(initial); setLoading(true); setError('')
+    api.metadata(id).then(metadata => {
+      if (active) setEntry(metadata)
+    }).catch(reason => {
+      if (active) setError(messageOf(reason))
+    }).finally(() => {
+      if (active) setLoading(false)
+    })
+    return () => { active = false }
+  }, [id, initial])
+  useEffect(() => {
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
+    addEventListener('keydown', escape)
+    return () => removeEventListener('keydown', escape)
+  }, [onClose])
+  return <div className="modal-backdrop" role="presentation" onPointerDown={onClose}>
+    <section className="confirm-dialog properties-dialog" role="dialog" aria-modal="true" aria-labelledby="properties-title" onPointerDown={event => event.stopPropagation()}>
+      <div className="properties-heading">
+        <div className="confirm-mark">{entry ? <FileGlyph entry={entry} /> : <Info />}</div>
+        <div><h2 id="properties-title">Properties</h2>{entry && <p title={entry.path}>{entry.name}</p>}</div>
+      </div>
+      {!entry ? <div className="properties-loading" role="status"><span className="spinner" /> Loading properties…</div> : <dl className="properties-metadata">
+        <dt>Name</dt><dd>{entry.name}</dd>
+        <dt>Path</dt><dd>{entry.path}</dd>
+        <dt>Type</dt><dd>{propertyTypeLabel(entry.kind)}</dd>
+        {entry.kind === 'file' && <><dt>MIME</dt><dd><code>{entry.mime}</code></dd></>}
+        {entry.kind === 'directory' ? <><dt>Contents</dt><dd>{directoryContentsLabel(entry, loading)}</dd></> : <><dt>Size</dt><dd>{formatBytes(entry.size)} ({entry.size.toLocaleString()} bytes)</dd></>}
+        <dt>Permissions</dt><dd><code>{entry.permissions} ({entry.mode.toString(8).padStart(4, '0')})</code></dd>
+        <dt>Owner</dt><dd>{entry.uid}:{entry.gid}</dd>
+        <dt>Modified</dt><dd>{formatDate(entry.modifiedAt)}</dd>
+        <dt>Created</dt><dd>{formatDate(entry.createdAt)}</dd>
+        <dt>Accessed</dt><dd>{formatDate(entry.accessedAt)}</dd>
+        {entry.symlinkTarget !== undefined && <><dt>Target</dt><dd>{entry.symlinkTarget}</dd></>}
+      </dl>}
+      {error && <p className="properties-error" role="alert">Could not refresh properties: {error}</p>}
+      <div className="confirm-actions"><button className="primary" autoFocus onClick={onClose}>Close</button></div>
+    </section>
+  </div>
 }
 
 function ViewSelector({ view, setView }: { view: ViewMode; setView: (view: ViewMode) => void }) {

@@ -17,6 +17,8 @@ export type Entry = {
   etag: string
   hasProvenance: boolean
   browserReady: boolean
+  childFileCount?: number
+  childDirectoryCount?: number
 }
 
 export type EntryPage = { entries: Entry[]; total: number; nextOffset?: number }
@@ -81,6 +83,7 @@ export const api = {
   login: (username: string, password: string) => request<Session>('/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
   logout: () => request<void>('/auth/logout', { method: 'POST' }),
   list: (id = '', hidden = false) => request<EntryPage>(`/fs/entries?id=${encodeURIComponent(id)}&hidden=${hidden}&limit=1000`),
+  metadata: (id: string) => request<Entry>(`/fs/metadata?id=${encodeURIComponent(id)}`),
   create: (parentId: string, name: string, kind: 'file' | 'directory', replace = false) => request<Entry>('/fs/items', { method: 'POST', body: JSON.stringify({ parentId, name, kind, replace }) }),
   upload: async (parentId: string, files: FileList, replace = false) => {
     const body = new FormData(); Array.from(files).forEach(file => body.append('files', file, file.name))
