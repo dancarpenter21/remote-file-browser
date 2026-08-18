@@ -19,7 +19,7 @@ import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState
 import { fitMediaWindow, formatMediaTime, ignoresVideoShortcut, shouldAutoLoop, stepFrame, validSegment } from './videoPlayerState'
 import { progressPercent, upsertJob } from './mediaJobState'
 import { fitContextMenuToViewport } from './contextMenuPosition'
-import { moveConfirmationMessage, springLoadedPath } from './columnDrag'
+import { isAdjacentColumnMove, moveConfirmationMessage, springLoadedPath } from './columnDrag'
 import { directoryContentsLabel, propertyTypeLabel } from './propertiesState'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
@@ -359,7 +359,14 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       const source = findEntry(id, root, expanded)
       return source?.kind === 'directory' && destination.path.startsWith(`${source.path}/`)
     })) { setError('A directory cannot be moved inside itself.'); return false }
-    if (requireConfirmation) {
+    const currentDirectory = currentDir ? findEntry(currentDir, root, expanded) : undefined
+    const confirmMove = requireConfirmation && !isAdjacentColumnMove(
+      destinationId,
+      destination?.parentId,
+      currentDir,
+      currentDirectory?.parentId,
+    )
+    if (confirmMove) {
       const names = movableIds.map(id => findEntry(id, root, expanded)?.name ?? id)
       const confirmed = await confirmAction(moveConfirmationMessage(names, destination?.path ?? '/fs-root'), {
         title: movableIds.length === 1 ? 'Move item?' : 'Move selected items?',
