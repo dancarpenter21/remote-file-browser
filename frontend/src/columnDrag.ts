@@ -1,5 +1,14 @@
 export type ColumnDragPathEntry = { id: string }
 
+export function isAdjacentColumnMove(
+  destinationId: string,
+  destinationParentId: string | undefined,
+  currentDirectoryId: string,
+  currentDirectoryParentId: string | undefined,
+) {
+  return destinationParentId === currentDirectoryId || destinationId === currentDirectoryParentId
+}
+
 export function springLoadedPath<T extends ColumnDragPathEntry>(path: T[], entry: T, columnIndex: number) {
   return [...path.slice(0, columnIndex), entry]
 }
