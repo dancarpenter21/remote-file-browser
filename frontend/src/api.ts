@@ -22,7 +22,7 @@ export type Entry = {
 }
 
 export type EntryPage = { entries: Entry[]; total: number; nextOffset?: number }
-export type Session = { authenticated: boolean; username?: string; csrfToken?: string }
+export type Session = { authenticated: boolean; username?: string; csrfToken?: string; terminalEnabled: boolean }
 export type DocumentFile = { id: string; content: string; etag: string; mime: string }
 export type TrashEntry = {
   info: { id: string; originalId: string; originalName: string; deletedAt: string }
@@ -103,6 +103,7 @@ export const api = {
   hlsStatus: (key: string) => request<HlsJob>(`/media/hls/${key}/status`),
   conversionJobs: () => request<ConversionJob[]>('/media/jobs'),
   cleanupCache: () => request<CacheCleanupReport>('/media/cache/cleanup', { method: 'POST' }),
+  terminalTicket: (directoryId: string) => request<{ ticket: string }>('/terminal/tickets', { method: 'POST', body: JSON.stringify({ directoryId }) }),
   mediaInfo: (id: string) => request<MediaInfo>(`/media/info?id=${encodeURIComponent(id)}`),
   startExtraction: (input: { id: string; kind: 'frame'; time: number } | { id: string; kind: 'segment'; startTime: number; endTime: number }) =>
     request<ExtractionJob>('/media/extractions', { method: 'POST', body: JSON.stringify(input) }),
@@ -114,3 +115,4 @@ export const contentUrl = (id: string) => `/api/v1/fs/content?id=${encodeURIComp
 export const mediaUrl = (id: string) => `/api/v1/media/file?id=${encodeURIComponent(id)}`
 export const thumbnailUrl = (id: string, size: string) => `/api/v1/previews/thumbnail?id=${encodeURIComponent(id)}&size=${size}`
 export const liveEventsUrl = () => `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/v1/events`
+export const terminalUrl = (ticket: string) => `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/v1/terminal/ws?ticket=${encodeURIComponent(ticket)}`

@@ -15,6 +15,20 @@ The application owns `.trash` and `.cache/remote-file-browser` inside the mounte
 
 Media conversions and clip extractions report live FFmpeg progress over an authenticated WebSocket. The media-jobs panel also provides a cache reconciliation action that removes stale derived artifacts while preserving active work. Cache associations follow files moved or renamed through the UI, including moves performed as part of folder merges.
 
+## Integrated terminal
+
+The Terminal control opens a resizable panel beneath the file browser. A new shell starts in the directory currently shown by the browser, remains alive when the panel is hidden, and stops when the panel is closed, the browser disconnects, or the login session ends. The frontend bundles MesloLGS Nerd Font faces so prompts and tools can display Nerd Font glyphs even when the browser machine has no Nerd Font installed; attribution and source hashes are recorded in `frontend/THIRD_PARTY_NOTICES.md`.
+
+The terminal runs inside the backend container as `RFB_UID:RFB_GID`. It can modify the `/fs-root` bind mount and use programs installed in that container, but it is not a shell on the Docker host. The container supplies zsh and launches it as a login shell with `HOME=/fs-root`, allowing a mounted home directory's zsh configuration to load. The existing read-only container filesystem, dropped capabilities, and `no-new-privileges` setting still apply.
+
+Terminal access is enabled by default for the authenticated administrator because this is a single-administrator application. Configure it with:
+
+- `RFB_TERMINAL_ENABLED=false` to remove the UI and disable both terminal endpoints.
+- `RFB_TERMINAL_SHELL=/bin/zsh` to select the login shell executable.
+- `RFB_TERMINAL_MAX_SESSIONS=4` to cap concurrent PTYs across browser sessions.
+
+An enabled terminal grants arbitrary command execution within the backend container to anyone who can authenticate. Keep the application behind HTTPS, use a strong administrator password, and disable the terminal when interactive command execution is not required.
+
 ## API documentation and provenance automation
 
 The complete OpenAPI document is available at `/api/openapi.json`, with interactive Swagger documentation at `/api/docs/`. Documentation is public, but each operation still enforces the authentication shown in its Swagger security section.

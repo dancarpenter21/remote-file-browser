@@ -36,7 +36,7 @@ use tokio::{
     fs,
     io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     process::Command,
-    sync::{Mutex, RwLock, broadcast},
+    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, broadcast},
 };
 use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
@@ -47,6 +47,10 @@ use uuid::Uuid;
 
 const SESSION_COOKIE: &str = "rfb_session";
 const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+const TERMINAL_TICKET_TTL: Duration = Duration::from_secs(30);
+const TERMINAL_MAX_INPUT_BYTES: usize = 64 * 1024;
+const TERMINAL_DEFAULT_ROWS: u16 = 24;
+const TERMINAL_DEFAULT_COLS: u16 = 80;
 
 #[derive(Clone)]
 struct AppState {
@@ -64,6 +68,8 @@ struct AppState {
     cache_cleanup: Arc<Mutex<()>>,
     live_events: broadcast::Sender<LiveEvent>,
     provenance_api_token: Option<Arc<String>>,
+    terminal_tickets: Arc<DashMap<String, TerminalTicket>>,
+    terminal_slots: Arc<Semaphore>,
 }
 
 struct Config {
@@ -77,6 +83,16 @@ struct Config {
     upload_max: u64,
     cache_max: u64,
     cache_age_days: u64,
+    terminal_enabled: bool,
+    terminal_shell: PathBuf,
+    terminal_max_sessions: usize,
+}
+
+#[derive(Clone)]
+struct TerminalTicket {
+    session_token: String,
+    directory: PathBuf,
+    expires: SystemTime,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -210,6 +226,8 @@ type ApiResult<T> = Result<T, ApiError>;
         start_hls,
         list_media_jobs,
         request_cache_cleanup,
+        create_terminal_ticket,
+        terminal_websocket,
         hls_status,
         hls_file
     ),
@@ -236,7 +254,9 @@ type ApiResult<T> = Result<T, ApiError>;
         MediaInfo,
         ExtractionRequest,
         ExtractionJob,
-        CacheCleanupReport
+        CacheCleanupReport,
+        TerminalTicketRequest,
+        TerminalTicketResponse
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -246,6 +266,7 @@ type ApiResult<T> = Result<T, ApiError>;
         (name = "editor", description = "UTF-8 document editing"),
         (name = "trash", description = "Recoverable deletion"),
         (name = "media", description = "Previews and browser-compatible playback"),
+        (name = "terminal", description = "Authenticated interactive container terminal"),
         (name = "system", description = "Service health")
     )
 )]
@@ -325,7 +346,11 @@ async fn main() {
         upload_max: env_u64("RFB_UPLOAD_MAX_BYTES", 20 * 1024 * 1024 * 1024),
         cache_max: env_u64("RFB_CACHE_MAX_BYTES", 10 * 1024 * 1024 * 1024),
         cache_age_days: env_u64("RFB_CACHE_MAX_AGE_DAYS", 30),
+        terminal_enabled: env_bool("RFB_TERMINAL_ENABLED", true),
+        terminal_shell: PathBuf::from(env_string("RFB_TERMINAL_SHELL", "/bin/zsh")),
+        terminal_max_sessions: env_usize("RFB_TERMINAL_MAX_SESSIONS", 4).max(1),
     };
+    let terminal_max_sessions = config.terminal_max_sessions;
     let body_limit =
         usize::try_from(config.upload_max.min(usize::MAX as u64)).unwrap_or(usize::MAX);
     let state = AppState {
@@ -343,6 +368,8 @@ async fn main() {
         cache_cleanup: Arc::new(Mutex::new(())),
         live_events: live_event_tx,
         provenance_api_token: provenance_api_token.map(Arc::new),
+        terminal_tickets: Arc::new(DashMap::new()),
+        terminal_slots: Arc::new(Semaphore::new(terminal_max_sessions)),
     };
 
     spawn_cache_cleanup(state.clone());
@@ -381,6 +408,8 @@ async fn main() {
         .route("/media/hls", post(start_hls))
         .route("/media/jobs", get(list_media_jobs))
         .route("/media/cache/cleanup", post(request_cache_cleanup))
+        .route("/terminal/tickets", post(create_terminal_ticket))
+        .route("/terminal/ws", get(terminal_websocket))
         .route("/media/hls/{key}/status", get(hls_status))
         .route("/media/hls/{key}/{file}", get(hls_file));
 
@@ -445,6 +474,12 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
 }
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
 
 #[derive(Deserialize, utoipa::ToSchema)]
 struct LoginRequest {
@@ -458,6 +493,7 @@ struct SessionResponse {
     authenticated: bool,
     username: Option<String>,
     csrf_token: Option<String>,
+    terminal_enabled: bool,
 }
 
 #[utoipa::path(post, path = "/api/v1/auth/login", tag = "authentication", request_body = LoginRequest, responses((status = 200, body = SessionResponse), (status = 401, body = Problem), (status = 429, body = Problem)))]
@@ -526,6 +562,7 @@ async fn login(
             authenticated: true,
             username: Some(state.config.username.clone()),
             csrf_token: Some(csrf),
+            terminal_enabled: state.config.terminal_enabled,
         }),
     ))
 }
@@ -537,11 +574,13 @@ async fn session_info(State(state): State<AppState>, jar: CookieJar) -> Json<Ses
             authenticated: true,
             username: Some(state.config.username.clone()),
             csrf_token: Some(session.csrf),
+            terminal_enabled: state.config.terminal_enabled,
         }),
         Err(_) => Json(SessionResponse {
             authenticated: false,
             username: None,
             csrf_token: None,
+            terminal_enabled: state.config.terminal_enabled,
         }),
     }
 }
@@ -563,6 +602,10 @@ async fn logout(
 }
 
 fn require_session(state: &AppState, jar: &CookieJar) -> ApiResult<Session> {
+    Ok(require_session_with_token(state, jar)?.1)
+}
+
+fn require_session_with_token(state: &AppState, jar: &CookieJar) -> ApiResult<(String, Session)> {
     let token = jar
         .get(SESSION_COOKIE)
         .ok_or_else(|| {
@@ -591,7 +634,7 @@ fn require_session(state: &AppState, jar: &CookieJar) -> ApiResult<Session> {
         ));
     }
     session.expires = SystemTime::now() + SESSION_TTL;
-    Ok(session.clone())
+    Ok((token, session.clone()))
 }
 
 fn require_csrf(state: &AppState, jar: &CookieJar, headers: &HeaderMap) -> ApiResult<Session> {
@@ -1228,6 +1271,297 @@ async fn live_events(
     Ok(upgrade
         .on_upgrade(move |socket| live_socket(socket, state))
         .into_response())
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct TerminalTicketRequest {
+    directory_id: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct TerminalTicketResponse {
+    ticket: String,
+}
+
+#[derive(Deserialize)]
+struct TerminalSocketQuery {
+    ticket: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum TerminalClientMessage {
+    Input { data: String },
+    Resize { cols: u16, rows: u16 },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum TerminalServerMessage<'a> {
+    Ready,
+    Exit { code: Option<i32> },
+    Error { message: &'a str },
+}
+
+fn terminal_disabled() -> ApiError {
+    ApiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "terminal_disabled",
+        "The integrated terminal is disabled".into(),
+    )
+}
+
+fn prune_terminal_tickets_for_session(state: &AppState, now: SystemTime, session_token: &str) {
+    state
+        .terminal_tickets
+        .retain(|_, ticket| ticket.expires > now && ticket.session_token != session_token);
+}
+
+fn take_terminal_ticket(
+    state: &AppState,
+    ticket: &str,
+    session_token: &str,
+    now: SystemTime,
+) -> ApiResult<TerminalTicket> {
+    let (_, ticket) = state.terminal_tickets.remove(ticket).ok_or_else(|| {
+        ApiError(
+            StatusCode::UNAUTHORIZED,
+            "invalid_terminal_ticket",
+            "The terminal ticket is invalid or has already been used".into(),
+        )
+    })?;
+    if ticket.expires <= now || ticket.session_token != session_token {
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "invalid_terminal_ticket",
+            "The terminal ticket is invalid or expired".into(),
+        ));
+    }
+    Ok(ticket)
+}
+
+#[utoipa::path(post, path = "/api/v1/terminal/tickets", tag = "terminal", params(("x-csrf-token" = String, Header)), request_body = TerminalTicketRequest, security(("sessionCookie" = []), ("csrfToken" = [])), responses((status = 200, body = TerminalTicketResponse), (status = 400, body = Problem), (status = 401, body = Problem), (status = 403, body = Problem), (status = 503, body = Problem)))]
+async fn create_terminal_ticket(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Json(input): Json<TerminalTicketRequest>,
+) -> ApiResult<Json<TerminalTicketResponse>> {
+    if !state.config.terminal_enabled {
+        return Err(terminal_disabled());
+    }
+    let _ = require_csrf(&state, &jar, &headers)?;
+    let session_token = jar
+        .get(SESSION_COOKIE)
+        .expect("validated session has a cookie")
+        .value()
+        .to_string();
+    let directory = resolve_existing(&state.config, &input.directory_id).await?;
+    if !fs::symlink_metadata(&directory).await?.is_dir() {
+        return Err(ApiError::bad(
+            "not_directory",
+            "A terminal can only start in a directory",
+        ));
+    }
+    let now = SystemTime::now();
+    prune_terminal_tickets_for_session(&state, now, &session_token);
+    let ticket = random_token();
+    state.terminal_tickets.insert(
+        ticket.clone(),
+        TerminalTicket {
+            session_token,
+            directory,
+            expires: now + TERMINAL_TICKET_TTL,
+        },
+    );
+    Ok(Json(TerminalTicketResponse { ticket }))
+}
+
+#[utoipa::path(get, path = "/api/v1/terminal/ws", tag = "terminal", params(("ticket" = String, Query)), security(("sessionCookie" = [])), responses((status = 101, description = "One-time-ticket authenticated terminal WebSocket"), (status = 401, body = Problem), (status = 429, body = Problem), (status = 503, body = Problem)))]
+async fn terminal_websocket(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(query): Query<TerminalSocketQuery>,
+    upgrade: WebSocketUpgrade,
+) -> ApiResult<Response> {
+    if !state.config.terminal_enabled {
+        return Err(terminal_disabled());
+    }
+    let (session_token, _) = require_session_with_token(&state, &jar)?;
+    let permit = Arc::clone(&state.terminal_slots)
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "terminal_capacity",
+                "The maximum number of terminal sessions is already running".into(),
+            )
+        })?;
+    let ticket = take_terminal_ticket(&state, &query.ticket, &session_token, SystemTime::now())?;
+    Ok(upgrade
+        .max_message_size(TERMINAL_MAX_INPUT_BYTES)
+        .max_frame_size(TERMINAL_MAX_INPUT_BYTES)
+        .on_upgrade(move |socket| {
+            terminal_socket(socket, state, session_token, ticket.directory, permit)
+        })
+        .into_response())
+}
+
+fn parse_terminal_client_message(text: &str) -> Result<TerminalClientMessage, &'static str> {
+    let message: TerminalClientMessage =
+        serde_json::from_str(text).map_err(|_| "Invalid terminal message")?;
+    match &message {
+        TerminalClientMessage::Input { data } if data.len() > TERMINAL_MAX_INPUT_BYTES => {
+            Err("Terminal input is too large")
+        }
+        TerminalClientMessage::Resize { cols, rows }
+            if !(2..=500).contains(cols) || !(1..=200).contains(rows) =>
+        {
+            Err("Invalid terminal size")
+        }
+        _ => Ok(message),
+    }
+}
+
+async fn send_terminal_control(socket: &mut WebSocket, message: TerminalServerMessage<'_>) -> bool {
+    let Ok(json) = serde_json::to_string(&message) else {
+        return false;
+    };
+    socket.send(Message::Text(json.into())).await.is_ok()
+}
+
+fn terminal_session_active(state: &AppState, token: &str) -> bool {
+    state
+        .sessions
+        .get(token)
+        .is_some_and(|session| session.expires >= SystemTime::now())
+}
+
+fn signal_terminal_group(pid: Option<u32>, signal: nix::sys::signal::Signal) {
+    let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) else {
+        return;
+    };
+    let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), signal);
+}
+
+async fn stop_terminal_process(child: &mut tokio::process::Child, pid: Option<u32>) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    signal_terminal_group(pid, nix::sys::signal::Signal::SIGHUP);
+    if tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
+        signal_terminal_group(pid, nix::sys::signal::Signal::SIGKILL);
+        let _ = child.wait().await;
+    }
+}
+
+fn start_terminal_process(
+    config: &Config,
+    directory: &Path,
+) -> pty_process::Result<(pty_process::Pty, tokio::process::Child)> {
+    let (pty, pts) = pty_process::open()?;
+    pty.resize(pty_process::Size::new(
+        TERMINAL_DEFAULT_ROWS,
+        TERMINAL_DEFAULT_COLS,
+    ))?;
+    let shell = &config.terminal_shell;
+    let child = pty_process::Command::new(shell)
+        .arg("-l")
+        .current_dir(directory)
+        .env("HOME", &config.root)
+        .env("SHELL", shell)
+        .env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor")
+        .kill_on_drop(true)
+        .spawn(pts)?;
+    Ok((pty, child))
+}
+
+async fn terminal_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    session_token: String,
+    directory: PathBuf,
+    _permit: OwnedSemaphorePermit,
+) {
+    let shell = state.config.terminal_shell.clone();
+    let (pty, mut child) = match start_terminal_process(&state.config, &directory) {
+        Ok(process) => process,
+        Err(error) => {
+            warn!(%error, shell = %shell.display(), "could not spawn terminal shell");
+            let _ = send_terminal_control(
+                &mut socket,
+                TerminalServerMessage::Error {
+                    message: "The configured terminal shell could not be started",
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    let pid = child.id();
+    let (mut reader, mut writer) = pty.into_split();
+    let mut output = [0_u8; 16 * 1024];
+    let mut session_check = tokio::time::interval(Duration::from_secs(5));
+    session_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut finished = false;
+    if !send_terminal_control(&mut socket, TerminalServerMessage::Ready).await {
+        stop_terminal_process(&mut child, pid).await;
+        return;
+    }
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Text(text))) => match parse_terminal_client_message(text.as_str()) {
+                    Ok(TerminalClientMessage::Input { data }) => {
+                        if writer.write_all(data.as_bytes()).await.is_err() { break; }
+                    }
+                    Ok(TerminalClientMessage::Resize { cols, rows }) => {
+                        if writer.resize(pty_process::Size::new(rows, cols)).is_err() { break; }
+                    }
+                    Err(message) => {
+                        let _ = send_terminal_control(&mut socket, TerminalServerMessage::Error { message }).await;
+                        break;
+                    }
+                },
+                Some(Ok(Message::Ping(payload))) => {
+                    if socket.send(Message::Pong(payload)).await.is_err() { break; }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {
+                    let _ = send_terminal_control(&mut socket, TerminalServerMessage::Error { message: "Unsupported terminal message" }).await;
+                    break;
+                }
+            },
+            read = reader.read(&mut output) => match read {
+                Ok(0) | Err(_) => {
+                    if let Ok(Ok(status)) = tokio::time::timeout(Duration::from_secs(1), child.wait()).await {
+                        let _ = send_terminal_control(&mut socket, TerminalServerMessage::Exit { code: status.code() }).await;
+                        finished = true;
+                    }
+                    break;
+                }
+                Ok(read) => if socket.send(Message::Binary(output[..read].to_vec().into())).await.is_err() { break; },
+            },
+            status = child.wait() => {
+                let code = status.ok().and_then(|status| status.code());
+                let _ = send_terminal_control(&mut socket, TerminalServerMessage::Exit { code }).await;
+                finished = true;
+                break;
+            },
+            _ = session_check.tick() => {
+                if !terminal_session_active(&state, &session_token) { break; }
+            }
+        }
+    }
+    if !finished {
+        stop_terminal_process(&mut child, pid).await;
+    }
+    let _ = socket.send(Message::Close(None)).await;
 }
 
 fn spawn_filesystem_watcher(state: AppState) {
@@ -3826,6 +4160,9 @@ mod tests {
                 upload_max: 1024,
                 cache_max: 1024,
                 cache_age_days: 1,
+                terminal_enabled: true,
+                terminal_shell: PathBuf::from("/bin/sh"),
+                terminal_max_sessions: 2,
             }),
             password_hash: Arc::new(String::new()),
             sessions: Arc::new(DashMap::new()),
@@ -3840,7 +4177,109 @@ mod tests {
             cache_cleanup: Arc::new(Mutex::new(())),
             live_events: events,
             provenance_api_token: token.map(|value| Arc::new(value.to_string())),
+            terminal_tickets: Arc::new(DashMap::new()),
+            terminal_slots: Arc::new(Semaphore::new(2)),
         }
+    }
+    #[test]
+    fn terminal_messages_enforce_types_and_limits() {
+        assert!(matches!(
+            parse_terminal_client_message(r#"{"type":"input","data":"ls\n"}"#),
+            Ok(TerminalClientMessage::Input { data }) if data == "ls\n"
+        ));
+        assert!(matches!(
+            parse_terminal_client_message(r#"{"type":"resize","cols":120,"rows":40}"#),
+            Ok(TerminalClientMessage::Resize {
+                cols: 120,
+                rows: 40
+            })
+        ));
+        assert!(parse_terminal_client_message(r#"{"type":"resize","cols":1,"rows":40}"#).is_err());
+        let oversized = format!(
+            r#"{{"type":"input","data":"{}"}}"#,
+            "x".repeat(TERMINAL_MAX_INPUT_BYTES + 1)
+        );
+        assert!(parse_terminal_client_message(&oversized).is_err());
+    }
+    #[tokio::test]
+    async fn terminal_tickets_are_root_confined_session_bound_and_single_use() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("work")).unwrap();
+        let state = test_state(root.path(), None);
+        state.sessions.insert(
+            "session-token".into(),
+            Session {
+                csrf: "csrf-token".into(),
+                expires: SystemTime::now() + Duration::from_secs(60),
+            },
+        );
+        let jar = CookieJar::new().add(Cookie::new(SESSION_COOKIE, "session-token"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-csrf-token", "csrf-token".parse().unwrap());
+        let Json(response) = create_terminal_ticket(
+            State(state.clone()),
+            jar,
+            headers,
+            Json(TerminalTicketRequest {
+                directory_id: encode_path(OsStr::new("work")),
+            }),
+        )
+        .await
+        .unwrap();
+        let ticket =
+            take_terminal_ticket(&state, &response.ticket, "session-token", SystemTime::now())
+                .unwrap();
+        assert_eq!(ticket.directory, root.path().join("work"));
+        assert!(
+            take_terminal_ticket(&state, &response.ticket, "session-token", SystemTime::now())
+                .is_err()
+        );
+
+        state.terminal_tickets.insert(
+            "wrong-session".into(),
+            TerminalTicket {
+                session_token: "another-session".into(),
+                directory: root.path().to_path_buf(),
+                expires: SystemTime::now() + Duration::from_secs(60),
+            },
+        );
+        assert!(
+            take_terminal_ticket(&state, "wrong-session", "session-token", SystemTime::now())
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn terminal_process_starts_in_the_requested_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        let (mut pty, mut child) = start_terminal_process(&state.config, root.path()).unwrap();
+        let pid = child.id();
+        pty.write_all(b"pwd\nexit\n").await.unwrap();
+        let mut collected = Vec::new();
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut buffer = [0_u8; 1024];
+            loop {
+                match pty.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return false,
+                    Ok(read) => {
+                        collected.extend_from_slice(&buffer[..read]);
+                        if String::from_utf8_lossy(&collected)
+                            .contains(&root.path().to_string_lossy().to_string())
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        stop_terminal_process(&mut child, pid).await;
+        assert!(
+            observed,
+            "terminal output was {:?}",
+            String::from_utf8_lossy(&collected)
+        );
     }
     fn probe(video: (&str, &str), audio: Option<&str>) -> ProbeOutput {
         let mut streams = vec![ProbeStream {
@@ -3987,6 +4426,8 @@ mod tests {
             ("/api/v1/media/hls", &["post"][..]),
             ("/api/v1/media/jobs", &["get"][..]),
             ("/api/v1/media/cache/cleanup", &["post"][..]),
+            ("/api/v1/terminal/tickets", &["post"][..]),
+            ("/api/v1/terminal/ws", &["get"][..]),
             ("/api/v1/media/hls/{key}/status", &["get"][..]),
             ("/api/v1/media/hls/{key}/{file}", &["get"][..]),
         ] {
