@@ -28,7 +28,7 @@ ARG FFMPEG_VERSION=8.1.2
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl libaom-dev libass-dev libdav1d-dev libfreetype-dev \
     libfribidi-dev libmp3lame-dev libopenjp2-7-dev libopus-dev libvorbis-dev \
-    libvpx-dev libwebp-dev libx264-dev libx265-dev libzimg-dev && \
+    libvpx-dev libwebp-dev libx264-dev libx265-dev libzimg-dev zsh && \
     rm -rf /var/lib/apt/lists/* && mkdir -p /usr/share/doc/remote-file-browser /usr/share/src
 COPY --from=ffmpeg-builder /opt/ffmpeg /opt/ffmpeg
 COPY --from=ffmpeg-builder /tmp/ffmpeg-configure.txt /usr/share/doc/remote-file-browser/ffmpeg-configure.txt

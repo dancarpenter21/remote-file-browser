@@ -10,7 +10,7 @@ import Hls from 'hls.js'
 import {
   Camera, ChevronLeft, ChevronRight, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
   Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal, Play,
-  ExternalLink, Link2, Minus, Move, Plus, RefreshCw, RotateCw, Save, Scissors, Search, Trash2, Upload, WrapText, X, ZoomIn, ZoomOut,
+  ExternalLink, Link2, Minus, Move, Plus, RefreshCw, RotateCw, Save, Scissors, Search, SquareTerminal, Trash2, Upload, WrapText, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import { api, ApiFailure, CacheCleanupReport, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, ExtractionJob, LiveEvent, liveEventsUrl, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { deleteConfirmationMessage } from './deleteConfirmation'
@@ -21,6 +21,7 @@ import { progressPercent, upsertJob } from './mediaJobState'
 import { fitContextMenuToViewport } from './contextMenuPosition'
 import { isAdjacentColumnMove, moveConfirmationMessage, springLoadedPath } from './columnDrag'
 import { directoryContentsLabel, propertyTypeLabel } from './propertiesState'
+import { TerminalDock } from './TerminalDock'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type EditorMode = 'edit' | 'split' | 'preview'
@@ -81,7 +82,7 @@ export default function App() {
   useEffect(() => { api.session().then(s => { setCsrf(s.csrfToken); setSession(s) }) }, [])
   if (!session) return <div className="center"><span className="spinner" /></div>
   if (!session.authenticated) return <Login onLogin={s => { setCsrf(s.csrfToken); setSession(s) }} />
-  return <ConfirmProvider><MergeProvider><PromptProvider><FileManager session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false }) }} /></PromptProvider></MergeProvider></ConfirmProvider>
+  return <ConfirmProvider><MergeProvider><PromptProvider><FileManager session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false, terminalEnabled: false }) }} /></PromptProvider></MergeProvider></ConfirmProvider>
 }
 
 function Login({ onLogin }: { onLogin: (session: Session) => void }) {
@@ -125,6 +126,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [error, setError] = useState('')
   const [folderMenu, setFolderMenu] = useState<{ directoryId: string; path: string; x: number; y: number } | null>(null)
   const [properties, setProperties] = useState<{ id: string; initial?: Entry } | null>(null)
+  const [terminal, setTerminal] = useState<{ directoryId: string; hidden: boolean } | null>(null)
   const [showPreview, setShowPreview] = useState(() => localStorage.getItem('rfb-column-preview') !== 'false')
   const [defaultColumnWidth] = useState(() => Math.min(480, Math.max(180, Number(localStorage.getItem('rfb-column-width')) || 240)))
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>(() => {
@@ -408,20 +410,24 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const viewerImages = viewer?.type === 'image'
     ? ((viewer.entry.parentId === '' ? root : expanded[viewer.entry.parentId])?.entries.filter(entry => entry.mime.startsWith('image/')) ?? [viewer.entry])
     : []
+  const toggleTerminal = () => setTerminal(current => current ? { ...current, hidden: !current.hidden } : { directoryId: currentDir, hidden: false })
   return <div className="app-shell">
     <header className="topbar">
       <div className="brand"><FolderOpen size={20} /><strong>Remote Files</strong><span>/fs-root</span></div>
       <div className="search"><Search size={16} /><input placeholder="Filter visible files" value={filter} onChange={e => setFilter(e.target.value)} />{filter && <button type="button" className="search-clear" title="Clear file filter" aria-label="Clear file filter" onClick={() => setFilter('')}><X /></button>}</div>
+      {session.terminalEnabled && <button className={`icon-button ${terminal && !terminal.hidden ? 'active' : ''}`} title={terminal && !terminal.hidden ? 'Hide terminal' : 'Show terminal'} aria-label={terminal && !terminal.hidden ? 'Hide terminal' : 'Show terminal'} aria-pressed={Boolean(terminal && !terminal.hidden)} onClick={toggleTerminal}><SquareTerminal size={18} /></button>}
       <button className="icon-button" title="Sign out" onClick={logout}><LogOut size={18} /></button>
     </header>
     <div className="workspace">
       <aside>
         <button className="nav-item active"><Folder size={17} /> Files</button>
         <button className="nav-item" onClick={openTrash}><Trash2 size={17} /> Trash</button>
+        {session.terminalEnabled && <button className={`nav-item ${terminal && !terminal.hidden ? 'active' : ''}`} aria-pressed={Boolean(terminal && !terminal.hidden)} onClick={toggleTerminal}><SquareTerminal size={17} /> Terminal</button>}
         <ConversionJobs />
         <div className="aside-note"><span>Signed in as</span><strong>{session.username}</strong></div>
       </aside>
-      <main className={`browser ${view === 'details' ? 'column-view' : ''}`}>
+      <div className="content-stack">
+        <main className={`browser ${view === 'details' ? 'column-view' : ''}`}>
         <div className="toolbar">
           <button onClick={() => createItem('directory')}><Plus size={16} /> Folder</button>
           <button onClick={() => createItem('file')}><File size={16} /> File</button>
@@ -446,7 +452,9 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
             <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} primary={primary} defaultColumnWidth={defaultColumnWidth} columnWidths={columnWidths} setColumnWidth={(key, width) => setColumnWidths(previous => ({ ...previous, [key]: width }))} navigate={navigateColumn} loadDirectory={loadDirectory} selectItems={selectColumnItems} selectDragItems={(ids, entry) => { setSelected(ids); setPrimary(entry) }} selectParent={selectParentColumn} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} showFolderMenu={showFolderMenu} showProperties={entry => showProperties(entry.id, entry)} setError={setError} /> :
             !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view={view} selected={selected} setSelected={setSelected} setPrimary={setPrimary} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} showProperties={entry => showProperties(entry.id, entry)} setError={setError} />}
         </div>{showPreview && <ColumnPreview entries={previewEntries} primary={primary} />}</div>
-      </main>
+        </main>
+        {terminal && <TerminalDock directoryId={terminal.directoryId} hidden={terminal.hidden} onHide={() => setTerminal(current => current && ({ ...current, hidden: true }))} onClose={() => setTerminal(null)} />}
+      </div>
     </div>
     {editor && <EditorWindow document={editor} onClose={() => setEditor(null)} onSaved={setEditor} />}
     {viewer && <ViewerWindow {...viewer} images={viewerImages} onNavigate={entry => {
