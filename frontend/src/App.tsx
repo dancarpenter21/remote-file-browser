@@ -8,9 +8,9 @@ import remarkGfm from 'remark-gfm'
 import rehypeSanitize from 'rehype-sanitize'
 import Hls from 'hls.js'
 import {
-  Camera, ChevronLeft, ChevronRight, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
+  Camera, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
   Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal, Play,
-  ExternalLink, Link2, Minus, Move, Plus, RefreshCw, RotateCw, Save, Scissors, Search, SquareTerminal, Trash2, Upload, WrapText, X, ZoomIn, ZoomOut,
+  ExternalLink, Link2, Minus, Plus, RefreshCw, RotateCw, Save, Scissors, Search, SquareTerminal, Trash2, Upload, WrapText, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import { api, ApiFailure, CacheCleanupReport, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, ExtractionJob, LiveEvent, liveEventsUrl, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { deleteConfirmationMessage } from './deleteConfirmation'
@@ -22,10 +22,10 @@ import { fitContextMenuToViewport } from './contextMenuPosition'
 import { isAdjacentColumnMove, moveConfirmationMessage, springLoadedPath } from './columnDrag'
 import { directoryContentsLabel, propertyTypeLabel } from './propertiesState'
 import { TerminalDock } from './TerminalDock'
+import { ClipboardOperation, RemoteClipboard, clipboardIdsForEntry, clipboardShortcut, movableClipboardIds, pasteProblem, shouldHandleClipboardShortcut } from './fileClipboard'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type EditorMode = 'edit' | 'split' | 'preview'
-type Clipboard = { operation: 'copy' | 'move'; ids: string[] } | null
 type ConfirmOptions = { title?: string; confirmLabel?: string; danger?: boolean }
 type ConfirmRequest = ConfirmOptions & { message: string; resolve: (answer: boolean) => void }
 const ConfirmContext = createContext<(message: string, options?: ConfirmOptions) => Promise<boolean>>(async () => false)
@@ -119,7 +119,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [view, setView] = useState<ViewMode>(() => (localStorage.getItem('rfb-view') as ViewMode) || 'details')
   const [hidden, setHidden] = useState(() => localStorage.getItem('rfb-hidden') === 'true')
   const [filter, setFilter] = useState('')
-  const [clipboard, setClipboard] = useState<Clipboard>(null)
+  const [clipboard, setClipboard] = useState<RemoteClipboard>(null)
   const [editor, setEditor] = useState<DocumentFile | null>(null)
   const [viewer, setViewer] = useState<{ entry: Entry; type: 'image' | 'video' } | null>(null)
   const [trash, setTrash] = useState<TrashEntry[] | null>(null)
@@ -336,23 +336,54 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   }
   const deleteSelected = () => deleteItems(Array.from(selected))
   const deleteEntry = (entry: Entry) => deleteItems(selected.has(entry.id) ? Array.from(selected) : [entry.id])
-  const paste = async () => {
+  const stageClipboard = (operation: ClipboardOperation, target?: Entry) => {
+    const ids = target ? clipboardIdsForEntry(target.id, selected) : Array.from(selected)
+    if (!ids.length) return
+    setError(''); setClipboard({ operation, ids })
+  }
+  const paste = async (destinationId = currentDir, destinationPath = destinationId ? findEntry(destinationId, root, expanded)?.path ?? '/fs-root' : '/fs-root') => {
     if (!clipboard) return
+    const sources = clipboard.ids.map(id => findEntry(id, root, expanded)).filter((entry): entry is Entry => Boolean(entry))
+    const problem = pasteProblem(clipboard.operation, sources, destinationId, destinationPath)
+    if (problem) { setError(problem); return }
+    const operationIds = clipboard.operation === 'move' ? movableClipboardIds(clipboard.ids, sources, destinationId) : clipboard.ids
+    if (!operationIds.length) { setError(''); setClipboard(null); return }
+    const sourceParents = new Set(sources.filter(source => operationIds.includes(source.id)).map(source => source.parentId))
     setError('')
     try {
-      await api.operate(clipboard.operation, clipboard.ids, currentDir)
+      await api.operate(clipboard.operation, operationIds, destinationId)
     } catch (e) {
       if (clipboard.operation === 'move' && e instanceof ApiFailure && e.code === 'folder_merge_conflict') {
         const choice = await chooseMerge(e.message)
         if (choice === 'cancel') return
-        try { await api.operate('move', clipboard.ids, currentDir, undefined, choice === 'replace', choice === 'merge') } catch (retryError) { setError(messageOf(retryError)); return }
+        try { await api.operate('move', operationIds, destinationId, undefined, choice === 'replace', choice === 'merge') } catch (retryError) { setError(messageOf(retryError)); return }
       } else if (e instanceof ApiFailure && e.code === 'already_exists' && await confirmAction(`${e.message}. Replace it and move the old item to Trash?`, { title: 'Replace existing item?', confirmLabel: 'Replace', danger: true })) {
-        try { await api.operate(clipboard.operation, clipboard.ids, currentDir, undefined, true) } catch (retryError) { setError(messageOf(retryError)); return }
+        try { await api.operate(clipboard.operation, operationIds, destinationId, undefined, true) } catch (retryError) { setError(messageOf(retryError)); return }
       } else { setError(messageOf(e)); return }
     }
-    if (clipboard.operation === 'move') setClipboard(null)
-    await refresh(currentDir)
+    if (clipboard.operation === 'move') {
+      const moved = new Set(operationIds)
+      setClipboard(null)
+      setSelected(ids => new Set(Array.from(ids).filter(id => !moved.has(id))))
+      setPrimary(entry => entry && moved.has(entry.id) ? null : entry)
+    }
+    await Promise.all(Array.from(new Set([...sourceParents, destinationId])).map(id => refresh(id)))
   }
+  useEffect(() => {
+    const keyboard = (event: KeyboardEvent) => {
+      const action = clipboardShortcut(event)
+      if (!action || ignoresFileClipboardShortcut(event.target) || editor || viewer || trash || properties) return
+      if (action === 'paste') {
+        if (!clipboard) return
+        event.preventDefault(); void paste()
+      } else {
+        if (!selected.size) return
+        event.preventDefault(); stageClipboard(action)
+      }
+    }
+    addEventListener('keydown', keyboard)
+    return () => removeEventListener('keydown', keyboard)
+  }, [clipboard, currentDir, editor, expanded, properties, root, selected, trash, viewer])
   const moveByDrag = async (ids: string[], destinationId: string, requireConfirmation = false) => {
     const movableIds = ids.filter(id => findEntry(id, root, expanded)?.parentId !== destinationId)
     if (!movableIds.length) return false
@@ -406,6 +437,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const activePage = currentDir === '' ? root : expanded[currentDir]
   const gridRows = (activePage?.entries ?? []).filter(entry => entry.name.toLowerCase().includes(filter.toLowerCase())).map(entry => ({ entry, depth: 0 }))
   const visibleCount = gridRows.length
+  const cutIds = new Set(clipboard?.operation === 'move' ? clipboard.ids : [])
   const previewEntries = Array.from(selected).map(id => findEntry(id, root, expanded)).filter((entry): entry is Entry => Boolean(entry))
   const viewerImages = viewer?.type === 'image'
     ? ((viewer.entry.parentId === '' ? root : expanded[viewer.entry.parentId])?.entries.filter(entry => entry.mime.startsWith('image/')) ?? [viewer.entry])
@@ -434,9 +466,9 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
           <button onClick={() => inputRef.current?.click()}><Upload size={16} /> Upload</button>
           <input ref={inputRef} type="file" multiple hidden onChange={e => e.target.files && mutate(() => api.upload(currentDir, e.target.files!), currentDir, () => api.upload(currentDir, e.target.files!, true))} />
           <span className="divider" />
-          <button disabled={!selected.size} onClick={() => setClipboard({ operation: 'copy', ids: Array.from(selected) })}><Copy size={16} /> Copy</button>
-          <button disabled={!selected.size} onClick={() => setClipboard({ operation: 'move', ids: Array.from(selected) })}><Move size={16} /> Move</button>
-          <button disabled={!clipboard} onClick={paste}>Paste</button>
+          <button disabled={!selected.size} title="Copy (Ctrl/Cmd+C)" onClick={() => stageClipboard('copy')}><Copy size={16} /> Copy</button>
+          <button disabled={!selected.size} title="Cut (Ctrl/Cmd+X)" onClick={() => stageClipboard('move')}><Scissors size={16} /> Cut</button>
+          <button disabled={!clipboard} title="Paste (Ctrl/Cmd+V)" onClick={() => void paste()}><ClipboardPaste size={16} /> Paste</button>
           <button disabled={selected.size !== 1} onClick={() => void rename()}><Edit3 size={16} /> Rename</button>
           <button disabled={!selected.size} onClick={deleteSelected}><Trash2 size={16} /> Delete</button>
           <div className="toolbar-spacer" />
@@ -449,8 +481,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         {error && <div className="banner error"><span>{error}</span><button onClick={() => setError('')}><X size={15} /></button></div>}
         <div className="browser-body"><div className="browser-view" onContextMenu={view === 'details' ? undefined : event => showFolderMenu(event, currentDir, columnPath.at(-1)?.path ?? '/fs-root')}>
           {!root ? <div className="center"><span className="spinner" /></div> : view === 'details' ?
-            <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} primary={primary} defaultColumnWidth={defaultColumnWidth} columnWidths={columnWidths} setColumnWidth={(key, width) => setColumnWidths(previous => ({ ...previous, [key]: width }))} navigate={navigateColumn} loadDirectory={loadDirectory} selectItems={selectColumnItems} selectDragItems={(ids, entry) => { setSelected(ids); setPrimary(entry) }} selectParent={selectParentColumn} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} showFolderMenu={showFolderMenu} showProperties={entry => showProperties(entry.id, entry)} setError={setError} /> :
-            !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view={view} selected={selected} setSelected={setSelected} setPrimary={setPrimary} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} showProperties={entry => showProperties(entry.id, entry)} setError={setError} />}
+            <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} cutIds={cutIds} primary={primary} defaultColumnWidth={defaultColumnWidth} columnWidths={columnWidths} setColumnWidth={(key, width) => setColumnWidths(previous => ({ ...previous, [key]: width }))} navigate={navigateColumn} loadDirectory={loadDirectory} selectItems={selectColumnItems} selectDragItems={(ids, entry) => { setSelected(ids); setPrimary(entry) }} selectParent={selectParentColumn} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showFolderMenu={showFolderMenu} showProperties={entry => showProperties(entry.id, entry)} setError={setError} /> :
+            !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view={view} selected={selected} cutIds={cutIds} setSelected={setSelected} setPrimary={setPrimary} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showProperties={entry => showProperties(entry.id, entry)} setError={setError} />}
         </div>{showPreview && <ColumnPreview entries={previewEntries} primary={primary} />}</div>
         </main>
         {terminal && <TerminalDock directoryId={terminal.directoryId} hidden={terminal.hidden} onHide={() => setTerminal(current => current && ({ ...current, hidden: true }))} onClose={() => setTerminal(null)} />}
@@ -461,7 +493,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       setViewer({ entry, type: 'image' }); setSelected(new Set([entry.id])); setPrimary(entry)
     }} onClose={() => setViewer(null)} />}
     {trash && <TrashWindow items={trash} onClose={() => setTrash(null)} onChanged={async () => setTrash(await api.listTrash())} onRestored={entry => refresh(entry.parentId)} setError={setError} />}
-    {folderMenu && <FolderContextMenu {...folderMenu} close={() => setFolderMenu(null)} createItem={createItem} showProperties={id => showProperties(id)} setError={setError} />}
+    {folderMenu && <FolderContextMenu {...folderMenu} close={() => setFolderMenu(null)} createItem={createItem} paste={() => paste(folderMenu.directoryId, folderMenu.path)} hasClipboard={Boolean(clipboard)} showProperties={id => showProperties(id)} setError={setError} />}
     {properties && <PropertiesDialog {...properties} onClose={() => setProperties(null)} />}
     <div id="window-tray" className="window-tray" role="region" aria-label="Minimized windows" />
   </div>
@@ -541,13 +573,14 @@ function ConversionJobs() {
 }
 
 type BrowserColumn = { directoryId: string; page?: EntryPage; label: string }
-function ColumnBrowser({ root, path, pages, filter, selected, primary, defaultColumnWidth, columnWidths, setColumnWidth, navigate, loadDirectory, selectItems, selectDragItems, selectParent, activate, renameEntry, moveEntries, deleteEntry, showFolderMenu, showProperties, setError }: {
-  root: EntryPage; path: Entry[]; pages: Record<string, EntryPage>; filter: string; selected: Set<string>; primary: Entry | null
+function ColumnBrowser({ root, path, pages, filter, selected, cutIds, primary, defaultColumnWidth, columnWidths, setColumnWidth, navigate, loadDirectory, selectItems, selectDragItems, selectParent, activate, renameEntry, moveEntries, deleteEntry, stageClipboard, pasteInto, hasClipboard, showFolderMenu, showProperties, setError }: {
+  root: EntryPage; path: Entry[]; pages: Record<string, EntryPage>; filter: string; selected: Set<string>; cutIds: Set<string>; primary: Entry | null
   defaultColumnWidth: number; columnWidths: Record<string, number>; setColumnWidth: (key: string, width: number) => void
   navigate: (entry: Entry, columnIndex: number) => Promise<void>; loadDirectory: (entry: Entry) => Promise<boolean>
   selectItems: (ids: Set<string>, primary: Entry | null, columnIndex: number, directoryId: string, preserveCurrentBranch?: boolean) => void
   selectDragItems: (ids: Set<string>, primary: Entry | null) => void; selectParent: (columnIndex: number) => void
   activate: (entry: Entry) => void; renameEntry: (entry: Entry) => Promise<void>; moveEntries: (ids: string[], destinationId: string, requireConfirmation?: boolean) => Promise<boolean>
+  stageClipboard: (operation: ClipboardOperation, entry: Entry) => void; pasteInto: (entry: Entry) => Promise<void>; hasClipboard: boolean
   deleteEntry: (entry: Entry) => Promise<void>; showFolderMenu: (event: React.MouseEvent, directoryId: string, path: string) => void
   showProperties: (entry: Entry) => void; setError: (message: string) => void
 }) {
@@ -701,13 +734,13 @@ function ColumnBrowser({ root, path, pages, filter, selected, primary, defaultCo
       const entries = visibleEntries(column), targetKey = column.directoryId || '__root__', branchId = visiblePath[columnIndex]?.id
       const width = Math.min(480, Math.max(180, columnWidths[targetKey] || defaultColumnWidth))
       return <div className={`finder-column ${activeColumn === columnIndex ? 'active' : ''} ${dropTarget === targetKey ? 'drop-target' : ''}`} style={{ '--column-width': `${width}px` } as React.CSSProperties} key={targetKey} ref={node => { columnRefs.current[columnIndex] = node }} tabIndex={0} role="listbox" aria-label={column.label} aria-multiselectable="true" onFocus={() => setActiveColumn(columnIndex)} onKeyDown={event => keyboard(event, columnIndex)} onContextMenu={event => showFolderMenu(event, column.directoryId, columnIndex === 0 ? '/fs-root' : visiblePath[columnIndex - 1].path)} onDragOver={event => { cancelSpringOpen(); acceptDrop(event, column.directoryId) }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null) }} onDrop={event => drop(event, column.directoryId)}>
-        {!column.page ? <div className="column-state"><span className="spinner" /></div> : entries.length === 0 ? <div className="column-state">{filter ? 'No matches' : 'Empty folder'}</div> : entries.map((entry, entryIndex) => <div className={`column-row ${selected.has(entry.id) ? 'selected' : branchId === entry.id ? 'branch-selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} key={entry.id} role="option" aria-selected={selected.has(entry.id)} aria-current={branchId === entry.id ? 'location' : undefined} draggable onDragStart={event => startDrag(event, entry)} onDragEnd={endDrag} onClick={event => choose(entry, columnIndex, entryIndex, event, true)} onDoubleClick={() => entry.kind === 'directory' ? void navigate(entry, columnIndex) : activate(entry)} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ entry, columnIndex, x: event.clientX, y: event.clientY }) }} onDragOver={event => { if (entry.kind === 'directory' && acceptDrop(event, entry.id)) scheduleSpringOpen(entry, columnIndex) }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) { cancelSpringOpen(entry.id); setDropTarget(current => current === entry.id ? null : current) } }} onDrop={event => { if (entry.kind === 'directory') drop(event, entry.id) }}>
+        {!column.page ? <div className="column-state"><span className="spinner" /></div> : entries.length === 0 ? <div className="column-state">{filter ? 'No matches' : 'Empty folder'}</div> : entries.map((entry, entryIndex) => <div className={`column-row ${selected.has(entry.id) ? 'selected' : branchId === entry.id ? 'branch-selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} key={entry.id} role="option" aria-selected={selected.has(entry.id)} aria-current={branchId === entry.id ? 'location' : undefined} draggable onDragStart={event => startDrag(event, entry)} onDragEnd={endDrag} onClick={event => choose(entry, columnIndex, entryIndex, event, true)} onDoubleClick={() => entry.kind === 'directory' ? void navigate(entry, columnIndex) : activate(entry)} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ entry, columnIndex, x: event.clientX, y: event.clientY }) }} onDragOver={event => { if (entry.kind === 'directory' && acceptDrop(event, entry.id)) scheduleSpringOpen(entry, columnIndex) }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) { cancelSpringOpen(entry.id); setDropTarget(current => current === entry.id ? null : current) } }} onDrop={event => { if (entry.kind === 'directory') drop(event, entry.id) }}>
           <FileGlyph entry={entry} /><span title={entry.name}>{entry.name}</span>{entry.kind === 'directory' && <ChevronRight className="column-arrow" />}
         </div>)}
         <div className="column-resizer" role="separator" aria-orientation="vertical" aria-label={`Resize ${column.label} column`} title="Resize column" onPointerDown={event => startResize(event, targetKey, width)} />
       </div>
     })}
-    {menu && <ContextMenu entry={menu.entry} x={menu.x} y={menu.y} close={() => setMenu(null)} open={() => menu.entry.kind === 'directory' ? void navigate(menu.entry, menu.columnIndex) : activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} showProperties={showProperties} setError={setError} />}
+    {menu && <ContextMenu entry={menu.entry} x={menu.x} y={menu.y} close={() => setMenu(null)} open={() => menu.entry.kind === 'directory' ? void navigate(menu.entry, menu.columnIndex) : activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={pasteInto} hasClipboard={hasClipboard} showProperties={showProperties} setError={setError} />}
   </div>
 }
 
@@ -758,10 +791,11 @@ function ProvenanceEditor({ entry }: { entry: Entry }) {
 
 type Row = { entry: Entry; depth: number }
 
-function FileList({ rows, view, selected, setSelected, setPrimary, activate, renameEntry, moveEntries, deleteEntry, showProperties, setError }: {
-  rows: Row[]; view: ViewMode; selected: Set<string>; setSelected: (value: Set<string>) => void; setPrimary: (entry: Entry | null) => void
+function FileList({ rows, view, selected, cutIds, setSelected, setPrimary, activate, renameEntry, moveEntries, deleteEntry, stageClipboard, pasteInto, hasClipboard, showProperties, setError }: {
+  rows: Row[]; view: ViewMode; selected: Set<string>; cutIds: Set<string>; setSelected: (value: Set<string>) => void; setPrimary: (entry: Entry | null) => void
   activate: (entry: Entry) => void; renameEntry: (entry: Entry) => Promise<void>
   moveEntries: (ids: string[], destinationId: string) => Promise<boolean>
+  stageClipboard: (operation: ClipboardOperation, entry: Entry) => void; pasteInto: (entry: Entry) => Promise<void>; hasClipboard: boolean
   deleteEntry: (entry: Entry) => Promise<void>; showProperties: (entry: Entry) => void; setError: (message: string) => void
 }) {
   const [menu, setMenu] = useState<{ entry: Entry; x: number; y: number } | null>(null)
@@ -816,9 +850,9 @@ function FileList({ rows, view, selected, setSelected, setPrimary, activate, ren
       void moveEntries(ids, entry.id)
     },
   })
-  const contextMenu = menu && <ContextMenu {...menu} close={() => setMenu(null)} open={() => activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} showProperties={showProperties} setError={setError} />
+  const contextMenu = menu && <ContextMenu {...menu} close={() => setMenu(null)} open={() => activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={pasteInto} hasClipboard={hasClipboard} showProperties={showProperties} setError={setError} />
   return <div className={`preview-list ${view}`}>
-    {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => selectEntry(entry, index, event)} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
+    {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => selectEntry(entry, index, event)} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
       <button className="card-menu" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>
       {entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : entry.mime.startsWith('image/') || (view !== 'small' && entry.mime.startsWith('video/')) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view)} loading="lazy" />{entry.mime.startsWith('video/') && entry.browserReady && <VideoReadyBadge />}</button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
       <button className="filename" tabIndex={-1} title={entry.name}>{entry.name}</button>
@@ -850,7 +884,7 @@ function PositionedContextMenu({ x, y, children }: { x: number; y: number; child
   return <div ref={menuRef} className="context-menu" style={{ left: position.x, top: position.y }} role="menu" onPointerDown={event => event.stopPropagation()}>{children}</div>
 }
 
-function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, showProperties, setError }: { entry: Entry; x: number; y: number; close: () => void; open: () => void; renameEntry: (entry: Entry) => Promise<void>; deleteEntry: (entry: Entry) => Promise<void>; showProperties: (entry: Entry) => void; setError: (message: string) => void }) {
+function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, stageClipboard, pasteInto, hasClipboard, showProperties, setError }: { entry: Entry; x: number; y: number; close: () => void; open: () => void; renameEntry: (entry: Entry) => Promise<void>; deleteEntry: (entry: Entry) => Promise<void>; stageClipboard: (operation: ClipboardOperation, entry: Entry) => void; pasteInto: (entry: Entry) => Promise<void>; hasClipboard: boolean; showProperties: (entry: Entry) => void; setError: (message: string) => void }) {
   const promptAction = usePrompt()
   const copyPath = async () => {
     try { await navigator.clipboard.writeText(entry.path) } catch { setError(clipboardError(entry.path)) }
@@ -870,6 +904,8 @@ function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, showP
     close()
     try { await deleteEntry(entry) } catch (error) { setError(messageOf(error)) }
   }
+  const stage = (operation: ClipboardOperation) => { close(); stageClipboard(operation, entry) }
+  const paste = () => { close(); void pasteInto(entry) }
   const rename = () => { close(); void renameEntry(entry) }
   const properties = () => { close(); showProperties(entry) }
   const addProvenance = async () => {
@@ -884,6 +920,9 @@ function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, showP
   }
   return <PositionedContextMenu x={x} y={y}>
     <button role="menuitem" autoFocus onClick={() => { close(); open() }}><FolderOpen /> Open</button>
+    <button role="menuitem" onClick={() => stage('move')}><Scissors /> Cut</button>
+    <button role="menuitem" onClick={() => stage('copy')}><Copy /> Copy</button>
+    {entry.kind === 'directory' && <button role="menuitem" disabled={!hasClipboard} onClick={paste}><ClipboardPaste /> Paste Into</button>}
     <button role="menuitem" onClick={rename}><Edit3 /> Rename</button>
     <button role="menuitem" onClick={copyPath}><Copy /> Copy path</button>
     <button role="menuitem" onClick={properties}><Info /> Properties</button>
@@ -894,7 +933,7 @@ function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, showP
   </PositionedContextMenu>
 }
 
-function FolderContextMenu({ directoryId, path, x, y, close, createItem, showProperties, setError }: { directoryId: string; path: string; x: number; y: number; close: () => void; createItem: (kind: 'file' | 'directory', directoryId?: string) => Promise<void>; showProperties: (id: string) => void; setError: (message: string) => void }) {
+function FolderContextMenu({ directoryId, path, x, y, close, createItem, paste, hasClipboard, showProperties, setError }: { directoryId: string; path: string; x: number; y: number; close: () => void; createItem: (kind: 'file' | 'directory', directoryId?: string) => Promise<void>; paste: () => Promise<void>; hasClipboard: boolean; showProperties: (id: string) => void; setError: (message: string) => void }) {
   useEffect(() => {
     const dismiss = () => close()
     const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') close() }
@@ -902,6 +941,7 @@ function FolderContextMenu({ directoryId, path, x, y, close, createItem, showPro
     return () => { removeEventListener('pointerdown', dismiss); removeEventListener('keydown', escape) }
   }, [close])
   const create = (kind: 'file' | 'directory') => { close(); void createItem(kind, directoryId) }
+  const pasteHere = () => { close(); void paste() }
   const copyPath = async () => {
     try { await navigator.clipboard.writeText(path) } catch { setError(clipboardError(path)) }
     close()
@@ -911,6 +951,7 @@ function FolderContextMenu({ directoryId, path, x, y, close, createItem, showPro
     <button role="menuitem" autoFocus onClick={() => create('directory')}><Folder /> New Folder</button>
     <button role="menuitem" onClick={() => create('file')}><File /> New File</button>
     <span className="context-divider" />
+    <button role="menuitem" disabled={!hasClipboard} onClick={pasteHere}><ClipboardPaste /> Paste</button>
     <button role="menuitem" onClick={copyPath}><Copy /> Copy Path</button>
     <button role="menuitem" onClick={properties}><Info /> Properties</button>
   </PositionedContextMenu>
@@ -1272,6 +1313,11 @@ function findEntry(id: string | undefined, root: EntryPage | null, pages: Record
 function formatBytes(bytes: number) { if (bytes < 1024) return `${bytes} B`; const units = ['KB', 'MB', 'GB', 'TB']; let value = bytes / 1024, unit = 0; while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++ } return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}` }
 function formatDate(value?: string) { return value ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : '—' }
 function messageOf(error: unknown) { return error instanceof Error ? error.message : 'The operation failed' }
+function ignoresFileClipboardShortcut(target: EventTarget | null) {
+  const element = target instanceof Element ? target : document.activeElement
+  const blockedContext = Boolean(element?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), .context-menu, .floating, .modal-backdrop, .terminal-dock'))
+  return !shouldHandleClipboardShortcut(Boolean(getSelection()?.toString()), blockedContext)
+}
 function mediaPlaybackError(error: MediaError | null) {
   if (!error) return 'Video playback failed.'
   if (error.code === 1) return 'Video playback was aborted.'
