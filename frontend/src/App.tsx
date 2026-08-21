@@ -750,7 +750,7 @@ function ColumnPreview({ entries, primary }: { entries: Entry[]; primary: Entry 
   const entry = primary && entries.some(item => item.id === primary.id) ? primary : entries[0]
   return <aside className="column-preview">
     <div className="preview-hero">
-      {entry.mime.startsWith('image/') ? <img src={thumbnailUrl(entry.id, 'large')} alt="" /> : entry.mime.startsWith('video/') ? <VideoPlayer key={entry.id} entry={entry} autoPlay={false} /> : entry.mime.startsWith('audio/') ? <audio key={entry.id} src={mediaUrl(entry.id)} controls preload="metadata" /> : <FileGlyph entry={entry} />}
+      {entry.mime.startsWith('image/') ? <img src={thumbnailUrl(entry.id, 'large', entry.etag)} alt="" /> : entry.mime.startsWith('video/') ? <VideoPlayer key={`${entry.id}:${entry.etag}`} entry={entry} autoPlay={false} /> : entry.mime.startsWith('audio/') ? <audio key={`${entry.id}:${entry.etag}`} src={mediaUrl(entry.id, entry.etag)} controls preload="metadata" /> : <FileGlyph entry={entry} />}
       <strong title={entry.name}>{entry.name}</strong><span>{entry.kind === 'directory' ? 'Folder' : entry.mime}</span>
     </div>
     <dl className="preview-metadata"><dt>Size</dt><dd>{formatBytes(entry.size)}</dd><dt>Permissions</dt><dd><code>{entry.permissions} {entry.mode.toString(8)}</code></dd><dt>Owner</dt><dd>{entry.uid}:{entry.gid}</dd><dt>Modified</dt><dd>{formatDate(entry.modifiedAt)}</dd><dt>Created</dt><dd>{formatDate(entry.createdAt)}</dd><dt>Accessed</dt><dd>{formatDate(entry.accessedAt)}</dd></dl>
@@ -854,7 +854,7 @@ function FileList({ rows, view, selected, cutIds, setSelected, setPrimary, activ
   return <div className={`preview-list ${view}`}>
     {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => selectEntry(entry, index, event)} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
       <button className="card-menu" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>
-      {entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : entry.mime.startsWith('image/') || (view !== 'small' && entry.mime.startsWith('video/')) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view)} loading="lazy" />{entry.mime.startsWith('video/') && entry.browserReady && <VideoReadyBadge />}</button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
+      {entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : entry.mime.startsWith('image/') || (view !== 'small' && entry.mime.startsWith('video/')) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view, entry.etag)} loading="lazy" />{entry.mime.startsWith('video/') && entry.browserReady && <VideoReadyBadge />}</button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
       <button className="filename" tabIndex={-1} title={entry.name}>{entry.name}</button>
       {view !== 'small' && <small>{formatBytes(entry.size)}</small>}
     </div>)}
@@ -1048,7 +1048,7 @@ function ViewerWindow({ entry, type, images, onNavigate, onClose }: { entry: Ent
     const current = imageIndex >= 0 ? imageIndex : 0
     onNavigate(images[(current + direction + images.length) % images.length])
   }, [imageIndex, images, onNavigate])
-  useEffect(() => { setZoom(1); setRotate(0); setMediaDimensions(undefined) }, [entry.id])
+  useEffect(() => { setZoom(1); setRotate(0); setMediaDimensions(undefined) }, [entry.etag, entry.id])
   useEffect(() => {
     const resized = () => setViewport({ width: innerWidth, height: innerHeight })
     addEventListener('resize', resized)
@@ -1077,7 +1077,7 @@ function ViewerWindow({ entry, type, images, onNavigate, onClose }: { entry: Ent
       <div className="window-toolbar"><button onClick={() => setZoom(z => Math.max(.25, z - .25))}><ZoomOut /></button><span>{Math.round(zoom * 100)}%</span><button onClick={() => setZoom(z => Math.min(5, z + .25))}><ZoomIn /></button><button onClick={() => setRotate(r => r + 90)}><RotateCw /></button><a className="button" href={contentUrl(entry.id)}><Download /> Download</a></div>
       <div className="image-stage">
         <button className="image-nav previous" disabled={images.length < 2} aria-label="Previous image" title="Previous image (Left Arrow)" onClick={() => navigate(-1)}><ChevronLeft /></button>
-        <img src={mediaUrl(entry.id)} alt={entry.name} style={{ transform: `scale(${zoom}) rotate(${rotate}deg)` }} onLoad={event => setMediaDimensions({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} />
+        <img src={mediaUrl(entry.id, entry.etag)} alt={entry.name} style={{ transform: `scale(${zoom}) rotate(${rotate}deg)` }} onLoad={event => setMediaDimensions({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} />
         <button className="image-nav next" disabled={images.length < 2} aria-label="Next image" title="Next image (Right Arrow)" onClick={() => navigate(1)}><ChevronRight /></button>
       </div>
     </> : <VideoPlayer entry={entry} editing onMediaSize={(width, height) => setMediaDimensions({ width, height })} />}
@@ -1106,7 +1106,7 @@ function VideoPlayer({ entry, autoPlay = true, editing = false, onMediaSize }: {
       if (!cancelled.current) { setDuration(info.durationSeconds); setFrameRate(info.frameRate ?? undefined) }
     }).catch(e => { if (!cancelled.current) setActionMessage(messageOf(e)) })
     return () => { cancelled.current = true; hlsRef.current?.destroy(); hlsRef.current = null }
-  }, [editing, entry.id])
+  }, [editing, entry.etag, entry.id])
   const attach = (playlistUrl: string) => {
     if (cancelled.current) return
     hlsFailure.current = ''
@@ -1227,7 +1227,7 @@ function VideoPlayer({ entry, autoPlay = true, editing = false, onMediaSize }: {
     return () => removeEventListener('keydown', keyboard)
   }, [currentTime, duration, editing, extracting, frameRate, markIn, markOut])
   return <div className={`video-player ${editing ? 'editing' : ''}`}>
-    <div className="video-stage"><video key={`${entry.id}:${hlsSource ? 'hls' : 'source'}`} ref={videoRef} src={hlsSource ? undefined : mediaUrl(entry.id)} controls muted autoPlay={!hlsSource && autoPlay} loop={shouldAutoLoop(duration)} preload={autoPlay ? 'auto' : 'metadata'} onError={handleVideoError} onLoadedMetadata={event => { const video = event.currentTarget; if (!duration && Number.isFinite(video.duration)) setDuration(video.duration); if (video.videoWidth > 0 && video.videoHeight > 0) onMediaSize?.(video.videoWidth, video.videoHeight) }} onTimeUpdate={event => setCurrentTime(event.currentTarget.currentTime)} onSeeked={event => setCurrentTime(event.currentTarget.currentTime)} />{message && <div className="video-message">{message}</div>}</div>
+    <div className="video-stage"><video key={`${entry.id}:${entry.etag}:${hlsSource ? 'hls' : 'source'}`} ref={videoRef} src={hlsSource ? undefined : mediaUrl(entry.id, entry.etag)} controls muted autoPlay={!hlsSource && autoPlay} loop={shouldAutoLoop(duration)} preload={autoPlay ? 'auto' : 'metadata'} onError={handleVideoError} onLoadedMetadata={event => { const video = event.currentTarget; if (!duration && Number.isFinite(video.duration)) setDuration(video.duration); if (video.videoWidth > 0 && video.videoHeight > 0) onMediaSize?.(video.videoWidth, video.videoHeight) }} onTimeUpdate={event => setCurrentTime(event.currentTarget.currentTime)} onSeeked={event => setCurrentTime(event.currentTarget.currentTime)} />{message && <div className="video-message">{message}</div>}</div>
     {editing && <div className="video-tools" aria-label="Video extraction controls">
       <div className="frame-controls">
         <button title="Previous frame (,)" aria-label="Previous frame" disabled={!frameRate} onClick={() => step(-1)}><ChevronLeft /></button>

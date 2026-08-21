@@ -112,7 +112,7 @@ export const api = {
 }
 
 export const contentUrl = (id: string) => `/api/v1/fs/content?id=${encodeURIComponent(id)}`
-export const mediaUrl = (id: string) => `/api/v1/media/file?id=${encodeURIComponent(id)}`
-export const thumbnailUrl = (id: string, size: string) => `/api/v1/previews/thumbnail?id=${encodeURIComponent(id)}&size=${size}`
+export const mediaUrl = (id: string, version: string) => `/api/v1/media/file?id=${encodeURIComponent(id)}&v=${encodeURIComponent(version)}`
+export const thumbnailUrl = (id: string, size: string, version: string) => `/api/v1/previews/thumbnail?id=${encodeURIComponent(id)}&size=${size}&v=${encodeURIComponent(version)}`
 export const liveEventsUrl = () => `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/v1/events`
 export const terminalUrl = (ticket: string) => `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/v1/terminal/ws?ticket=${encodeURIComponent(ticket)}`

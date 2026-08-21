@@ -107,6 +107,8 @@ struct CacheRecord {
     kind: String,
     key: String,
     source_id: String,
+    #[serde(default)]
+    source_inode: u64,
     source_size: u64,
     source_modified_ns: u64,
     dimension: Option<u32>,
@@ -914,6 +916,7 @@ fn cache_record_matches(
 ) -> bool {
     record.kind == kind
         && record.source_id == id
+        && record.source_inode == meta.ino()
         && record.source_size == meta.len()
         && record.source_modified_ns == source_modified_ns(meta)
         && record.dimension == dimension
@@ -956,6 +959,7 @@ async fn register_cache_record(state: &AppState, record: CacheRecord) -> ApiResu
             existing.kind == record.kind
                 && existing.key == record.key
                 && existing.source_id == record.source_id
+                && existing.source_inode == record.source_inode
                 && existing.source_size == record.source_size
                 && existing.source_modified_ns == record.source_modified_ns
                 && existing.dimension == record.dimension
@@ -1771,6 +1775,7 @@ async fn remap_cache(state: &AppState, source: &Path, target: &Path) -> ApiResul
             _ => continue,
         };
         record.source_id = new_id;
+        record.source_inode = meta.ino();
         record.source_size = meta.len();
         record.source_modified_ns = source_modified_ns(&meta);
     }
@@ -2714,8 +2719,9 @@ struct PreviewQuery {
 fn thumbnail_cache_key(id: &str, meta: &std::fs::Metadata, dimension: u32) -> String {
     blake3::hash(
         format!(
-            "{}:{}:{}:{dimension}",
+            "{}:{}:{}:{}:{dimension}",
             id,
+            meta.ino(),
             meta.len(),
             source_modified_ns(meta)
         )
@@ -2795,6 +2801,7 @@ async fn thumbnail(
             kind: "thumbnail".into(),
             key: key.clone(),
             source_id: query.id,
+            source_inode: meta.ino(),
             source_size: meta.len(),
             source_modified_ns: source_modified_ns(&meta),
             dimension: Some(dimension),
@@ -3511,8 +3518,9 @@ const HLS_CACHE_VERSION: &str = "ffmpeg-8.1.2-progressive-hls-v2";
 
 fn hls_cache_key(id: &str, source_meta: &std::fs::Metadata) -> String {
     let fingerprint = format!(
-        "{}:{}:{:?}:{}",
+        "{}:{}:{}:{:?}:{}",
         id,
+        source_meta.ino(),
         source_meta.len(),
         source_meta.modified().ok(),
         HLS_CACHE_VERSION
@@ -3583,6 +3591,7 @@ async fn start_hls(
                 kind: "hls".into(),
                 key: key.clone(),
                 source_id: input.id.clone(),
+                source_inode: source_meta.ino(),
                 source_size: source_meta.len(),
                 source_modified_ns: source_modified_ns(&source_meta),
                 dimension: None,
@@ -3637,6 +3646,7 @@ async fn start_hls(
                 kind: "hls".into(),
                 key: key.clone(),
                 source_id: input.id.clone(),
+                source_inode: source_meta.ino(),
                 source_size: source_meta.len(),
                 source_modified_ns: source_modified_ns(&source_meta),
                 dimension: None,
@@ -3938,6 +3948,7 @@ async fn reconcile_cache(
                     .and_then(|path| std::fs::metadata(path).ok())
                     .is_some_and(|meta| {
                         meta.is_file()
+                            && meta.ino() == record.source_inode
                             && meta.len() == record.source_size
                             && source_modified_ns(&meta) == record.source_modified_ns
                     });
@@ -4608,6 +4619,52 @@ mod tests {
             serde_json::json!({ "type": "filesystem", "directoryIds": ["folder"] })
         );
     }
+    #[test]
+    fn cache_records_include_inode_identity_and_load_legacy_indexes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("image.png");
+        std::fs::write(&source, b"image").unwrap();
+        let meta = std::fs::metadata(&source).unwrap();
+        let mut record = CacheRecord {
+            kind: "thumbnail".into(),
+            key: "abc123".into(),
+            source_id: "image.png".into(),
+            source_inode: meta.ino() ^ 1,
+            source_size: meta.len(),
+            source_modified_ns: source_modified_ns(&meta),
+            dimension: Some(192),
+        };
+        assert!(!cache_record_matches(
+            &record,
+            "thumbnail",
+            "image.png",
+            &meta,
+            Some(192)
+        ));
+        record.source_inode = meta.ino();
+        assert!(cache_record_matches(
+            &record,
+            "thumbnail",
+            "image.png",
+            &meta,
+            Some(192)
+        ));
+
+        let legacy: CacheIndex = serde_json::from_value(serde_json::json!({
+            "records": {
+                "thumbnail:legacy": {
+                    "kind": "thumbnail",
+                    "key": "legacy",
+                    "sourceId": "image.png",
+                    "sourceSize": meta.len(),
+                    "sourceModifiedNs": source_modified_ns(&meta),
+                    "dimension": 192
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(legacy.records["thumbnail:legacy"].source_inode, 0);
+    }
     #[tokio::test]
     async fn cache_association_and_active_job_follow_a_ui_move() {
         let root = tempfile::tempdir().unwrap();
@@ -4633,6 +4690,7 @@ mod tests {
                 kind: "hls".into(),
                 key: key.clone(),
                 source_id: source_id.clone(),
+                source_inode: meta.ino(),
                 source_size: meta.len(),
                 source_modified_ns: source_modified_ns(&meta),
                 dimension: None,
@@ -4688,6 +4746,7 @@ mod tests {
                 kind: "hls".into(),
                 key: "abc123".into(),
                 source_id: encode_path(OsStr::new("video.mp4")),
+                source_inode: meta.ino(),
                 source_size: meta.len(),
                 source_modified_ns: source_modified_ns(&meta),
                 dimension: None,
