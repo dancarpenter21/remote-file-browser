@@ -10,10 +10,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use argon2::{
-    Argon2,
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-};
 use axum::{
     Json, Router,
     body::Body,
@@ -55,7 +51,6 @@ const TERMINAL_DEFAULT_COLS: u16 = 80;
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
-    password_hash: Arc<String>,
     sessions: Arc<DashMap<String, Session>>,
     login_attempts: Arc<DashMap<String, Vec<SystemTime>>>,
     media_jobs: Arc<DashMap<String, MediaJob>>,
@@ -78,6 +73,7 @@ struct Config {
     trash: PathBuf,
     cache: PathBuf,
     username: String,
+    admin_password: AdminPasswordSource,
     secure_cookies: bool,
     editor_max: u64,
     upload_max: u64,
@@ -86,6 +82,42 @@ struct Config {
     terminal_enabled: bool,
     terminal_shell: PathBuf,
     terminal_max_sessions: usize,
+}
+
+#[derive(Clone)]
+enum AdminPasswordSource {
+    File(PathBuf),
+    Static(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum AdminPasswordError {
+    #[error("read administrator password secret: {0}")]
+    Read(#[from] std::io::Error),
+    #[error("administrator password must contain at least 12 characters")]
+    TooShort,
+}
+
+impl AdminPasswordSource {
+    fn from_env() -> Result<Self, &'static str> {
+        if let Ok(path) = std::env::var("RFB_ADMIN_PASSWORD_FILE") {
+            return Ok(Self::File(PathBuf::from(path)));
+        }
+        std::env::var("RFB_ADMIN_PASSWORD")
+            .map(Self::Static)
+            .map_err(|_| "RFB_ADMIN_PASSWORD_FILE or RFB_ADMIN_PASSWORD is required")
+    }
+
+    async fn load(&self) -> Result<String, AdminPasswordError> {
+        let password = match self {
+            Self::File(path) => fs::read_to_string(path).await?.trim_end().to_string(),
+            Self::Static(password) => password.clone(),
+        };
+        if password.chars().count() < 12 {
+            return Err(AdminPasswordError::TooShort);
+        }
+        Ok(password)
+    }
 }
 
 #[derive(Clone)]
@@ -326,16 +358,11 @@ async fn main() {
     let provenance_api_token = read_optional_token("RFB_PROVENANCE_API_TOKEN_FILE").await;
     let (live_event_tx, _) = broadcast::channel(512);
 
-    let password = read_secret().await;
-    assert!(
-        password.chars().count() >= 12,
-        "administrator password must contain at least 12 characters"
-    );
-    let salt = SaltString::encode_b64(&rand::random::<[u8; 16]>()).expect("valid password salt");
-    let password_hash = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string();
+    let admin_password = AdminPasswordSource::from_env().expect("administrator password source");
+    admin_password
+        .load()
+        .await
+        .expect("load administrator password secret");
 
     let config = Config {
         root,
@@ -343,6 +370,7 @@ async fn main() {
         trash,
         cache,
         username: env_string("RFB_ADMIN_USERNAME", "admin"),
+        admin_password,
         secure_cookies: env_bool("RFB_SECURE_COOKIES", true),
         editor_max: env_u64("RFB_EDITOR_MAX_BYTES", 5 * 1024 * 1024),
         upload_max: env_u64("RFB_UPLOAD_MAX_BYTES", 20 * 1024 * 1024 * 1024),
@@ -357,7 +385,6 @@ async fn main() {
         usize::try_from(config.upload_max.min(usize::MAX as u64)).unwrap_or(usize::MAX);
     let state = AppState {
         config: Arc::new(config),
-        password_hash: Arc::new(password_hash),
         sessions: Arc::new(DashMap::new()),
         login_attempts: Arc::new(DashMap::new()),
         media_jobs: Arc::new(DashMap::new()),
@@ -431,18 +458,6 @@ async fn main() {
 #[utoipa::path(get, path = "/healthz", tag = "system", responses((status = 200, body = String)))]
 async fn health() -> &'static str {
     "ok"
-}
-
-async fn read_secret() -> String {
-    if let Ok(path) = std::env::var("RFB_ADMIN_PASSWORD_FILE") {
-        return fs::read_to_string(path)
-            .await
-            .expect("read administrator password secret")
-            .trim_end()
-            .to_string();
-    }
-    std::env::var("RFB_ADMIN_PASSWORD")
-        .expect("RFB_ADMIN_PASSWORD_FILE or RFB_ADMIN_PASSWORD is required")
 }
 
 async fn read_optional_token(variable: &str) -> Option<String> {
@@ -528,11 +543,20 @@ async fn login(
             ));
         }
     }
-    let parsed = PasswordHash::new(&state.password_hash).map_err(ApiError::internal)?;
-    let valid = input.username == state.config.username
-        && Argon2::default()
-            .verify_password(input.password.as_bytes(), &parsed)
-            .is_ok();
+    let expected_password = state
+        .config
+        .admin_password
+        .load()
+        .await
+        .map_err(ApiError::internal)?;
+    let password_valid = bool::from(
+        input
+            .password
+            .as_bytes()
+            .ct_eq(expected_password.as_bytes()),
+    );
+    drop(expected_password);
+    let valid = input.username == state.config.username && password_valid;
     if !valid {
         state.login_attempts.entry(client).or_default().push(now);
         tokio::time::sleep(Duration::from_millis(350)).await;
@@ -4166,6 +4190,7 @@ mod tests {
                 trash,
                 cache,
                 username: "admin".into(),
+                admin_password: AdminPasswordSource::Static("development-password".into()),
                 secure_cookies: false,
                 editor_max: 1024,
                 upload_max: 1024,
@@ -4175,7 +4200,6 @@ mod tests {
                 terminal_shell: PathBuf::from("/bin/sh"),
                 terminal_max_sessions: 2,
             }),
-            password_hash: Arc::new(String::new()),
             sessions: Arc::new(DashMap::new()),
             login_attempts: Arc::new(DashMap::new()),
             media_jobs: Arc::new(DashMap::new()),
@@ -4191,6 +4215,94 @@ mod tests {
             terminal_tickets: Arc::new(DashMap::new()),
             terminal_slots: Arc::new(Semaphore::new(2)),
         }
+    }
+    #[tokio::test]
+    async fn login_reloads_rotated_password_file_and_handles_invalid_secrets() {
+        let root = tempfile::tempdir().unwrap();
+        let password_path = root.path().join("admin_password");
+        std::fs::write(&password_path, "initial-password\n").unwrap();
+        let mut state = test_state(root.path(), None);
+        Arc::get_mut(&mut state.config).unwrap().admin_password =
+            AdminPasswordSource::File(password_path.clone());
+
+        let initial = login(
+            State(state.clone()),
+            CookieJar::new(),
+            HeaderMap::new(),
+            Json(LoginRequest {
+                username: "admin".into(),
+                password: "initial-password".into(),
+            }),
+        )
+        .await;
+        assert!(initial.is_ok());
+
+        std::fs::write(&password_path, "rotated-password\n").unwrap();
+        let old_password = login(
+            State(state.clone()),
+            CookieJar::new(),
+            HeaderMap::new(),
+            Json(LoginRequest {
+                username: "admin".into(),
+                password: "initial-password".into(),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            old_password,
+            Err(ApiError(StatusCode::UNAUTHORIZED, "invalid_credentials", _))
+        ));
+        let rotated = login(
+            State(state.clone()),
+            CookieJar::new(),
+            HeaderMap::new(),
+            Json(LoginRequest {
+                username: "admin".into(),
+                password: "rotated-password".into(),
+            }),
+        )
+        .await;
+        assert!(rotated.is_ok());
+
+        std::fs::write(&password_path, "too-short\n").unwrap();
+        let invalid = login(
+            State(state.clone()),
+            CookieJar::new(),
+            HeaderMap::new(),
+            Json(LoginRequest {
+                username: "admin".into(),
+                password: "too-short".into(),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            invalid,
+            Err(ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                _
+            ))
+        ));
+
+        std::fs::remove_file(password_path).unwrap();
+        let unreadable = login(
+            State(state),
+            CookieJar::new(),
+            HeaderMap::new(),
+            Json(LoginRequest {
+                username: "admin".into(),
+                password: "rotated-password".into(),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            unreadable,
+            Err(ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                _
+            ))
+        ));
     }
     #[test]
     fn terminal_messages_enforce_types_and_limits() {

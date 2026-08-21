@@ -9,6 +9,8 @@ A Dockerized, single-administrator file manager for a remote Linux server. It us
 3. Place a certificate and key at `secrets/tls.crt` and `secrets/tls.key`.
 4. Run `docker compose up --build -d`, then open the server over HTTPS.
 
+To rotate the administrator password, replace the contents of `secrets/admin_password`. The new value is used for subsequent login attempts without restarting the stack; existing authenticated sessions remain valid.
+
 Only the frontend is published. The backend is reachable solely on the Compose network. HTTP mode is available for isolated development by setting `RFB_TLS_MODE=http` and `RFB_SECURE_COOKIES=false`; never use it across an untrusted network.
 
 The application owns `.trash` and `.cache/remote-file-browser` inside the mounted root. Files deleted from ordinary folders are moved into `.trash`; permanent deletion is available only from the Trash view.
