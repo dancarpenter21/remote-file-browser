@@ -90,14 +90,6 @@ enum AdminPasswordSource {
     Static(String),
 }
 
-#[derive(Debug, thiserror::Error)]
-enum AdminPasswordError {
-    #[error("read administrator password secret: {0}")]
-    Read(#[from] std::io::Error),
-    #[error("administrator password must contain at least 12 characters")]
-    TooShort,
-}
-
 impl AdminPasswordSource {
     fn from_env() -> Result<Self, &'static str> {
         if let Ok(path) = std::env::var("RFB_ADMIN_PASSWORD_FILE") {
@@ -108,15 +100,11 @@ impl AdminPasswordSource {
             .map_err(|_| "RFB_ADMIN_PASSWORD_FILE or RFB_ADMIN_PASSWORD is required")
     }
 
-    async fn load(&self) -> Result<String, AdminPasswordError> {
-        let password = match self {
+    async fn load(&self) -> std::io::Result<String> {
+        Ok(match self {
             Self::File(path) => fs::read_to_string(path).await?.trim_end().to_string(),
             Self::Static(password) => password.clone(),
-        };
-        if password.chars().count() < 12 {
-            return Err(AdminPasswordError::TooShort);
-        }
-        Ok(password)
+        })
     }
 }
 
@@ -4217,7 +4205,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn login_reloads_rotated_password_file_and_handles_invalid_secrets() {
+    async fn login_reloads_rotated_password_file_and_handles_unreadable_secrets() {
         let root = tempfile::tempdir().unwrap();
         let password_path = root.path().join("admin_password");
         std::fs::write(&password_path, "initial-password\n").unwrap();
@@ -4237,7 +4225,7 @@ mod tests {
         .await;
         assert!(initial.is_ok());
 
-        std::fs::write(&password_path, "rotated-password\n").unwrap();
+        std::fs::write(&password_path, "short\n").unwrap();
         let old_password = login(
             State(state.clone()),
             CookieJar::new(),
@@ -4258,31 +4246,11 @@ mod tests {
             HeaderMap::new(),
             Json(LoginRequest {
                 username: "admin".into(),
-                password: "rotated-password".into(),
+                password: "short".into(),
             }),
         )
         .await;
         assert!(rotated.is_ok());
-
-        std::fs::write(&password_path, "too-short\n").unwrap();
-        let invalid = login(
-            State(state.clone()),
-            CookieJar::new(),
-            HeaderMap::new(),
-            Json(LoginRequest {
-                username: "admin".into(),
-                password: "too-short".into(),
-            }),
-        )
-        .await;
-        assert!(matches!(
-            invalid,
-            Err(ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                _
-            ))
-        ));
 
         std::fs::remove_file(password_path).unwrap();
         let unreadable = login(
@@ -4291,7 +4259,7 @@ mod tests {
             HeaderMap::new(),
             Json(LoginRequest {
                 username: "admin".into(),
-                password: "rotated-password".into(),
+                password: "short".into(),
             }),
         )
         .await;

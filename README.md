@@ -5,7 +5,7 @@ A Dockerized, single-administrator file manager for a remote Linux server. It us
 ## Quick start
 
 1. Copy `.env.example` to `.env` and set `RFB_ROOT_PATH`, `RFB_UID`, and `RFB_GID` to the existing directory and numeric identity that should own file operations.
-2. Create `secrets/admin_password` containing a password of at least 12 characters.
+2. Create `secrets/admin_password` containing the administrator password.
 3. Place a certificate and key at `secrets/tls.crt` and `secrets/tls.key`.
 4. Run `docker compose up --build -d`, then open the server over HTTPS.
 
