@@ -78,6 +78,26 @@ async function markPreparation(project: Project): Promise<void> {
 
 export async function buildServer() {
   await ensureStorage();
+  const localOrigins = ["http://127.0.0.1:4317", "http://127.0.0.1:5173", "http://localhost:5173"];
+  const configuredOrigins = (process.env.VFX_EDITOR_ALLOWED_ORIGINS ?? "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  for (const origin of configuredOrigins) {
+    let parsed: URL;
+    try {
+      parsed = new URL(origin);
+    } catch {
+      throw new Error(`Invalid VFX_EDITOR_ALLOWED_ORIGINS entry: ${origin}`);
+    }
+    if (parsed.origin !== origin || !["http:", "https:"].includes(parsed.protocol)) {
+      throw new Error(`VFX_EDITOR_ALLOWED_ORIGINS entries must be HTTP(S) origins without paths: ${origin}`);
+    }
+  }
+  if (process.env.NODE_ENV === "production" && configuredOrigins.length === 0) {
+    throw new Error("Set VFX_EDITOR_ALLOWED_ORIGINS to the public reverse-proxy origin before starting production.");
+  }
+  const allowedOrigins = new Set([...localOrigins, ...configuredOrigins]);
   const existingProjects = await listProjects();
   for (const project of existingProjects) {
     await cleanupInterruptedArtifacts(project.id);
@@ -89,10 +109,7 @@ export async function buildServer() {
 
   app.addHook("onRequest", async (request, reply) => {
     const origin = request.headers.origin;
-    if (origin) {
-      const allowed = new Set(["http://127.0.0.1:4317", "http://127.0.0.1:5173", "http://localhost:5173"]);
-      if (!allowed.has(origin)) return reply.code(403).send({ error: "Unexpected request origin." });
-    }
+    if (origin && !allowedOrigins.has(origin)) return reply.code(403).send({ error: "Unexpected request origin." });
   });
 
   app.setErrorHandler((error, _request, reply) => {

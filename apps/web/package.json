@@ -4,18 +4,18 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1",
+    "dev": "vite --host 0.0.0.0",
     "build": "vite build --outDir ../../dist/web"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "latest",
     "@vfx/shared": "*",
-    "vite": "8.2.2",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },
   "devDependencies": {
     "@types/react": "^19.1.12",
-    "@types/react-dom": "^19.1.9"
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "latest",
+    "vite": "8.2.2"
   }
 }

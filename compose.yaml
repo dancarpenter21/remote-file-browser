@@ -1,0 +1,68 @@
+name: vfx-editor
+
+services:
+  dev:
+    profiles: [dev]
+    platform: linux/amd64
+    build:
+      context: .
+      target: development
+    init: true
+    environment:
+      NODE_ENV: development
+      VFX_EDITOR_HOST: 0.0.0.0
+      VFX_EDITOR_PORT: 4317
+      VFX_EDITOR_DATA_DIR: /data
+      CHOKIDAR_USEPOLLING: "true"
+    ports:
+      - "127.0.0.1:5173:5173"
+    volumes:
+      - .:/app
+      - dev_node_modules:/app/node_modules
+      - dev_data:/data
+    healthcheck:
+      test: [CMD, node, -e, "Promise.all([fetch('http://127.0.0.1:5173'),fetch('http://127.0.0.1:4317/api/health')]).then(r=>{if(r.some(x=>!x.ok))process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
+  prod:
+    profiles: [prod]
+    platform: linux/amd64
+    build:
+      context: .
+      target: production
+    init: true
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      VFX_EDITOR_HOST: 0.0.0.0
+      VFX_EDITOR_PORT: 4317
+      VFX_EDITOR_DATA_DIR: /data
+      VFX_EDITOR_ALLOWED_ORIGINS: ${VFX_EDITOR_ALLOWED_ORIGINS:-}
+    expose:
+      - "4317"
+    volumes:
+      - prod_data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:4317/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+
+volumes:
+  dev_node_modules:
+    name: vfx-editor-dev-node-modules
+  dev_data:
+    name: vfx-editor-dev-data
+  prod_data:
+    name: vfx-editor-prod-data
+
+networks:
+  default:
+    name: vfx-editor
