@@ -43,7 +43,7 @@ describe("media pipeline", () => {
     originalHash = await sha256(externalSource);
     originalMtime = (await stat(externalSource)).mtimeMs;
     const source = await inspectSource(externalSource, "external-source.mp4", "source.mp4", originalHash);
-    project = await createProjectRecord("Integration fixture", source);
+    project = await createProjectRecord("Integration fixture", source, { provider: "remote-file-browser", key: "a".repeat(64) });
     await copyFile(externalSource, projectFile(project.id, source.storedName));
     await chmod(projectFile(project.id, source.storedName), 0o400);
     const prepared = await prepareProjectMedia(project);
@@ -90,6 +90,18 @@ describe("media pipeline", () => {
   it("never mutates the external source", async () => {
     expect(await sha256(externalSource)).toBe(originalHash);
     expect((await stat(externalSource)).mtimeMs).toBe(originalMtime);
+  });
+
+  it("finds an existing Remote Files project by integration key", async () => {
+    const { buildServer } = await import("./server.js");
+    const app = await buildServer();
+    try {
+      const response = await app.inject({ method: "GET", url: `/api/integrations/remote-file-browser/projects/${"a".repeat(64)}` });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({ id: project.id, integration: { provider: "remote-file-browser", key: "a".repeat(64) } });
+    } finally {
+      await app.close();
+    }
   });
 
   it("can exclude original audio while retaining the crowd mix", async () => {

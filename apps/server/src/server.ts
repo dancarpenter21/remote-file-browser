@@ -78,7 +78,13 @@ async function markPreparation(project: Project): Promise<void> {
 
 export async function buildServer() {
   await ensureStorage();
-  const localOrigins = ["http://127.0.0.1:4317", "http://127.0.0.1:5173", "http://localhost:5173"];
+  const localOrigins = [
+    "http://127.0.0.1:4317",
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+    "http://linux-server:5173",
+    "http://linux-server.local:5173",
+  ];
   const configuredOrigins = (process.env.VFX_EDITOR_ALLOWED_ORIGINS ?? "")
     .split(",")
     .map((origin) => origin.trim())
@@ -105,6 +111,7 @@ export async function buildServer() {
   }
   const app = Fastify({ logger: true, bodyLimit: 1024 * 1024 });
   const queue = new RenderQueue();
+  const integrationImports = new Map<string, Promise<Project>>();
   await app.register(multipart, { limits: { files: 1, fileSize: 40 * 1024 * 1024 * 1024 } });
 
   app.addHook("onRequest", async (request, reply) => {
@@ -123,6 +130,64 @@ export async function buildServer() {
   app.get("/api/health", async () => ({ ok: true }));
   app.get("/api/projects", async () => listProjects());
   app.get<{ Params: { id: string } }>("/api/projects/:id", async (request) => readProject(request.params.id));
+
+  const findIntegratedProject = async (key: string) => (await listProjects()).find((project) => project.integration?.provider === "remote-file-browser" && project.integration.key === key);
+  const validateIntegrationKey = (key: string) => {
+    if (!/^[a-f0-9]{64}$/.test(key)) throw new Error("Invalid Remote Files integration key.");
+  };
+
+  app.get<{ Params: { key: string } }>("/api/integrations/remote-file-browser/projects/:key", async (request, reply) => {
+    validateIntegrationKey(request.params.key);
+    return await findIntegratedProject(request.params.key) ?? reply.code(404).send({ error: "Integrated project not found." });
+  });
+
+  app.post<{ Params: { key: string } }>("/api/integrations/remote-file-browser/projects/:key", async (request, reply) => {
+    const key = request.params.key;
+    validateIntegrationKey(key);
+    const existing = await findIntegratedProject(key);
+    if (existing) return existing;
+    const pending = integrationImports.get(key);
+    if (pending) return pending;
+
+    const importing = (async () => {
+      const upload = await request.file();
+      if (!upload) throw new Error("Choose a source video.");
+      const declaredBytes = Number(request.headers["content-length"] ?? 0);
+      if (declaredBytes > 0) {
+        const filesystem = await statfs(dataDirectory);
+        const availableBytes = filesystem.bavail * filesystem.bsize;
+        if (availableBytes < declaredBytes * 2 + 1024 ** 3) throw Object.assign(new Error("Not enough free disk space to import this source and create working media."), { statusCode: 507 });
+      }
+      const importDirectory = await mkdtemp(path.join(dataDirectory, "import-"));
+      const temporary = path.join(importDirectory, "source-upload");
+      const hash = createHash("sha256");
+      const meter = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          hash.update(chunk);
+          callback(null, chunk);
+        },
+      });
+      try {
+        await pipeline(upload.file, meter, createWriteStream(temporary, { flags: "wx", mode: 0o600 }));
+        const storedName = `source${safeExtension(upload.filename)}`;
+        const source = await inspectSource(temporary, upload.filename, storedName, hash.digest("hex"));
+        const name = path.basename(upload.filename, path.extname(upload.filename)) || "Untitled video";
+        const project = await createProjectRecord(name, source, { provider: "remote-file-browser", key });
+        await rename(temporary, projectFile(project.id, storedName));
+        await chmod(projectFile(project.id, storedName), 0o400);
+        void markPreparation(project);
+        return project;
+      } finally {
+        await rm(importDirectory, { recursive: true, force: true });
+      }
+    })();
+    integrationImports.set(key, importing);
+    try {
+      return reply.code(202).send(await importing);
+    } finally {
+      integrationImports.delete(key);
+    }
+  });
 
   app.post("/api/projects", async (request, reply) => {
     const upload = await request.file();

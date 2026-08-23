@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { formatFrameTime, fpsValue, highlightContainsSection, highlightIntersectsSection, type HighlightRange, type Rational, type SlowSection } from "@vfx/shared";
+import { apiUrl } from "./urls.js";
 
 interface Props {
   projectId: string;
@@ -35,6 +36,8 @@ export function Timeline(props: Props) {
   const [scrubbing, setScrubbing] = useState(false);
   const [hoverPreview, setHoverPreview] = useState<HoverPreview>();
   const ordered = useMemo(() => [...props.sections].sort((a, b) => a.startFrame - b.startFrame), [props.sections]);
+  const sectionsRef = useRef(props.sections);
+  sectionsRef.current = props.sections;
   const seekCallbacksRef = useRef({ onSeek: props.onSeek, onScrubChange: props.onScrubChange });
   seekCallbacksRef.current = { onSeek: props.onSeek, onScrubChange: props.onScrubChange };
   const highlightCallbacksRef = useRef({ onChange: props.onHighlightChange, onCommit: props.onHighlightCommit });
@@ -140,10 +143,11 @@ export function Timeline(props: Props) {
         }
         return highlightIntersectsSection(props.highlightRange, candidate) && !highlightContainsSection(props.highlightRange, candidate) ? section : candidate;
       });
+      sectionsRef.current = next;
       props.onSectionsChange(next);
     };
     const up = () => {
-      props.onSectionsCommit(props.sections);
+      props.onSectionsCommit(sectionsRef.current);
       setDrag(undefined);
     };
     window.addEventListener("pointermove", move);
@@ -232,10 +236,10 @@ export function Timeline(props: Props) {
             return (
               <div className={`timeline-section speed-${String(section.speed).replace(".", "-")}${active ? "" : " inactive"}`} key={section.id} style={{ left: `${left}%`, width: `${width}%` }}>
                 <span className="section-caption">{index + 1} · {section.speed}×</span>
-                <button className="edge-handle start" aria-label={`Move start of section ${index + 1}`} onPointerDown={(event) => { event.stopPropagation(); setDrag({ sectionId: section.id, edge: "start" }); }} />
-                <button className="ramp-handle in" aria-label={`Adjust ramp in for section ${index + 1}`} style={{ left: `${rampIn}%` }} onPointerDown={(event) => { event.stopPropagation(); setDrag({ sectionId: section.id, edge: "rampIn" }); }} />
-                <button className="ramp-handle out" aria-label={`Adjust ramp out for section ${index + 1}`} style={{ right: `${rampOut}%` }} onPointerDown={(event) => { event.stopPropagation(); setDrag({ sectionId: section.id, edge: "rampOut" }); }} />
-                <button className="edge-handle end" aria-label={`Move end of section ${index + 1}`} onPointerDown={(event) => { event.stopPropagation(); setDrag({ sectionId: section.id, edge: "end" }); }} />
+                <button className="edge-handle start" aria-label={`Move start of section ${index + 1}`} disabled={props.disabled} onPointerDown={(event) => { event.stopPropagation(); if (!props.disabled) setDrag({ sectionId: section.id, edge: "start" }); }} />
+                <button className="ramp-handle in" aria-label={`Adjust ramp in for section ${index + 1}`} disabled={props.disabled} style={{ left: `${rampIn}%` }} onPointerDown={(event) => { event.stopPropagation(); if (!props.disabled) setDrag({ sectionId: section.id, edge: "rampIn" }); }} />
+                <button className="ramp-handle out" aria-label={`Adjust ramp out for section ${index + 1}`} disabled={props.disabled} style={{ right: `${rampOut}%` }} onPointerDown={(event) => { event.stopPropagation(); if (!props.disabled) setDrag({ sectionId: section.id, edge: "rampOut" }); }} />
+                <button className="edge-handle end" aria-label={`Move end of section ${index + 1}`} disabled={props.disabled} onPointerDown={(event) => { event.stopPropagation(); if (!props.disabled) setDrag({ sectionId: section.id, edge: "end" }); }} />
               </div>
             );
           })}
@@ -248,7 +252,7 @@ export function Timeline(props: Props) {
       </div>
       {hoverPreview && (
         <div className="timeline-frame-preview" style={{ left: hoverPreview.left, top: hoverPreview.top }} aria-hidden="true">
-          <video ref={previewVideoRef} src={`/api/projects/${props.projectId}/media/proxy`} muted playsInline preload="metadata" />
+          <video ref={previewVideoRef} src={apiUrl(`/projects/${props.projectId}/media/proxy`)} muted playsInline preload="metadata" />
           <div><span>{formatFrameTime(hoverPreview.frame, props.fps)}</span><strong>Frame {hoverPreview.frame.toLocaleString()}</strong></div>
         </div>
       )}

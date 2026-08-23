@@ -48,7 +48,7 @@ export async function saveProject(project: Project): Promise<Project> {
   return parsed;
 }
 
-export async function createProjectRecord(name: string, source: SourceMetadata): Promise<Project> {
+export async function createProjectRecord(name: string, source: SourceMetadata, integration?: Project["integration"]): Promise<Project> {
   const now = new Date().toISOString();
   const project: Project = {
     schemaVersion: 1,
@@ -68,6 +68,7 @@ export async function createProjectRecord(name: string, source: SourceMetadata):
       crowdMuted: false,
       crowdSource: "bundled",
     },
+    integration,
   };
   await saveProject(project);
   return project;

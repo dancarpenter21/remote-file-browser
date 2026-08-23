@@ -35,13 +35,27 @@ The Compose deployment has independent `dev` and `prod` profiles. Both use the b
 
 ### Development profile
 
-The development image runs the API and Vite development server together with source bind-mounted for hot reload. It is available only from the Docker host at `http://127.0.0.1:5173`.
+The development image runs the API and Vite development server together with source bind-mounted for hot reload. Direct access is available only from the Docker host at `http://127.0.0.1:5174/vfx/`; set `VFX_EDITOR_DEV_PORT` to change that port. The default differs from Remote Files' port 5173 so both development stacks can run together.
 
 ```bash
 docker compose --profile dev up --build
 ```
 
 Development projects are persisted in the `vfx-editor-dev-data` volume. Dependencies are kept in `vfx-editor-dev-node-modules`, separate from host `node_modules`.
+
+## Remote Files integration
+
+VFX Editor can be exposed at `/vfx/` through Remote Files and opened from a video's **Edit with VFX Editor** context-menu action. Remote Files streams the source directly to this service; VFX Editor keeps its own read-only copy and reuses the project while the Remote Files ID and version remain unchanged.
+
+Start this Compose project first so its external `vfx-editor` network exists, then start Remote Files with its `compose.vfx.yaml` overlay. For development:
+
+```bash
+docker compose --profile dev up -d --build
+cd ../Development/remote-file-browser
+docker compose -f compose.yaml -f compose.vfx.yaml --profile dev up -d --build frontend-dev
+```
+
+For production, set `VFX_EDITOR_ALLOWED_ORIGINS` to the exact public Remote Files origin, start the VFX `prod` profile, and then start Remote Files with the same overlay. VFX publishes no production host port; Remote Files supplies authentication and TLS.
 
 ### Production profile
 

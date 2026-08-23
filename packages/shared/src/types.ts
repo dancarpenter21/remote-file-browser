@@ -71,6 +71,10 @@ export const projectSchema = z.object({
   waveformFilename: z.string().optional(),
   preview: artifactSchema.optional(),
   export: artifactSchema.optional(),
+  integration: z.object({
+    provider: z.literal("remote-file-browser"),
+    key: z.string().regex(/^[a-f0-9]{64}$/),
+  }).optional(),
 });
 
 export const projectPatchSchema = z.object({

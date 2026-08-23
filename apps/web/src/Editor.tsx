@@ -14,7 +14,9 @@ import {
   type SlowSpeed,
 } from "@vfx/shared";
 import { cancelRender, createRender, getProject, patchProject, uploadCrowd } from "./api.js";
+import { createSectionId } from "./sectionId.js";
 import { Timeline } from "./Timeline.js";
+import { apiUrl } from "./urls.js";
 
 interface Props {
   initialProject: Project;
@@ -40,11 +42,14 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
   const [job, setJob] = useState<RenderJob>();
   const videoRef = useRef<HTMLVideoElement>(null);
   const projectRef = useRef(project);
+  const savingRef = useRef(false);
   projectRef.current = project;
 
   const timeline = compileHighlightTimeline(project.source.frameCount, project.source.fps, sections, highlightRange);
   const activeSectionCount = sections.filter((section) => highlightContainsSection(highlightRange, section)).length;
   const previewFresh = project.preview?.revision === project.revision;
+  const hasCompleteSlowMarks = markIn !== undefined && markOut !== undefined;
+  const hasPartialSlowMarks = (markIn === undefined) !== (markOut === undefined);
 
   useEffect(() => {
     setProject(initialProject);
@@ -59,7 +64,7 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
 
   useEffect(() => {
     if (!job) return;
-    const events = new EventSource(`/api/jobs/${job.id}/events`);
+    const events = new EventSource(apiUrl(`/jobs/${job.id}/events`));
     events.onmessage = async (event) => {
       const update = JSON.parse(event.data) as RenderJob;
       setJob(update);
@@ -109,37 +114,53 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
     setCurrentFrame((frame) => Math.max(0, Math.min(project.source.frameCount - 1, frame + amount)));
   }
 
-  async function commit(nextSections = sections, nextAudio = audio, nextHighlight = highlightRange): Promise<void> {
-    if (saving) return;
+  async function commit(nextSections = sections, nextAudio = audio, nextHighlight = highlightRange): Promise<boolean> {
+    if (savingRef.current) {
+      setError("Another edit is still being saved. Try again in a moment.");
+      return false;
+    }
+    savingRef.current = true;
     setSaving(true);
     setError(undefined);
     try {
-      const updated = await patchProject(project.id, {
-        expectedRevision: project.revision,
+      const currentProject = projectRef.current;
+      const updated = await patchProject(currentProject.id, {
+        expectedRevision: currentProject.revision,
         sections: nextSections,
         audio: nextAudio,
         highlightRange: nextHighlight,
       });
+      projectRef.current = updated;
       setProject(updated);
       setSections(updated.sections);
       setAudio(updated.audio);
       setHighlightRange(effectiveHighlightRange(updated.source.frameCount, updated.highlightRange));
       onProjectChange(updated);
+      return true;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not save edits.");
-      const refreshed = await getProject(project.id);
+      const refreshed = await getProject(projectRef.current.id);
+      projectRef.current = refreshed;
       setProject(refreshed);
       setSections(refreshed.sections);
       setAudio(refreshed.audio);
       setHighlightRange(effectiveHighlightRange(refreshed.source.frameCount, refreshed.highlightRange));
+      return false;
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   }
 
-  function addSection(): void {
-    const startFrame = Math.min(markIn ?? currentFrame, markOut ?? Math.min(project.source.frameCount, currentFrame + Math.max(2, Math.round(fpsValue(project.source.fps)))));
-    const endFrameExclusive = Math.max(markIn ?? currentFrame, markOut ?? Math.min(project.source.frameCount, currentFrame + Math.max(2, Math.round(fpsValue(project.source.fps)))));
+  async function addSection(): Promise<void> {
+    const defaultLength = Math.max(2, Math.round(fpsValue(project.source.fps)));
+    const defaultStart = Math.min(currentFrame, project.source.frameCount - 2);
+    const startFrame = hasCompleteSlowMarks
+      ? Math.min(markIn, markOut - 1)
+      : defaultStart;
+    const endFrameExclusive = hasCompleteSlowMarks
+      ? Math.max(markIn + 1, markOut)
+      : Math.min(project.source.frameCount, defaultStart + defaultLength);
     if (endFrameExclusive - startFrame < 2) {
       setError("Mark a range containing at least two frames.");
       return;
@@ -153,11 +174,19 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
       return;
     }
     const ramp = defaultRampFrames(endFrameExclusive - startFrame, project.source.fps);
-    const next = [...sections, { id: crypto.randomUUID(), startFrame, endFrameExclusive, speed: 0.5 as const, rampInFrames: ramp, rampOutFrames: ramp }].sort((a, b) => a.startFrame - b.startFrame);
+    let sectionId: string;
+    try {
+      sectionId = createSectionId();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not create the slow-motion section.");
+      return;
+    }
+    const next = [...sections, { id: sectionId, startFrame, endFrameExclusive, speed: 0.5 as const, rampInFrames: ramp, rampOutFrames: ramp }].sort((a, b) => a.startFrame - b.startFrame);
     setSections(next);
-    setMarkIn(undefined);
-    setMarkOut(undefined);
-    void commit(next, audio);
+    if (await commit(next, audio)) {
+      setMarkIn(undefined);
+      setMarkOut(undefined);
+    }
   }
 
   function setHighlightFromMarks(): void {
@@ -207,12 +236,12 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
           <div className="viewer">
             <video
               ref={videoRef}
-              src={`/api/projects/${project.id}/media/proxy`}
+              src={apiUrl(`/projects/${project.id}/media/proxy`)}
               onPlay={() => setPlaying(true)}
               onPause={() => setPlaying(false)}
               onTimeUpdate={(event) => playing && setCurrentFrame(Math.min(project.source.frameCount - 1, Math.floor(event.currentTarget.currentTime * fpsValue(project.source.fps))))}
             />
-            {!playing && !scrubbing && <img className="exact-frame" src={`/api/projects/${project.id}/frames/${currentFrame}`} alt={`Exact source frame ${currentFrame}`} />}
+            {!playing && !scrubbing && <img className="exact-frame" src={apiUrl(`/projects/${project.id}/frames/${currentFrame}`)} alt={`Exact source frame ${currentFrame}`} />}
           </div>
           <div className="transport">
             <button className="frame-button" aria-label="Previous frame" title="Previous frame" onClick={() => stepFrame(-1)}><FrameStepIcon direction="previous" /></button>
@@ -233,7 +262,7 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
             currentFrame={currentFrame}
             highlightRange={highlightRange}
             sections={sections}
-            waveformUrl={project.waveformFilename ? `/api/projects/${project.id}/media/waveform` : undefined}
+            waveformUrl={project.waveformFilename ? apiUrl(`/projects/${project.id}/media/waveform`) : undefined}
             disabled={saving}
             onSeek={(frame) => { setPlaying(false); videoRef.current?.pause(); setCurrentFrame(frame); }}
             onScrubChange={setScrubbing}
@@ -258,14 +287,14 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
               <p className="active-range">Active · Frames {highlightRange.startFrame.toLocaleString()}–{(highlightRange.endFrameExclusive - 1).toLocaleString()}</p>
             </section>
             <section className="workflow-step slow-step">
-              <header><span className="step-number">2</span><div><h2>Add slow motion</h2><p>Mark moments inside the highlight, then add each section.</p></div></header>
+              <header><span className="step-number">2</span><div><h2>Add slow motion</h2><p>Add one second at the playhead, or set In and Out marks for an exact range.</p></div></header>
               <div className="workflow-marks">
                 <button onClick={() => setMarkIn(currentFrame)}>Mark In <kbd>I</kbd></button>
                 <output>{markIn === undefined ? "In —" : `In ${markIn.toLocaleString()}`}</output>
                 <button onClick={() => setMarkOut(Math.min(project.source.frameCount, currentFrame + 1))}>Mark Out <kbd>O</kbd></button>
                 <output>{markOut === undefined ? "Out —" : `Out ${(markOut - 1).toLocaleString()}`}</output>
               </div>
-              <div className="workflow-actions"><button className="primary-action" onClick={addSection} disabled={saving || markIn === undefined || markOut === undefined}>Add slow section</button></div>
+              <div className="workflow-actions"><button className="primary-action" onClick={() => void addSection()} disabled={saving || hasPartialSlowMarks} title={hasPartialSlowMarks ? "Set the other mark to complete the range." : undefined}>{hasCompleteSlowMarks ? "Add marked slow section" : "Add 1-second slow section"}</button></div>
               <p className="active-range">{activeSectionCount} active slow-motion {activeSectionCount === 1 ? "section" : "sections"}</p>
             </section>
           </div>
@@ -305,8 +334,8 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
             {job && ["queued", "running"].includes(job.status) && <div className="job-progress"><div><span style={{ width: `${Math.round(job.progress * 100)}%` }} /></div><p>{job.kind === "preview" ? "Building preview" : "Rendering final"} · {Math.round(job.progress * 100)}%</p><button onClick={() => void cancelRender(job.id)}>Cancel</button></div>}
             {job?.status === "failed" && <p className="inline-error">{job.error}</p>}
             <div className="render-actions"><button onClick={() => void startRender("preview")} disabled={Boolean(job && ["queued", "running"].includes(job.status))}>Build preview</button><button className="accent-button" onClick={() => void startRender("export")} disabled={Boolean(job && ["queued", "running"].includes(job.status))}>Export MP4</button></div>
-            {project.preview && <div className={previewFresh ? "artifact" : "artifact stale"}><span>{previewFresh ? "Preview ready" : "Preview is stale"}</span>{previewFresh && <a href={`/api/projects/${project.id}/media/preview`} target="_blank" rel="noreferrer">Open</a>}</div>}
-            {project.export && <div className={project.export.revision === project.revision ? "artifact" : "artifact stale"}><span>{project.export.revision === project.revision ? "Export ready" : "Older export"}</span><a href={`/api/projects/${project.id}/media/export`}>Download</a></div>}
+            {project.preview && <div className={previewFresh ? "artifact" : "artifact stale"}><span>{previewFresh ? "Preview ready" : "Preview is stale"}</span>{previewFresh && <a href={apiUrl(`/projects/${project.id}/media/preview`)} target="_blank" rel="noreferrer">Open</a>}</div>}
+            {project.export && <div className={project.export.revision === project.revision ? "artifact" : "artifact stale"}><span>{project.export.revision === project.revision ? "Export ready" : "Older export"}</span><a href={apiUrl(`/projects/${project.id}/media/export`)}>Download</a></div>}
           </section>
         </aside>
       </div>
