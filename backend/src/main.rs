@@ -47,6 +47,7 @@ const TERMINAL_TICKET_TTL: Duration = Duration::from_secs(30);
 const TERMINAL_MAX_INPUT_BYTES: usize = 64 * 1024;
 const TERMINAL_DEFAULT_ROWS: u16 = 24;
 const TERMINAL_DEFAULT_COLS: u16 = 80;
+const VFX_EDITOR_MAX_SOURCE_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -82,6 +83,7 @@ struct Config {
     terminal_enabled: bool,
     terminal_shell: PathBuf,
     terminal_max_sessions: usize,
+    vfx_editor_api_url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -248,6 +250,8 @@ type ApiResult<T> = Result<T, ApiError>;
         start_hls,
         list_media_jobs,
         request_cache_cleanup,
+        auth_check,
+        open_vfx_project,
         create_terminal_ticket,
         terminal_websocket,
         hls_status,
@@ -277,6 +281,8 @@ type ApiResult<T> = Result<T, ApiError>;
         ExtractionRequest,
         ExtractionJob,
         CacheCleanupReport,
+        VfxProjectRequest,
+        VfxProjectResponse,
         TerminalTicketRequest,
         TerminalTicketResponse
     )),
@@ -367,6 +373,10 @@ async fn main() {
         terminal_enabled: env_bool("RFB_TERMINAL_ENABLED", true),
         terminal_shell: PathBuf::from(env_string("RFB_TERMINAL_SHELL", "/bin/zsh")),
         terminal_max_sessions: env_usize("RFB_TERMINAL_MAX_SESSIONS", 4).max(1),
+        vfx_editor_api_url: std::env::var("RFB_VFX_EDITOR_API_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim_end_matches('/').to_string()),
     };
     let terminal_max_sessions = config.terminal_max_sessions;
     let body_limit =
@@ -395,6 +405,7 @@ async fn main() {
     let api = Router::new()
         .route("/auth/login", post(login))
         .route("/auth/session", get(session_info))
+        .route("/auth/check", get(auth_check))
         .route("/auth/logout", post(logout))
         .route("/fs/entries", get(list_entries))
         .route("/fs/metadata", get(metadata))
@@ -425,6 +436,7 @@ async fn main() {
         .route("/media/hls", post(start_hls))
         .route("/media/jobs", get(list_media_jobs))
         .route("/media/cache/cleanup", post(request_cache_cleanup))
+        .route("/integrations/vfx/projects", post(open_vfx_project))
         .route("/terminal/tickets", post(create_terminal_ticket))
         .route("/terminal/ws", get(terminal_websocket))
         .route("/media/hls/{key}/status", get(hls_status))
@@ -499,6 +511,7 @@ struct SessionResponse {
     username: Option<String>,
     csrf_token: Option<String>,
     terminal_enabled: bool,
+    vfx_editor_enabled: bool,
 }
 
 #[utoipa::path(post, path = "/api/v1/auth/login", tag = "authentication", request_body = LoginRequest, responses((status = 200, body = SessionResponse), (status = 401, body = Problem), (status = 429, body = Problem)))]
@@ -577,6 +590,7 @@ async fn login(
             username: Some(state.config.username.clone()),
             csrf_token: Some(csrf),
             terminal_enabled: state.config.terminal_enabled,
+            vfx_editor_enabled: state.config.vfx_editor_api_url.is_some(),
         }),
     ))
 }
@@ -589,14 +603,22 @@ async fn session_info(State(state): State<AppState>, jar: CookieJar) -> Json<Ses
             username: Some(state.config.username.clone()),
             csrf_token: Some(session.csrf),
             terminal_enabled: state.config.terminal_enabled,
+            vfx_editor_enabled: state.config.vfx_editor_api_url.is_some(),
         }),
         Err(_) => Json(SessionResponse {
             authenticated: false,
             username: None,
             csrf_token: None,
             terminal_enabled: state.config.terminal_enabled,
+            vfx_editor_enabled: state.config.vfx_editor_api_url.is_some(),
         }),
     }
+}
+
+#[utoipa::path(get, path = "/api/v1/auth/check", tag = "authentication", security(("sessionCookie" = [])), responses((status = 204), (status = 401, body = Problem)))]
+async fn auth_check(State(state): State<AppState>, jar: CookieJar) -> ApiResult<StatusCode> {
+    require_session(&state, &jar)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(post, path = "/api/v1/auth/logout", tag = "authentication", security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 204), (status = 401, body = Problem), (status = 403, body = Problem)))]
@@ -2845,6 +2867,154 @@ async fn media_file(
     serve_file(path, &headers, true).await
 }
 
+#[derive(Deserialize, utoipa::ToSchema)]
+struct VfxProjectRequest {
+    id: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct VfxProjectResponse {
+    project_id: String,
+    reused: bool,
+}
+
+#[derive(Deserialize)]
+struct VfxProject {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct VfxProblem {
+    error: Option<String>,
+}
+
+fn vfx_service_error(status: reqwest::StatusCode, problem: Option<VfxProblem>) -> ApiError {
+    let message = problem
+        .and_then(|value| value.error)
+        .unwrap_or_else(|| "VFX Editor could not import the video".into());
+    if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+        ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "vfx_source_too_large",
+            message,
+        )
+    } else if status.is_client_error() {
+        ApiError::bad("vfx_import_failed", message)
+    } else {
+        ApiError(StatusCode::BAD_GATEWAY, "vfx_service_failed", message)
+    }
+}
+
+#[utoipa::path(post, path = "/api/v1/integrations/vfx/projects", tag = "media", params(("x-csrf-token" = String, Header)), request_body = VfxProjectRequest, security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 200, body = VfxProjectResponse), (status = 400, body = Problem), (status = 413, body = Problem), (status = 503, body = Problem)))]
+async fn open_vfx_project(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Json(input): Json<VfxProjectRequest>,
+) -> ApiResult<Json<VfxProjectResponse>> {
+    require_csrf(&state, &jar, &headers)?;
+    let api_url = state.config.vfx_editor_api_url.as_deref().ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "vfx_unavailable",
+            "VFX Editor is not configured".into(),
+        )
+    })?;
+    let path = resolve_existing(&state.config, &input.id).await?;
+    let metadata = fs::symlink_metadata(&path).await?;
+    if !metadata.is_file() {
+        return Err(ApiError::bad("not_video", "Choose a regular video file"));
+    }
+    let mime = mime_guess::from_path(&path).first_or_octet_stream();
+    if mime.type_() != mime_guess::mime::VIDEO {
+        return Err(ApiError::bad("not_video", "Choose a video file"));
+    }
+    if metadata.len() > VFX_EDITOR_MAX_SOURCE_BYTES {
+        return Err(ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "vfx_source_too_large",
+            "VFX Editor accepts source videos up to 40 GB".into(),
+        ));
+    }
+
+    let version = format!(
+        "\"{:x}-{:x}-{:x}\"",
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime_nsec() ^ metadata.mtime()
+    );
+    let integration_key =
+        blake3::hash(format!("remote-file-browser\0{}\0{}", input.id, version).as_bytes())
+            .to_hex()
+            .to_string();
+    let endpoint =
+        format!("{api_url}/api/integrations/remote-file-browser/projects/{integration_key}");
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(ApiError::internal)?;
+
+    let lookup = client.get(&endpoint).send().await.map_err(|error| {
+        warn!(%error, "VFX Editor lookup failed");
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "vfx_unavailable",
+            "VFX Editor is unavailable".into(),
+        )
+    })?;
+    if lookup.status().is_success() {
+        let project: VfxProject = lookup.json().await.map_err(ApiError::internal)?;
+        return Ok(Json(VfxProjectResponse {
+            project_id: project.id,
+            reused: true,
+        }));
+    }
+    if lookup.status() != reqwest::StatusCode::NOT_FOUND {
+        let status = lookup.status();
+        let problem = lookup.json::<VfxProblem>().await.ok();
+        return Err(vfx_service_error(status, problem));
+    }
+
+    let file = fs::File::open(&path).await?;
+    let stream = ReaderStream::new(file);
+    let filename = path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("video.media"))
+        .to_string_lossy()
+        .into_owned();
+    let part = reqwest::multipart::Part::stream_with_length(
+        reqwest::Body::wrap_stream(stream),
+        metadata.len(),
+    )
+    .file_name(filename)
+    .mime_str(mime.as_ref())
+    .map_err(ApiError::internal)?;
+    let response = client
+        .post(&endpoint)
+        .multipart(reqwest::multipart::Form::new().part("file", part))
+        .send()
+        .await
+        .map_err(|error| {
+            warn!(%error, "VFX Editor import failed");
+            ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "vfx_unavailable",
+                "VFX Editor is unavailable".into(),
+            )
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        let problem = response.json::<VfxProblem>().await.ok();
+        return Err(vfx_service_error(status, problem));
+    }
+    let project: VfxProject = response.json().await.map_err(ApiError::internal)?;
+    Ok(Json(VfxProjectResponse {
+        project_id: project.id,
+        reused: false,
+    }))
+}
+
 #[derive(Clone, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct MediaInfo {
@@ -4187,6 +4357,7 @@ mod tests {
                 terminal_enabled: true,
                 terminal_shell: PathBuf::from("/bin/sh"),
                 terminal_max_sessions: 2,
+                vfx_editor_api_url: None,
             }),
             sessions: Arc::new(DashMap::new()),
             login_attempts: Arc::new(DashMap::new()),
@@ -4270,6 +4441,55 @@ mod tests {
                 "internal_error",
                 _
             ))
+        ));
+    }
+    #[tokio::test]
+    async fn vfx_integration_requires_configuration_and_video_sources() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("notes.txt"), b"not video").unwrap();
+        let mut state = test_state(root.path(), None);
+        state.sessions.insert(
+            "session-token".into(),
+            Session {
+                csrf: "csrf-token".into(),
+                expires: SystemTime::now() + Duration::from_secs(60),
+            },
+        );
+        let jar = CookieJar::new().add(Cookie::new(SESSION_COOKIE, "session-token"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-csrf-token", "csrf-token".parse().unwrap());
+        let unconfigured = open_vfx_project(
+            State(state.clone()),
+            jar.clone(),
+            headers.clone(),
+            Json(VfxProjectRequest {
+                id: encode_path(OsStr::new("notes.txt")),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            unconfigured,
+            Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "vfx_unavailable",
+                _
+            ))
+        ));
+
+        Arc::get_mut(&mut state.config).unwrap().vfx_editor_api_url =
+            Some("http://127.0.0.1:9".into());
+        let non_video = open_vfx_project(
+            State(state),
+            jar,
+            headers,
+            Json(VfxProjectRequest {
+                id: encode_path(OsStr::new("notes.txt")),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            non_video,
+            Err(ApiError(StatusCode::BAD_REQUEST, "not_video", _))
         ));
     }
     #[test]

@@ -12,6 +12,13 @@ common_locations='root /usr/share/nginx/html;
     location /api/ { proxy_pass http://backend; proxy_http_version 1.1; proxy_set_header Host $host; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection $connection_upgrade; proxy_read_timeout 3600s; proxy_request_buffering off; }
     location / { try_files $uri $uri/ /index.html; }'
 
+if [ "${RFB_VFX_EDITOR_ENABLED:-false}" = "true" ]; then
+  common_locations="${common_locations}
+    location = /_rfb_vfx_auth { internal; proxy_pass http://backend/api/v1/auth/check; proxy_pass_request_body off; proxy_set_header Content-Length \"\"; proxy_set_header Cookie \$http_cookie; }
+    location = /vfx { return 308 /vfx/; }
+    location ^~ /vfx/ { auth_request /_rfb_vfx_auth; client_max_body_size 40g; proxy_pass http://vfx-editor:4317/; proxy_http_version 1.1; proxy_set_header Host \$host; proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto \$scheme; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection \$connection_upgrade; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; }"
+fi
+
 if [ "${RFB_TLS_MODE:-https}" = "https" ]; then
   test -s /run/tls/tls.crt || { echo 'TLS certificate is missing' >&2; exit 1; }
   test -s /run/tls/tls.key || { echo 'TLS private key is missing' >&2; exit 1; }

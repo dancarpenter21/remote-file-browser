@@ -1,0 +1,26 @@
+services:
+  backend:
+    environment:
+      RFB_VFX_EDITOR_API_URL: http://vfx-editor:4317
+    networks:
+      - default
+      - vfx-editor
+
+  frontend:
+    environment:
+      RFB_VFX_EDITOR_ENABLED: "true"
+    networks:
+      - default
+      - vfx-editor
+
+  frontend-dev:
+    environment:
+      VITE_VFX_EDITOR_TARGET: http://vfx-editor:5173
+    networks:
+      - default
+      - vfx-editor
+
+networks:
+  vfx-editor:
+    external: true
+    name: vfx-editor

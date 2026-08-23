@@ -1,11 +1,17 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-export default defineConfig({
+export default defineConfig(() => {
+  const vfxTarget = process.env.VITE_VFX_EDITOR_TARGET
+  return {
   plugins: [react()],
   server: {
     allowedHosts: ['linux-server', 'linux-server.local'],
     proxy: {
+      ...(vfxTarget ? {
+        '/vfx-hmr': { target: vfxTarget, ws: true },
+        '/vfx': { target: vfxTarget, ws: true },
+      } : {}),
       '/api': {
         target: process.env.VITE_PROXY_TARGET ?? 'http://127.0.0.1:8080',
         ws: true,
@@ -36,4 +42,5 @@ export default defineConfig({
       },
     },
   },
+  }
 })

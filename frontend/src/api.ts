@@ -22,7 +22,8 @@ export type Entry = {
 }
 
 export type EntryPage = { entries: Entry[]; total: number; nextOffset?: number }
-export type Session = { authenticated: boolean; username?: string; csrfToken?: string; terminalEnabled: boolean }
+export type Session = { authenticated: boolean; username?: string; csrfToken?: string; terminalEnabled: boolean; vfxEditorEnabled: boolean }
+export type VfxProjectResponse = { projectId: string; reused: boolean }
 export type DocumentFile = { id: string; content: string; etag: string; mime: string }
 export type TrashEntry = {
   info: { id: string; originalId: string; originalName: string; deletedAt: string }
@@ -103,6 +104,7 @@ export const api = {
   hlsStatus: (key: string) => request<HlsJob>(`/media/hls/${key}/status`),
   conversionJobs: () => request<ConversionJob[]>('/media/jobs'),
   cleanupCache: () => request<CacheCleanupReport>('/media/cache/cleanup', { method: 'POST' }),
+  openVfxProject: (id: string) => request<VfxProjectResponse>('/integrations/vfx/projects', { method: 'POST', body: JSON.stringify({ id }) }),
   terminalTicket: (directoryId: string) => request<{ ticket: string }>('/terminal/tickets', { method: 'POST', body: JSON.stringify({ directoryId }) }),
   mediaInfo: (id: string) => request<MediaInfo>(`/media/info?id=${encodeURIComponent(id)}`),
   startExtraction: (input: { id: string; kind: 'frame'; time: number } | { id: string; kind: 'segment'; startTime: number; endTime: number }) =>

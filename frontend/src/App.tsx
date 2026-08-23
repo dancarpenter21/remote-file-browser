@@ -23,6 +23,8 @@ import { isAdjacentColumnMove, moveConfirmationMessage, springLoadedPath } from 
 import { directoryContentsLabel, propertyTypeLabel } from './propertiesState'
 import { TerminalDock } from './TerminalDock'
 import { ClipboardOperation, RemoteClipboard, clipboardIdsForEntry, clipboardShortcut, movableClipboardIds, pasteProblem, shouldHandleClipboardShortcut } from './fileClipboard'
+import { markdownSanitizeSchema, markdownUrlTransform, resolveMarkdownImageSource } from './markdownPreview'
+import { launchVfxEditor } from './vfxLaunch'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type EditorMode = 'edit' | 'split' | 'preview'
@@ -35,6 +37,7 @@ const MergeContext = createContext<(message: string) => Promise<MergeChoice>>(as
 type PromptOptions = { title: string; label?: string; initialValue?: string; submitLabel?: string; placeholder?: string }
 type PromptRequest = PromptOptions & { resolve: (answer: string | null) => void }
 const PromptContext = createContext<(options: PromptOptions) => Promise<string | null>>(async () => null)
+const VfxEditorContext = createContext(false)
 
 function ConfirmProvider({ children }: { children: React.ReactNode }) {
   const [request, setRequest] = useState<ConfirmRequest | null>(null)
@@ -82,7 +85,7 @@ export default function App() {
   useEffect(() => { api.session().then(s => { setCsrf(s.csrfToken); setSession(s) }) }, [])
   if (!session) return <div className="center"><span className="spinner" /></div>
   if (!session.authenticated) return <Login onLogin={s => { setCsrf(s.csrfToken); setSession(s) }} />
-  return <ConfirmProvider><MergeProvider><PromptProvider><FileManager session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false, terminalEnabled: false }) }} /></PromptProvider></MergeProvider></ConfirmProvider>
+  return <ConfirmProvider><MergeProvider><PromptProvider><VfxEditorContext.Provider value={session.vfxEditorEnabled}><FileManager session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false, terminalEnabled: false, vfxEditorEnabled: false }) }} /></VfxEditorContext.Provider></PromptProvider></MergeProvider></ConfirmProvider>
 }
 
 function Login({ onLogin }: { onLogin: (session: Session) => void }) {
@@ -886,6 +889,7 @@ function PositionedContextMenu({ x, y, children }: { x: number; y: number; child
 
 function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, stageClipboard, pasteInto, hasClipboard, showProperties, setError }: { entry: Entry; x: number; y: number; close: () => void; open: () => void; renameEntry: (entry: Entry) => Promise<void>; deleteEntry: (entry: Entry) => Promise<void>; stageClipboard: (operation: ClipboardOperation, entry: Entry) => void; pasteInto: (entry: Entry) => Promise<void>; hasClipboard: boolean; showProperties: (entry: Entry) => void; setError: (message: string) => void }) {
   const promptAction = usePrompt()
+  const vfxEditorEnabled = useContext(VfxEditorContext)
   const copyPath = async () => {
     try { await navigator.clipboard.writeText(entry.path) } catch { setError(clipboardError(entry.path)) }
     close()
@@ -918,6 +922,10 @@ function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, stage
       dispatchEvent(new CustomEvent<ProvenanceChange>('rfb:provenance-changed', { detail: { id: entry.id, urls: next.urls } }))
     } catch (error) { setError(messageOf(error)) }
   }
+  const editWithVfx = () => {
+    close()
+    void launchVfxEditor(entry.id, (url, target) => window.open(url, target), api.openVfxProject).catch(error => setError(messageOf(error)))
+  }
   return <PositionedContextMenu x={x} y={y}>
     <button role="menuitem" autoFocus onClick={() => { close(); open() }}><FolderOpen /> Open</button>
     <button role="menuitem" onClick={() => stage('move')}><Scissors /> Cut</button>
@@ -927,6 +935,7 @@ function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, stage
     <button role="menuitem" onClick={copyPath}><Copy /> Copy path</button>
     <button role="menuitem" onClick={properties}><Info /> Properties</button>
     <span className="context-divider" />
+    {vfxEditorEnabled && entry.kind === 'file' && entry.mime.startsWith('video/') && <button role="menuitem" onClick={editWithVfx}><ExternalLink /> Edit with VFX Editor</button>}
     {entry.kind === 'file' && <button role="menuitem" onClick={() => void addProvenance()}><Link2 /> Add provenance URL</button>}
     {entry.kind === 'file' && entry.hasProvenance && <button role="menuitem" onClick={() => void copyProvenance()}><Copy /> Copy Provenance URL</button>}
     <button role="menuitem" className="danger" onClick={remove}><Trash2 /> Delete</button>
@@ -1032,7 +1041,12 @@ function EditorWindow({ document, onClose, onSaved }: { document: DocumentFile; 
     {error && <div className="banner error">{error}</div>}
     <div className={`editor-body mode-${mode}`}>
       <CodeMirror value={content} height="100%" theme="dark" extensions={[...(isMarkdown ? [markdown()] : []), ...(wordWrap ? [EditorView.lineWrapping] : [])]} onChange={setContent} />
-      {mode !== 'edit' && <article className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]}>{content}</ReactMarkdown></article>}
+      {mode !== 'edit' && <article className="markdown"><ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[[rehypeSanitize, markdownSanitizeSchema]]}
+        urlTransform={markdownUrlTransform}
+        components={{ img: ({ src, ...props }) => <img {...props} src={resolveMarkdownImageSource(document.id, src)} /> }}
+      >{content}</ReactMarkdown></article>}
     </div>
   </FloatingWindow>
 }

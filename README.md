@@ -110,6 +110,27 @@ docker compose --profile dev down
 Set `RFB_DEV_PORT` to change the published port. If file changes are not
 detected, set `RFB_DEV_POLLING=true`; the WSL template enables this by default.
 
+### VFX Editor integration
+
+When the sibling `~/vfx-editor` application is running, Remote Files can expose it at the authenticated `/vfx/` path and add **Edit with VFX Editor** to video context menus. The selected source is streamed between the two backends and copied into VFX-owned storage; unchanged files reopen their existing project.
+
+Start VFX Editor first so its external Docker network exists:
+
+```sh
+cd ~/vfx-editor
+docker compose --profile dev up -d --build
+```
+
+Then start integrated Remote Files development from this repository:
+
+```sh
+docker compose -f compose.yaml -f compose.vfx.yaml --profile dev up -d --build frontend-dev
+```
+
+Remote Files remains on port 5173. Direct VFX development access uses port 5174, while integrated access uses `http://localhost:5173/vfx/`.
+
+For production, set `VFX_EDITOR_ALLOWED_ORIGINS` in the VFX deployment to the exact public Remote Files origin, start its `prod` profile, then start Remote Files with `compose.vfx.yaml`. VFX publishes no production port; nginx proxies `/vfx/` through the existing Remote Files session and TLS boundary. Omit the overlay to run Remote Files without VFX Editor; the context-menu action will be hidden.
+
 To run both processes directly on the host instead, use the following commands.
 
 Backend:
