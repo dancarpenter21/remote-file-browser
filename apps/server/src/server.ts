@@ -10,6 +10,8 @@ import fastifyStatic from "@fastify/static";
 import {
   projectPatchSchema,
   renderRequestSchema,
+  effectiveHighlightRange,
+  validateHighlightRange,
   validateSections,
   type Project,
 } from "@vfx/shared";
@@ -53,8 +55,12 @@ async function markPreparation(project: Project): Promise<void> {
   try {
     const prepared = await prepareProjectMedia(project);
     const current = await readProject(project.id);
+    const highlightWasFullSource = !current.highlightRange || (
+      current.highlightRange.startFrame === 0 && current.highlightRange.endFrameExclusive === current.source.frameCount
+    );
     current.source.frameCount = prepared.frameCount;
     current.source.durationSeconds = prepared.durationSeconds;
+    if (highlightWasFullSource) current.highlightRange = { startFrame: 0, endFrameExclusive: prepared.frameCount };
     current.proxyFilename = prepared.proxyFilename;
     current.waveformFilename = prepared.waveformFilename;
     current.status = "ready";
@@ -140,10 +146,12 @@ export async function buildServer() {
     const patch = projectPatchSchema.parse(request.body);
     const project = await readProject(request.params.id);
     if (patch.expectedRevision !== project.revision) return reply.code(409).send({ error: "Project changed in another tab. Reload before editing." });
-    if (patch.sections) {
-      validateSections(patch.sections, project.source.frameCount);
-      project.sections = [...patch.sections].sort((a, b) => a.startFrame - b.startFrame);
-    }
+    const nextSections = patch.sections ?? project.sections;
+    const nextHighlight = patch.highlightRange ?? effectiveHighlightRange(project.source.frameCount, project.highlightRange);
+    validateSections(nextSections, project.source.frameCount);
+    validateHighlightRange(nextHighlight, project.source.frameCount, nextSections);
+    if (patch.sections) project.sections = [...patch.sections].sort((a, b) => a.startFrame - b.startFrame);
+    if (patch.highlightRange) project.highlightRange = patch.highlightRange;
     if (patch.name !== undefined) project.name = patch.name;
     if (patch.audio !== undefined) project.audio = patch.audio;
     project.revision += 1;

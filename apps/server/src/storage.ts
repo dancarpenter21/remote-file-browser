@@ -59,8 +59,10 @@ export async function createProjectRecord(name: string, source: SourceMetadata):
     revision: 0,
     status: "importing",
     source,
+    highlightRange: { startFrame: 0, endFrameExclusive: source.frameCount },
     sections: [],
     audio: {
+      useOriginalAudio: true,
       sourceGainDb: 0,
       crowdGainDb: -24,
       crowdMuted: false,

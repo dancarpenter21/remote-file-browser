@@ -3,10 +3,13 @@ import path from "node:path";
 import {
   buildSetPtsFrameExpression,
   compileTimeline,
+  effectiveHighlightRange,
   fpsString,
   frameToSeconds,
+  localizeSectionsForHighlight,
   type Project,
   type Rational,
+  type SlowSection,
   type SourceMetadata,
 } from "@vfx/shared";
 import { bundledCrowdPath } from "./paths.js";
@@ -62,6 +65,8 @@ export async function inspectSource(file: string, originalName: string, storedNa
   if (averageValue < 1 || averageValue > 120) throw new Error("V1 supports nominal frame rates from 1 to 120 fps.");
   const interlaced = Boolean(video.field_order && !["progressive", "unknown"].includes(video.field_order));
   const variableFrameRate = Math.abs(fps.num / fps.den - nominal.num / nominal.den) > 0.001;
+  const frameCount = Math.round(durationSeconds * averageValue);
+  if (frameCount < 2) throw new Error("The video must contain at least two frames.");
   return {
     originalName,
     storedName,
@@ -70,7 +75,7 @@ export async function inspectSource(file: string, originalName: string, storedNa
     height: video.height,
     durationSeconds,
     fps,
-    frameCount: Math.max(1, Math.round(durationSeconds * averageValue)),
+    frameCount,
     hasAudio: Boolean(result.streams?.some((stream) => stream.codec_type === "audio")),
     interlaced,
     variableFrameRate,
@@ -107,6 +112,7 @@ export async function prepareProjectMedia(project: Project, signal?: AbortSignal
   const proxyProbe = await probe(proxy, true);
   const video = proxyProbe.streams?.find((stream) => stream.codec_type === "video");
   const frameCount = Number(video?.nb_frames) || Math.max(1, Math.round(project.source.durationSeconds * project.source.fps.num / project.source.fps.den));
+  if (frameCount < 2) throw new Error("The normalized video must contain at least two frames.");
   const durationSeconds = frameToSeconds(frameCount, project.source.fps);
   let waveformFilename: string | undefined;
   if (project.source.hasAudio) {
@@ -137,20 +143,20 @@ function escapeFilterPath(value: string): string {
   return value.replaceAll("\\", "\\\\").replaceAll(":", "\\:").replaceAll("'", "\\'");
 }
 
-function buildTempoCommands(project: Project): string {
-  const timeline = compileTimeline(project.source.frameCount, project.source.fps, project.sections);
+function buildTempoCommands(frameCount: number, fps: Rational, sections: SlowSection[]): string {
+  const timeline = compileTimeline(frameCount, fps, sections);
   const commands: string[] = [];
   let previous = Number.NaN;
   for (let frame = 0; frame < timeline.frameExpansion.length; frame += 1) {
     const factor = Math.cbrt(1 / timeline.frameExpansion[frame]!);
     if (!Number.isFinite(previous) || Math.abs(factor - previous) > 1e-6) {
-      const time = frameToSeconds(frame, project.source.fps).toFixed(9);
+      const time = frameToSeconds(frame, fps).toFixed(9);
       const value = factor.toFixed(9);
       for (const name of ["tempo1", "tempo2", "tempo3"]) commands.push(`${time} atempo@${name} tempo ${value};`);
       previous = factor;
     }
   }
-  const end = frameToSeconds(project.source.frameCount, project.source.fps).toFixed(9);
+  const end = frameToSeconds(frameCount, fps).toFixed(9);
   for (const name of ["tempo1", "tempo2", "tempo3"]) commands.push(`${end} atempo@${name} tempo 1;`);
   return `${commands.join("\n")}\n`;
 }
@@ -162,7 +168,10 @@ export interface RenderOptions {
 }
 
 export async function renderProject(project: Project, options: RenderOptions): Promise<{ filename: string; durationSeconds: number }> {
-  const timeline = compileTimeline(project.source.frameCount, project.source.fps, project.sections);
+  const highlight = effectiveHighlightRange(project.source.frameCount, project.highlightRange);
+  const highlightFrameCount = highlight.endFrameExclusive - highlight.startFrame;
+  const activeSections = localizeSectionsForHighlight(highlight, project.sections);
+  const timeline = compileTimeline(highlightFrameCount, project.source.fps, activeSections);
   const jobDirectory = projectFile(project.id, "jobs");
   await mkdir(jobDirectory, { recursive: true });
   const token = `${options.kind}-${Date.now()}`;
@@ -171,24 +180,26 @@ export async function renderProject(project: Project, options: RenderOptions): P
   const filename = options.kind === "preview" ? `preview-r${project.revision}.mp4` : `export-r${project.revision}.mp4`;
   const output = projectFile(project.id, filename);
   const partial = projectFile(project.id, `${filename}.partial.mp4`);
-  await writeFile(commandFile, buildTempoCommands(project));
+  await writeFile(commandFile, buildTempoCommands(highlightFrameCount, project.source.fps, activeSections));
   const sourceInput = options.kind === "preview" && project.proxyFilename
     ? projectFile(project.id, project.proxyFilename)
     : projectFile(project.id, project.source.storedName);
   const crowdInput = project.audio.crowdSource === "custom" ? projectFile(project.id, "custom-crowd.flac") : bundledCrowdPath;
-  const ptsFrameExpression = buildSetPtsFrameExpression(project.source.frameCount, project.sections);
+  const ptsFrameExpression = buildSetPtsFrameExpression(highlightFrameCount, activeSections);
   const fps = fpsString(project.source.fps);
   const ptsExpression = `(${ptsFrameExpression})*${project.source.fps.den}/(${project.source.fps.num}*TB)`;
   const videoPrefix = options.kind === "preview" ? "" : `${normalizationFilter(project, false)},`;
   const interpolation = options.kind === "preview"
     ? `fps=fps=${fps}:round=near`
     : `minterpolate=fps=${fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=10`;
-  const sourceAudio = project.source.hasAudio
-    ? `[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=duration=${project.source.durationSeconds.toFixed(9)},asetpts=PTS-STARTPTS,asendcmd=f='${escapeFilterPath(commandFile)}',atempo@tempo1=1,atempo@tempo2=1,atempo@tempo3=1,apad,atrim=duration=${timeline.durationSeconds.toFixed(9)},volume=${project.audio.sourceGainDb}dB[sourceaudio];`
+  const highlightStartSeconds = frameToSeconds(highlight.startFrame, project.source.fps);
+  const highlightEndSeconds = frameToSeconds(highlight.endFrameExclusive, project.source.fps);
+  const sourceAudio = project.source.hasAudio && project.audio.useOriginalAudio
+    ? `[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=start=${highlightStartSeconds.toFixed(9)}:end=${highlightEndSeconds.toFixed(9)},asetpts=PTS-STARTPTS,asendcmd=f='${escapeFilterPath(commandFile)}',atempo@tempo1=1,atempo@tempo2=1,atempo@tempo3=1,apad,atrim=duration=${timeline.durationSeconds.toFixed(9)},volume=${project.audio.sourceGainDb}dB[sourceaudio];`
     : `anullsrc=r=48000:cl=stereo,atrim=duration=${timeline.durationSeconds.toFixed(9)}[sourceaudio];`;
   const crowdGain = project.audio.crowdMuted ? -60 : project.audio.crowdGainDb;
   const filter = [
-    `[0:v:0]${videoPrefix}tpad=stop_mode=clone:stop_duration=${(project.source.fps.den / project.source.fps.num).toFixed(12)},setpts='${ptsExpression}',${interpolation},trim=end_frame=${timeline.outputFrameCount},setpts=N/(${fps}*TB),fps=fps=${fps}:round=near[video];`,
+    `[0:v:0]${videoPrefix}trim=start_frame=${highlight.startFrame}:end_frame=${highlight.endFrameExclusive},setpts=N/(${fps}*TB),tpad=stop_mode=clone:stop_duration=${(2 * project.source.fps.den / project.source.fps.num).toFixed(12)},setpts='${ptsExpression}',${interpolation},tpad=stop_mode=clone:stop_duration=${(project.source.fps.den / project.source.fps.num).toFixed(12)},trim=end_frame=${timeline.outputFrameCount},setpts=N/(${fps}*TB),fps=fps=${fps}:round=near[video];`,
     sourceAudio,
     `[1:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=duration=${timeline.durationSeconds.toFixed(9)},afade=t=in:d=0.25,afade=t=out:st=${Math.max(0, timeline.durationSeconds - 0.25).toFixed(9)}:d=0.25,volume=${crowdGain}dB[crowd];`,
     `[sourceaudio][crowd]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95:level=disabled[audio]`,

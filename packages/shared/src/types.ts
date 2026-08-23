@@ -20,7 +20,13 @@ export const slowSectionSchema = z.object({
   rampOutFrames: z.number().int().nonnegative(),
 });
 
+export const highlightRangeSchema = z.object({
+  startFrame: z.number().int().nonnegative(),
+  endFrameExclusive: z.number().int().positive(),
+});
+
 export const audioSettingsSchema = z.object({
+  useOriginalAudio: z.boolean().default(true),
   sourceGainDb: z.number().min(-60).max(6),
   crowdGainDb: z.number().min(-60).max(0),
   crowdMuted: z.boolean(),
@@ -58,6 +64,7 @@ export const projectSchema = z.object({
   status: z.enum(["importing", "ready", "error"]),
   error: z.string().optional(),
   source: sourceMetadataSchema,
+  highlightRange: highlightRangeSchema.optional(),
   sections: z.array(slowSectionSchema),
   audio: audioSettingsSchema,
   proxyFilename: z.string().optional(),
@@ -69,6 +76,7 @@ export const projectSchema = z.object({
 export const projectPatchSchema = z.object({
   expectedRevision: z.number().int().nonnegative(),
   name: z.string().min(1).max(120).optional(),
+  highlightRange: highlightRangeSchema.optional(),
   sections: z.array(slowSectionSchema).optional(),
   audio: audioSettingsSchema.optional(),
 });
@@ -81,6 +89,7 @@ export const renderRequestSchema = z.object({
 export type Rational = z.infer<typeof rationalSchema>;
 export type SlowSpeed = z.infer<typeof slowSpeedSchema>;
 export type SlowSection = z.infer<typeof slowSectionSchema>;
+export type HighlightRange = z.infer<typeof highlightRangeSchema>;
 export type AudioSettings = z.infer<typeof audioSettingsSchema>;
 export type SourceMetadata = z.infer<typeof sourceMetadataSchema>;
 export type Project = z.infer<typeof projectSchema>;

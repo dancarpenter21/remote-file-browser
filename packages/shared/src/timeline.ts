@@ -1,4 +1,4 @@
-import type { Rational, SlowSection } from "./types.js";
+import type { HighlightRange, Rational, SlowSection } from "./types.js";
 
 export interface TimelineMap {
   frameExpansion: number[];
@@ -54,6 +54,48 @@ export function validateSections(sections: SlowSection[], frameCount: number): v
       throw new Error("Slow-motion ranges cannot overlap.");
     }
   }
+}
+
+export function effectiveHighlightRange(frameCount: number, range?: HighlightRange): HighlightRange {
+  return range ?? { startFrame: 0, endFrameExclusive: frameCount };
+}
+
+export function highlightContainsSection(range: HighlightRange, section: SlowSection): boolean {
+  return section.startFrame >= range.startFrame && section.endFrameExclusive <= range.endFrameExclusive;
+}
+
+export function highlightIntersectsSection(range: HighlightRange, section: SlowSection): boolean {
+  return section.startFrame < range.endFrameExclusive && section.endFrameExclusive > range.startFrame;
+}
+
+export function validateHighlightRange(range: HighlightRange, frameCount: number, sections: SlowSection[]): void {
+  if (range.startFrame < 0 || range.endFrameExclusive > frameCount || range.endFrameExclusive - range.startFrame < 2) {
+    throw new Error("The highlight must contain at least two source frames and stay inside the video.");
+  }
+  if (sections.some((section) => highlightIntersectsSection(range, section) && !highlightContainsSection(range, section))) {
+    throw new Error("The highlight boundary cannot cut through a slow-motion section.");
+  }
+}
+
+export function localizeSectionsForHighlight(range: HighlightRange, sections: SlowSection[]): SlowSection[] {
+  return sections
+    .filter((section) => highlightContainsSection(range, section))
+    .map((section) => ({
+      ...section,
+      startFrame: section.startFrame - range.startFrame,
+      endFrameExclusive: section.endFrameExclusive - range.startFrame,
+    }));
+}
+
+export function compileHighlightTimeline(frameCount: number, fps: Rational, sections: SlowSection[], range?: HighlightRange): TimelineMap {
+  const effectiveRange = effectiveHighlightRange(frameCount, range);
+  validateSections(sections, frameCount);
+  validateHighlightRange(effectiveRange, frameCount, sections);
+  return compileTimeline(
+    effectiveRange.endFrameExclusive - effectiveRange.startFrame,
+    fps,
+    localizeSectionsForHighlight(effectiveRange, sections),
+  );
 }
 
 function smoothstepPrimitive(u: number): number {

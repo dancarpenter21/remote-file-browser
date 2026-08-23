@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  compileTimeline,
+  compileHighlightTimeline,
   defaultRampFrames,
+  effectiveHighlightRange,
   formatFrameTime,
   fpsValue,
+  highlightContainsSection,
+  validateHighlightRange,
   type AudioSettings,
   type Project,
   type RenderJob,
@@ -23,7 +26,10 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
   const [project, setProject] = useState(initialProject);
   const [sections, setSections] = useState(initialProject.sections);
   const [audio, setAudio] = useState(initialProject.audio);
+  const [highlightRange, setHighlightRange] = useState(() => effectiveHighlightRange(initialProject.source.frameCount, initialProject.highlightRange));
   const [currentFrame, setCurrentFrame] = useState(0);
+  const [highlightMarkIn, setHighlightMarkIn] = useState<number>();
+  const [highlightMarkOut, setHighlightMarkOut] = useState<number>();
   const [markIn, setMarkIn] = useState<number>();
   const [markOut, setMarkOut] = useState<number>();
   const [playing, setPlaying] = useState(false);
@@ -36,13 +42,19 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
   const projectRef = useRef(project);
   projectRef.current = project;
 
-  const timeline = compileTimeline(project.source.frameCount, project.source.fps, sections);
+  const timeline = compileHighlightTimeline(project.source.frameCount, project.source.fps, sections, highlightRange);
+  const activeSectionCount = sections.filter((section) => highlightContainsSection(highlightRange, section)).length;
   const previewFresh = project.preview?.revision === project.revision;
 
   useEffect(() => {
     setProject(initialProject);
     setSections(initialProject.sections);
     setAudio(initialProject.audio);
+    setHighlightRange(effectiveHighlightRange(initialProject.source.frameCount, initialProject.highlightRange));
+    setHighlightMarkIn(undefined);
+    setHighlightMarkOut(undefined);
+    setMarkIn(undefined);
+    setMarkOut(undefined);
   }, [initialProject]);
 
   useEffect(() => {
@@ -97,7 +109,7 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
     setCurrentFrame((frame) => Math.max(0, Math.min(project.source.frameCount - 1, frame + amount)));
   }
 
-  async function commit(nextSections = sections, nextAudio = audio): Promise<void> {
+  async function commit(nextSections = sections, nextAudio = audio, nextHighlight = highlightRange): Promise<void> {
     if (saving) return;
     setSaving(true);
     setError(undefined);
@@ -106,10 +118,12 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
         expectedRevision: project.revision,
         sections: nextSections,
         audio: nextAudio,
+        highlightRange: nextHighlight,
       });
       setProject(updated);
       setSections(updated.sections);
       setAudio(updated.audio);
+      setHighlightRange(effectiveHighlightRange(updated.source.frameCount, updated.highlightRange));
       onProjectChange(updated);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not save edits.");
@@ -117,6 +131,7 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
       setProject(refreshed);
       setSections(refreshed.sections);
       setAudio(refreshed.audio);
+      setHighlightRange(effectiveHighlightRange(refreshed.source.frameCount, refreshed.highlightRange));
     } finally {
       setSaving(false);
     }
@@ -133,10 +148,33 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
       setError("The new range overlaps an existing slow-motion section.");
       return;
     }
+    if (startFrame < highlightRange.startFrame || endFrameExclusive > highlightRange.endFrameExclusive) {
+      setError("Slow-motion sections must stay inside the active highlight.");
+      return;
+    }
     const ramp = defaultRampFrames(endFrameExclusive - startFrame, project.source.fps);
     const next = [...sections, { id: crypto.randomUUID(), startFrame, endFrameExclusive, speed: 0.5 as const, rampInFrames: ramp, rampOutFrames: ramp }].sort((a, b) => a.startFrame - b.startFrame);
     setSections(next);
+    setMarkIn(undefined);
+    setMarkOut(undefined);
     void commit(next, audio);
+  }
+
+  function setHighlightFromMarks(): void {
+    if (highlightMarkIn === undefined || highlightMarkOut === undefined) {
+      setError("Set both In and Out marks before defining the highlight.");
+      return;
+    }
+    const next = { startFrame: Math.min(highlightMarkIn, highlightMarkOut - 1), endFrameExclusive: Math.max(highlightMarkIn + 1, highlightMarkOut) };
+    try {
+      validateHighlightRange(next, project.source.frameCount, sections);
+      setHighlightRange(next);
+      setHighlightMarkIn(undefined);
+      setHighlightMarkOut(undefined);
+      void commit(sections, audio, next);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The highlight range is invalid.");
+    }
   }
 
   function updateSection(id: string, patch: Partial<SlowSection>, save = true): void {
@@ -193,31 +231,55 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
             frameCount={project.source.frameCount}
             fps={project.source.fps}
             currentFrame={currentFrame}
+            highlightRange={highlightRange}
             sections={sections}
             waveformUrl={project.waveformFilename ? `/api/projects/${project.id}/media/waveform` : undefined}
             disabled={saving}
             onSeek={(frame) => { setPlaying(false); videoRef.current?.pause(); setCurrentFrame(frame); }}
             onScrubChange={setScrubbing}
+            onHighlightChange={setHighlightRange}
+            onHighlightCommit={(next) => void commit(sections, audio, next)}
             onSectionsChange={setSections}
             onSectionsCommit={(next) => void commit(next, audio)}
           />
-          <div className="mark-controls">
-            <button onClick={() => setMarkIn(currentFrame)}>Mark In <kbd>I</kbd></button>
-            <span>{markIn === undefined ? "—" : `Frame ${markIn}`}</span>
-            <button onClick={() => setMarkOut(Math.min(project.source.frameCount, currentFrame + 1))}>Mark Out <kbd>O</kbd></button>
-            <span>{markOut === undefined ? "—" : `Frame ${markOut - 1}`}</span>
-            <button className="accent-button" onClick={addSection} disabled={saving}>Add slow section</button>
+          <div className="edit-workflow">
+            <section className="workflow-step highlight-step">
+              <header><span className="step-number">1</span><div><h2>Choose the highlight</h2><p>Set the part of the source video that will be exported.</p></div></header>
+              <div className="workflow-marks">
+                <button onClick={() => setHighlightMarkIn(currentFrame)}>Set start</button>
+                <output>{highlightMarkIn === undefined ? "Start —" : `Start ${highlightMarkIn.toLocaleString()}`}</output>
+                <button onClick={() => setHighlightMarkOut(Math.min(project.source.frameCount, currentFrame + 1))}>Set end</button>
+                <output>{highlightMarkOut === undefined ? "End —" : `End ${(highlightMarkOut - 1).toLocaleString()}`}</output>
+              </div>
+              <div className="workflow-actions">
+                <button className="primary-action" onClick={setHighlightFromMarks} disabled={saving || highlightMarkIn === undefined || highlightMarkOut === undefined}>Apply highlight</button>
+                <button onClick={() => { const next = { startFrame: 0, endFrameExclusive: project.source.frameCount }; setHighlightRange(next); void commit(sections, audio, next); }} disabled={saving || (highlightRange.startFrame === 0 && highlightRange.endFrameExclusive === project.source.frameCount)}>Use full video</button>
+              </div>
+              <p className="active-range">Active · Frames {highlightRange.startFrame.toLocaleString()}–{(highlightRange.endFrameExclusive - 1).toLocaleString()}</p>
+            </section>
+            <section className="workflow-step slow-step">
+              <header><span className="step-number">2</span><div><h2>Add slow motion</h2><p>Mark moments inside the highlight, then add each section.</p></div></header>
+              <div className="workflow-marks">
+                <button onClick={() => setMarkIn(currentFrame)}>Mark In <kbd>I</kbd></button>
+                <output>{markIn === undefined ? "In —" : `In ${markIn.toLocaleString()}`}</output>
+                <button onClick={() => setMarkOut(Math.min(project.source.frameCount, currentFrame + 1))}>Mark Out <kbd>O</kbd></button>
+                <output>{markOut === undefined ? "Out —" : `Out ${(markOut - 1).toLocaleString()}`}</output>
+              </div>
+              <div className="workflow-actions"><button className="primary-action" onClick={addSection} disabled={saving || markIn === undefined || markOut === undefined}>Add slow section</button></div>
+              <p className="active-range">{activeSectionCount} active slow-motion {activeSectionCount === 1 ? "section" : "sections"}</p>
+            </section>
           </div>
         </section>
 
         <aside className="inspector">
           <section className="panel-section">
-            <div className="section-heading"><div><span className="eyebrow">Timing</span><h2>Slow sections</h2></div><span>{sections.length}</span></div>
+            <div className="section-heading"><div><span className="eyebrow">Step 2 · Fine tuning</span><h2>Slow sections</h2></div><span>{sections.length}</span></div>
             {sections.length === 0 && <p className="empty-note">Set In and Out marks on the timeline, then add a section.</p>}
             {sections.map((section, index) => {
               const length = section.endFrameExclusive - section.startFrame;
-              return <article className="section-card" key={section.id}>
-                <div className="section-card-title"><strong>Section {index + 1}</strong><button aria-label={`Delete section ${index + 1}`} onClick={() => { const next = sections.filter((item) => item.id !== section.id); setSections(next); void commit(next, audio); }}>Remove</button></div>
+              const active = highlightContainsSection(highlightRange, section);
+              return <article className={`section-card${active ? "" : " inactive"}`} key={section.id}>
+                <div className="section-card-title"><strong>Section {index + 1}{active ? "" : " · Outside highlight"}</strong><button aria-label={`Delete section ${index + 1}`} onClick={() => { const next = sections.filter((item) => item.id !== section.id); setSections(next); void commit(next, audio); }}>Remove</button></div>
                 <label>Speed<select value={section.speed} onChange={(event) => updateSection(section.id, { speed: Number(event.target.value) as SlowSpeed })}><option value="0.5">0.5×</option><option value="0.25">0.25×</option><option value="0.125">0.125×</option></select></label>
                 <div className="field-pair"><label>Start frame<input type="number" min="0" max={section.endFrameExclusive - 2} value={section.startFrame} onChange={(event) => updateSection(section.id, { startFrame: Number(event.target.value) }, false)} onBlur={() => void commit(sections, audio)} /></label><label>End frame<input type="number" min={section.startFrame + 2} max={project.source.frameCount} value={section.endFrameExclusive} onChange={(event) => updateSection(section.id, { endFrameExclusive: Number(event.target.value) }, false)} onBlur={() => void commit(sections, audio)} /></label></div>
                 <label>Ramp in · {section.rampInFrames}f<input type="range" min="0" max={length - section.rampOutFrames} value={section.rampInFrames} onChange={(event) => updateSection(section.id, { rampInFrames: Number(event.target.value) }, false)} onPointerUp={() => void commit(sections, audio)} /></label>
@@ -228,7 +290,8 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
 
           <section className="panel-section">
             <span className="eyebrow">Sound</span><h2>Stadium mix</h2>
-            <Gain label="Source" value={audio.sourceGainDb} min={-60} max={6} disabled={!project.source.hasAudio} onChange={(value) => setAudio({ ...audio, sourceGainDb: value })} onCommit={() => void commit(sections, audio)} />
+            <label className="check-row"><input type="checkbox" checked={audio.useOriginalAudio} disabled={!project.source.hasAudio} onChange={(event) => { const next = { ...audio, useOriginalAudio: event.target.checked }; setAudio(next); void commit(sections, next); }} /> Use original audio</label>
+            <Gain label="Source" value={audio.sourceGainDb} min={-60} max={6} disabled={!project.source.hasAudio || !audio.useOriginalAudio} onChange={(value) => setAudio({ ...audio, sourceGainDb: value })} onCommit={() => void commit(sections, audio)} />
             <Gain label="Crowd" value={audio.crowdGainDb} min={-60} max={0} disabled={audio.crowdMuted} onChange={(value) => setAudio({ ...audio, crowdGainDb: value })} onCommit={() => void commit(sections, audio)} />
             <label className="check-row"><input type="checkbox" checked={audio.crowdMuted} onChange={(event) => { const next = { ...audio, crowdMuted: event.target.checked }; setAudio(next); void commit(sections, next); }} /> Mute crowd</label>
             <label className="file-button">Use custom ambience<input type="file" accept="audio/*" onChange={async (event) => { const file = event.target.files?.[0]; if (!file) return; try { const updated = await uploadCrowd(project.id, file); setProject(updated); setAudio(updated.audio); onProjectChange(updated); } catch (cause) { setError(cause instanceof Error ? cause.message : "Upload failed."); } }} /></label>
@@ -236,8 +299,9 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
           </section>
 
           <section className="panel-section output-panel">
-            <span className="eyebrow">Output</span><h2>{timeline.durationSeconds.toFixed(2)} seconds</h2>
+            <span className="eyebrow">Highlight output</span><h2>{timeline.durationSeconds.toFixed(2)} seconds</h2>
             <p>{timeline.outputFrameCount.toLocaleString()} frames at {fpsValue(project.source.fps).toFixed(3)} fps</p>
+            <p>Source frames {highlightRange.startFrame.toLocaleString()}–{(highlightRange.endFrameExclusive - 1).toLocaleString()}</p>
             {job && ["queued", "running"].includes(job.status) && <div className="job-progress"><div><span style={{ width: `${Math.round(job.progress * 100)}%` }} /></div><p>{job.kind === "preview" ? "Building preview" : "Rendering final"} · {Math.round(job.progress * 100)}%</p><button onClick={() => void cancelRender(job.id)}>Cancel</button></div>}
             {job?.status === "failed" && <p className="inline-error">{job.error}</p>}
             <div className="render-actions"><button onClick={() => void startRender("preview")} disabled={Boolean(job && ["queued", "running"].includes(job.status))}>Build preview</button><button className="accent-button" onClick={() => void startRender("export")} disabled={Boolean(job && ["queued", "running"].includes(job.status))}>Export MP4</button></div>

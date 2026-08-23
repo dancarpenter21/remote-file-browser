@@ -3,7 +3,7 @@ import { chmod, copyFile, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { compileTimeline, defaultRampFrames, type Project } from "@vfx/shared";
+import { compileHighlightTimeline, defaultRampFrames, type Project } from "@vfx/shared";
 
 const testRoot = await mkdtemp(path.join(tmpdir(), "vfx-editor-test-"));
 process.env.VFX_EDITOR_DATA_DIR = path.join(testRoot, "data");
@@ -15,6 +15,15 @@ const { createProjectRecord, projectFile, saveProject } = await import("./storag
 
 async function sha256(file: string): Promise<string> {
   return createHash("sha256").update(await readFile(file)).digest("hex");
+}
+
+async function maxAudioVolume(file: string): Promise<number> {
+  const { stderr } = await runProcess(ffmpegPath, [
+    "-hide_banner", "-i", file, "-map", "0:a:0", "-af", "volumedetect", "-f", "null", "-",
+  ]);
+  const value = /max_volume:\s*(-?[\d.]+) dB/.exec(stderr)?.[1];
+  if (!value) throw new Error(`Could not read max audio volume.\n${stderr}`);
+  return Number(value);
 }
 
 describe("media pipeline", () => {
@@ -52,6 +61,7 @@ describe("media pipeline", () => {
       rampInFrames: ramp,
       rampOutFrames: ramp,
     }];
+    project.highlightRange = { startFrame: 30, endFrameExclusive: 75 };
     project.revision = 1;
     await saveProject(project);
   }, 30_000);
@@ -61,7 +71,7 @@ describe("media pipeline", () => {
   });
 
   it("renders draft and interpolated outputs with exact timeline duration", async () => {
-    const expected = compileTimeline(project.source.frameCount, project.source.fps, project.sections);
+    const expected = compileHighlightTimeline(project.source.frameCount, project.source.fps, project.sections, project.highlightRange);
     const preview = await renderProject(project, { kind: "preview" });
     const final = await renderProject(project, { kind: "export" });
     for (const artifact of [preview, final]) {
@@ -72,7 +82,7 @@ describe("media pipeline", () => {
       ]);
       const result = JSON.parse(stdout.toString()) as { streams: Array<{ avg_frame_rate: string; nb_read_frames: string }> };
       expect(result.streams[0]?.avg_frame_rate).toBe("30/1");
-      expect(Number(result.streams[0]?.nb_read_frames)).toBe(expected.outputFrameCount);
+      expect(Number(result.streams[0]?.nb_read_frames), artifact.filename).toBe(expected.outputFrameCount);
       expect(artifact.durationSeconds).toBeCloseTo(expected.durationSeconds, 8);
     }
   }, 30_000);
@@ -81,4 +91,15 @@ describe("media pipeline", () => {
     expect(await sha256(externalSource)).toBe(originalHash);
     expect((await stat(externalSource)).mtimeMs).toBe(originalMtime);
   });
+
+  it("can exclude original audio while retaining the crowd mix", async () => {
+    project.audio.crowdMuted = true;
+    project.audio.useOriginalAudio = true;
+    const withOriginal = await renderProject(project, { kind: "preview" });
+    const withOriginalVolume = await maxAudioVolume(projectFile(project.id, withOriginal.filename));
+    project.audio.useOriginalAudio = false;
+    const withoutOriginal = await renderProject(project, { kind: "preview" });
+    const withoutOriginalVolume = await maxAudioVolume(projectFile(project.id, withoutOriginal.filename));
+    expect(withOriginalVolume - withoutOriginalVolume).toBeGreaterThan(20);
+  }, 30_000);
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildSetPtsFrameExpression, compileTimeline, defaultRampFrames, validateSections } from "./timeline.js";
-import type { SlowSection } from "./types.js";
+import { buildSetPtsFrameExpression, compileHighlightTimeline, compileTimeline, defaultRampFrames, effectiveHighlightRange, localizeSectionsForHighlight, validateHighlightRange, validateSections } from "./timeline.js";
+import { audioSettingsSchema, type SlowSection } from "./types.js";
 
 const fps = { num: 30, den: 1 };
 
@@ -51,5 +51,25 @@ describe("timeline compiler", () => {
     const expression = buildSetPtsFrameExpression(90, [section({ rampInFrames: 5, rampOutFrames: 5 })]);
     expect(expression).toContain("if(lt(N,30)");
     expect(expression).toContain("N-30");
+  });
+
+  it("defaults highlights to the complete source", () => {
+    expect(effectiveHighlightRange(90)).toEqual({ startFrame: 0, endFrameExclusive: 90 });
+    expect(audioSettingsSchema.parse({ sourceGainDb: 0, crowdGainDb: -24, crowdMuted: false, crowdSource: "bundled" }).useOriginalAudio).toBe(true);
+  });
+
+  it("compiles only contained slow sections into highlight-local frames", () => {
+    const range = { startFrame: 20, endFrameExclusive: 70 };
+    const inside = section({ startFrame: 30, endFrameExclusive: 40 });
+    const outside = section({ id: "outside", startFrame: 75, endFrameExclusive: 85 });
+    expect(localizeSectionsForHighlight(range, [inside, outside])).toEqual([
+      { ...inside, startFrame: 10, endFrameExclusive: 20 },
+    ]);
+    expect(compileHighlightTimeline(100, fps, [inside, outside], range).outputFrameCount).toBe(60);
+  });
+
+  it("rejects a highlight boundary through a slow section", () => {
+    expect(() => validateHighlightRange({ startFrame: 40, endFrameExclusive: 80 }, 100, [section()])).toThrow("cannot cut");
+    expect(() => validateHighlightRange({ startFrame: 30, endFrameExclusive: 31 }, 100, [])).toThrow("at least two");
   });
 });
