@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { formatFrameTime, type Rational, type SlowSection } from "@vfx/shared";
+import { formatFrameTime, fpsValue, type Rational, type SlowSection } from "@vfx/shared";
 
 interface Props {
   projectId: string;
@@ -10,17 +10,27 @@ interface Props {
   waveformUrl?: string;
   disabled?: boolean;
   onSeek: (frame: number) => void;
+  onScrubChange: (scrubbing: boolean) => void;
   onSectionsChange: (sections: SlowSection[]) => void;
   onSectionsCommit: (sections: SlowSection[]) => void;
 }
 
 type Drag = { sectionId: string; edge: "start" | "end" | "rampIn" | "rampOut" };
+type HoverPreview = { frame: number; left: number; top: number };
 
 export function Timeline(props: Props) {
   const trackRef = useRef<HTMLDivElement>(null);
+  const previewVideoRef = useRef<HTMLVideoElement>(null);
+  const pendingPreviewFrameRef = useRef<number | undefined>(undefined);
+  const previewSeekTimerRef = useRef<number | undefined>(undefined);
+  const lastPreviewSeekRef = useRef(0);
   const [zoom, setZoom] = useState(1);
   const [drag, setDrag] = useState<Drag>();
+  const [scrubbing, setScrubbing] = useState(false);
+  const [hoverPreview, setHoverPreview] = useState<HoverPreview>();
   const ordered = useMemo(() => [...props.sections].sort((a, b) => a.startFrame - b.startFrame), [props.sections]);
+  const seekCallbacksRef = useRef({ onSeek: props.onSeek, onScrubChange: props.onScrubChange });
+  seekCallbacksRef.current = { onSeek: props.onSeek, onScrubChange: props.onScrubChange };
 
   function eventFrame(clientX: number): number {
     const track = trackRef.current;
@@ -28,6 +38,24 @@ export function Timeline(props: Props) {
     const rect = track.getBoundingClientRect();
     return Math.max(0, Math.min(props.frameCount - 1, Math.round(((clientX - rect.left) / rect.width) * props.frameCount)));
   }
+
+  function queuePreviewSeek(frame: number): void {
+    pendingPreviewFrameRef.current = frame;
+    if (previewSeekTimerRef.current !== undefined) return;
+    const delay = Math.max(0, 80 - (performance.now() - lastPreviewSeekRef.current));
+    previewSeekTimerRef.current = window.setTimeout(() => {
+      const pendingFrame = pendingPreviewFrameRef.current;
+      if (pendingFrame !== undefined && previewVideoRef.current) {
+        previewVideoRef.current.currentTime = pendingFrame / fpsValue(props.fps);
+      }
+      lastPreviewSeekRef.current = performance.now();
+      previewSeekTimerRef.current = undefined;
+    }, delay);
+  }
+
+  useEffect(() => () => {
+    if (previewSeekTimerRef.current !== undefined) window.clearTimeout(previewSeekTimerRef.current);
+  }, []);
 
   useEffect(() => {
     if (!drag) return;
@@ -69,6 +97,37 @@ export function Timeline(props: Props) {
     };
   }, [drag, ordered, props]);
 
+  useEffect(() => {
+    if (!scrubbing) return;
+    let pendingClientX: number | undefined;
+    let animationFrame: number | undefined;
+
+    const flush = () => {
+      animationFrame = undefined;
+      if (pendingClientX !== undefined) seekCallbacksRef.current.onSeek(eventFrame(pendingClientX));
+      pendingClientX = undefined;
+    };
+    const move = (event: PointerEvent) => {
+      pendingClientX = event.clientX;
+      if (animationFrame === undefined) animationFrame = window.requestAnimationFrame(flush);
+    };
+    const up = (event: PointerEvent) => {
+      if (animationFrame !== undefined) window.cancelAnimationFrame(animationFrame);
+      seekCallbacksRef.current.onSeek(eventFrame(event.clientX));
+      seekCallbacksRef.current.onScrubChange(false);
+      setScrubbing(false);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up, { once: true });
+    window.addEventListener("pointercancel", up, { once: true });
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+      if (animationFrame !== undefined) window.cancelAnimationFrame(animationFrame);
+    };
+  }, [scrubbing, props.frameCount]);
+
   return (
     <section className="timeline-shell" aria-label="Source timeline">
       <div className="timeline-toolbar">
@@ -79,11 +138,31 @@ export function Timeline(props: Props) {
       <div className="timeline-scroll">
         <div
           ref={trackRef}
-          className="timeline-track"
+          className={`timeline-track${scrubbing ? " is-scrubbing" : ""}`}
           style={{ width: `${zoom * 100}%`, backgroundImage: props.waveformUrl ? `linear-gradient(90deg, rgba(13,16,22,.3), rgba(13,16,22,.3)), url(${props.waveformUrl})` : undefined }}
           onPointerDown={(event) => {
-            if (!props.disabled && event.target === event.currentTarget) props.onSeek(eventFrame(event.clientX));
+            if (!props.disabled && event.button === 0) {
+              event.preventDefault();
+              const frame = eventFrame(event.clientX);
+              props.onSeek(frame);
+              props.onScrubChange(true);
+              setScrubbing(true);
+            }
           }}
+          onPointerMove={(event) => {
+            if (event.pointerType === "touch") return;
+            const track = trackRef.current;
+            if (!track) return;
+            const frame = eventFrame(event.clientX);
+            const rect = track.getBoundingClientRect();
+            const previewWidth = 176;
+            const previewHeight = 126;
+            const left = Math.max(previewWidth / 2 + 8, Math.min(window.innerWidth - previewWidth / 2 - 8, event.clientX));
+            const top = rect.top >= previewHeight + 8 ? rect.top - previewHeight - 8 : rect.bottom + 8;
+            setHoverPreview({ frame, left, top });
+            queuePreviewSeek(frame);
+          }}
+          onPointerLeave={() => setHoverPreview(undefined)}
         >
           {ordered.map((section, index) => {
             const left = section.startFrame / props.frameCount * 100;
@@ -103,6 +182,12 @@ export function Timeline(props: Props) {
           <div className="playhead" style={{ left: `${props.currentFrame / Math.max(1, props.frameCount - 1) * 100}%` }} />
         </div>
       </div>
+      {hoverPreview && (
+        <div className="timeline-frame-preview" style={{ left: hoverPreview.left, top: hoverPreview.top }} aria-hidden="true">
+          <video ref={previewVideoRef} src={`/api/projects/${props.projectId}/media/proxy`} muted playsInline preload="metadata" />
+          <div><span>{formatFrameTime(hoverPreview.frame, props.fps)}</span><strong>Frame {hoverPreview.frame.toLocaleString()}</strong></div>
+        </div>
+      )}
     </section>
   );
 }

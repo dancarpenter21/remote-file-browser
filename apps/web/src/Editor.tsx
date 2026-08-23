@@ -27,6 +27,8 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
   const [markIn, setMarkIn] = useState<number>();
   const [markOut, setMarkOut] = useState<number>();
   const [playing, setPlaying] = useState(false);
+  const [scrubbing, setScrubbing] = useState(false);
+  const [playbackVolume, setPlaybackVolume] = useState(1);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
   const [job, setJob] = useState<RenderJob>();
@@ -84,6 +86,16 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
   useEffect(() => {
     if (!playing && videoRef.current) videoRef.current.currentTime = currentFrame / fpsValue(project.source.fps);
   }, [currentFrame, playing, project.source.fps]);
+
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.volume = playbackVolume;
+  }, [playbackVolume]);
+
+  function stepFrame(amount: -1 | 1): void {
+    videoRef.current?.pause();
+    setPlaying(false);
+    setCurrentFrame((frame) => Math.max(0, Math.min(project.source.frameCount - 1, frame + amount)));
+  }
 
   async function commit(nextSections = sections, nextAudio = audio): Promise<void> {
     if (saving) return;
@@ -162,13 +174,19 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
               onPause={() => setPlaying(false)}
               onTimeUpdate={(event) => playing && setCurrentFrame(Math.min(project.source.frameCount - 1, Math.floor(event.currentTarget.currentTime * fpsValue(project.source.fps))))}
             />
-            {!playing && <img className="exact-frame" src={`/api/projects/${project.id}/frames/${currentFrame}`} alt={`Exact source frame ${currentFrame}`} />}
+            {!playing && !scrubbing && <img className="exact-frame" src={`/api/projects/${project.id}/frames/${currentFrame}`} alt={`Exact source frame ${currentFrame}`} />}
           </div>
           <div className="transport">
-            <button onClick={() => setCurrentFrame((frame) => Math.max(0, frame - 1))}>−1 frame</button>
-            <button className="play-button" onClick={() => videoRef.current?.paused ? void videoRef.current.play() : videoRef.current?.pause()}>{playing ? "Pause" : "Play"}</button>
-            <button onClick={() => setCurrentFrame((frame) => Math.min(project.source.frameCount - 1, frame + 1))}>+1 frame</button>
-            <span>{formatFrameTime(currentFrame, project.source.fps)}</span>
+            <button className="frame-button" aria-label="Previous frame" title="Previous frame" onClick={() => stepFrame(-1)}><FrameStepIcon direction="previous" /></button>
+            <button className="play-button" aria-label={playing ? "Pause" : "Play"} title={playing ? "Pause" : "Play"} onClick={() => videoRef.current?.paused ? void videoRef.current.play() : videoRef.current?.pause()}><PlayPauseIcon playing={playing} /></button>
+            <button className="frame-button" aria-label="Next frame" title="Next frame" onClick={() => stepFrame(1)}><FrameStepIcon direction="next" /></button>
+            <span className="transport-time">{formatFrameTime(currentFrame, project.source.fps)}</span>
+            <output className="transport-frame" aria-label={`Current frame ${currentFrame}`}>Frame {currentFrame.toLocaleString()}</output>
+            <label className="playback-volume" title="Preview volume">
+              <svg aria-hidden="true" viewBox="0 0 24 24"><path className="volume-body" d="M4 9v6h4l5 4V5L8 9H4z" /><path className="volume-waves" d="M16.2 8.2a5.4 5.4 0 0 1 0 7.6m2.4-10a8.8 8.8 0 0 1 0 12.4" /></svg>
+              <input aria-label="Preview volume" type="range" min="0" max="1" step="0.05" value={playbackVolume} onChange={(event) => setPlaybackVolume(Number(event.target.value))} />
+              <output>{Math.round(playbackVolume * 100)}%</output>
+            </label>
           </div>
           <Timeline
             projectId={project.id}
@@ -179,6 +197,7 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
             waveformUrl={project.waveformFilename ? `/api/projects/${project.id}/media/waveform` : undefined}
             disabled={saving}
             onSeek={(frame) => { setPlaying(false); videoRef.current?.pause(); setCurrentFrame(frame); }}
+            onScrubChange={setScrubbing}
             onSectionsChange={setSections}
             onSectionsCommit={(next) => void commit(next, audio)}
           />
@@ -228,6 +247,23 @@ export function Editor({ initialProject, onBack, onProjectChange }: Props) {
         </aside>
       </div>
     </main>
+  );
+}
+
+function FrameStepIcon({ direction }: { direction: "previous" | "next" }) {
+  const path = direction === "previous"
+    ? "M5 4V20M18 4L5 12L18 20"
+    : "M19 4V20M6 4L19 12L6 20";
+  return <svg className="transport-icon frame-step-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d={path} /></svg>;
+}
+
+function PlayPauseIcon({ playing }: { playing: boolean }) {
+  return (
+    <svg className="transport-icon play-pause-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24">
+      {playing
+        ? <><rect x="7" y="5" width="3.5" height="14" rx="0.75" /><rect x="13.5" y="5" width="3.5" height="14" rx="0.75" /></>
+        : <path d="M7.5 4.5 19.5 12 7.5 19.5Z" />}
+    </svg>
   );
 }
 

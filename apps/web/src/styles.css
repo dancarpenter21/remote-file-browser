@@ -77,16 +77,32 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .exact-frame { pointer-events: none; background: #030405; }
 .transport { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 54px; }
 .transport button, .mark-controls button, .render-actions button, .job-progress button { padding: 8px 11px; color: #abb2be; background: #181b21; border: 1px solid var(--line); border-radius: 5px; cursor: pointer; font-size: 11px; }
-.transport .play-button { min-width: 72px; color: #111; background: #e9edf1; font-weight: 700; }
-.transport span { margin-left: 10px; color: #7e8794; font: 11px var(--mono); }
+.transport .frame-button { display: grid; place-items: center; width: 38px; padding: 6px 0; color: #d2d7df; }
+.transport .play-button { display: grid; place-items: center; width: 46px; min-width: 46px; padding: 6px 0; color: #111; background: #e9edf1; }
+.transport-icon { display: block; width: 20px; height: 20px; }
+.frame-step-icon { width: 23px; height: 23px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: square; stroke-linejoin: miter; }
+.play-pause-icon { fill: currentColor; }
+.transport-time { margin-left: 10px; color: #7e8794; font: 11px var(--mono); }
+.transport-frame { min-width: 82px; padding: 5px 8px; color: #c9d0da; background: #101319; border: 1px solid var(--line); border-radius: 4px; font: 10px var(--mono); font-variant-numeric: tabular-nums; text-align: center; }
+.playback-volume { display: flex; align-items: center; gap: 7px; margin-left: 12px; color: #7e8794; }
+.playback-volume svg { width: 17px; height: 17px; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
+.playback-volume .volume-body { fill: currentColor; stroke: none; }
+.playback-volume .volume-waves { fill: none; }
+.playback-volume input { width: 82px; accent-color: var(--accent); cursor: pointer; }
+.playback-volume output { min-width: 31px; font: 9px var(--mono); }
 .timeline-shell { border: 1px solid var(--line); background: #12151a; border-radius: 6px; }
 .timeline-toolbar { height: 35px; display: flex; align-items: center; gap: 18px; padding: 0 10px; border-bottom: 1px solid var(--line); color: #9fa6b1; font: 10px var(--mono); }
 .timeline-toolbar .frame-label { color: #656d79; }
 .timeline-toolbar label { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 .timeline-toolbar input { width: 88px; accent-color: var(--accent); }
 .timeline-scroll { overflow-x: auto; padding-bottom: 4px; }
-.timeline-track { position: relative; min-width: 100%; height: 104px; background-color: #101319; background-repeat: repeat-x; background-position: center; background-size: auto 78px; cursor: crosshair; }
+.timeline-track { position: relative; min-width: 100%; height: 104px; background-color: #101319; background-repeat: repeat-x; background-position: center; background-size: auto 78px; cursor: ew-resize; touch-action: none; user-select: none; }
+.timeline-track.is-scrubbing { cursor: grabbing; }
 .timeline-track::before { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, transparent 49.8%, rgba(255,255,255,.035) 50%, transparent 50.2%); background-size: 10% 100%; pointer-events: none; }
+.timeline-frame-preview { position: fixed; z-index: 50; overflow: hidden; width: 176px; transform: translateX(-50%); background: #090b0f; border: 1px solid #3a414d; border-radius: 5px; box-shadow: 0 10px 28px rgba(0,0,0,.55); pointer-events: none; }
+.timeline-frame-preview video { display: block; width: 176px; height: 99px; object-fit: contain; background: #030405; }
+.timeline-frame-preview div { display: flex; align-items: center; justify-content: space-between; height: 26px; padding: 0 7px; color: #798391; border-top: 1px solid #282e37; font: 9px var(--mono); font-variant-numeric: tabular-nums; }
+.timeline-frame-preview strong { color: #d7dce4; font-weight: 500; }
 .timeline-section { position: absolute; top: 15px; height: 74px; min-width: 4px; background: rgba(104,216,196,.28); border: 1px solid var(--accent-2); box-shadow: inset 0 0 0 1px rgba(0,0,0,.3); }
 .timeline-section.speed-0-25 { background: rgba(157,243,110,.25); border-color: var(--accent); }
 .timeline-section.speed-0-125 { background: rgba(255,191,105,.25); border-color: #ffbf69; }
