@@ -112,7 +112,7 @@ detected, set `RFB_DEV_POLLING=true`; the WSL template enables this by default.
 
 ### VFX Editor integration
 
-When the sibling `~/vfx-editor` application is running, Remote Files can expose it at the authenticated `/vfx/` path and add **Edit with VFX Editor** to video context menus. The selected source is streamed between the two backends and copied into VFX-owned storage; unchanged files reopen their existing project.
+When the sibling `~/vfx-editor` application is running, Remote Files can expose it at the authenticated `/vfx/` path and add **Edit with VFX Editor** to video context menus. The selected source is streamed between the two backends and copied into VFX-owned storage; unchanged files reopen their existing project. Completed exports are streamed back between the servers and written beside the original as `name-edited.mp4`, using a numeric suffix rather than overwriting an existing export.
 
 Start VFX Editor first so its external Docker network exists:
 

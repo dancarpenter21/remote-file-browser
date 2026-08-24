@@ -9,7 +9,7 @@ describe('VFX Editor launch', () => {
     await expect(launchVfxEditor('video-id', openWindow, importProject)).resolves.toEqual({ projectId: 'project id', reused: false })
     expect(openWindow).toHaveBeenCalledWith('/vfx/?handoff=1', '_blank')
     expect(importProject).toHaveBeenCalledWith('video-id')
-    expect(replace).toHaveBeenCalledWith('/vfx/?project=project%20id')
+    expect(replace).toHaveBeenCalledWith('/vfx/?project=project%20id&source=video-id')
   })
 
   it('does not import when the popup is blocked', async () => {

@@ -11,7 +11,7 @@ export async function launchVfxEditor(
   if (!editor) throw new Error('Allow popups for Remote Files to open VFX Editor.')
   try {
     const project = await importProject(id)
-    editor.location.replace(`/vfx/?project=${encodeURIComponent(project.projectId)}`)
+    editor.location.replace(`/vfx/?project=${encodeURIComponent(project.projectId)}&source=${encodeURIComponent(id)}`)
     return project
   } catch (error) {
     editor.close()

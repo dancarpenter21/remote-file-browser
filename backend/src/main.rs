@@ -25,6 +25,7 @@ use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use futures_util::StreamExt;
 use notify::{EventKind, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -237,6 +238,7 @@ type ApiResult<T> = Result<T, ApiError>;
         soft_delete,
         read_document,
         write_document,
+        save_image_markup,
         list_trash,
         empty_trash,
         restore_trash,
@@ -252,6 +254,7 @@ type ApiResult<T> = Result<T, ApiError>;
         request_cache_cleanup,
         auth_check,
         open_vfx_project,
+        save_vfx_export,
         create_terminal_ticket,
         terminal_websocket,
         hls_status,
@@ -283,6 +286,8 @@ type ApiResult<T> = Result<T, ApiError>;
         CacheCleanupReport,
         VfxProjectRequest,
         VfxProjectResponse,
+        VfxExportRequest,
+        VfxExportResponse,
         TerminalTicketRequest,
         TerminalTicketResponse
     )),
@@ -422,6 +427,7 @@ async fn main() {
         .route("/fs/operations", post(operation))
         .route("/fs/trash", post(soft_delete))
         .route("/editor/document", get(read_document).put(write_document))
+        .route("/editor/image-markup", post(save_image_markup))
         .route("/trash", get(list_trash).delete(empty_trash))
         .route("/trash/{id}/restore", post(restore_trash))
         .route("/trash/{id}", delete(purge_trash))
@@ -437,6 +443,7 @@ async fn main() {
         .route("/media/jobs", get(list_media_jobs))
         .route("/media/cache/cleanup", post(request_cache_cleanup))
         .route("/integrations/vfx/projects", post(open_vfx_project))
+        .route("/integrations/vfx/exports", post(save_vfx_export))
         .route("/terminal/tickets", post(create_terminal_ticket))
         .route("/terminal/ws", get(terminal_websocket))
         .route("/media/hls/{key}/status", get(hls_status))
@@ -1874,12 +1881,7 @@ async fn entry_from_path(state: &AppState, path: PathBuf) -> ApiResult<Entry> {
     } else {
         None
     };
-    let etag = format!(
-        "\"{:x}-{:x}-{:x}\"",
-        meta.ino(),
-        meta.len(),
-        meta.mtime_nsec() ^ meta.mtime()
-    );
+    let etag = metadata_etag(&meta);
     let id = encode_path(relative.as_os_str());
     let has_provenance = kind == "file"
         && state
@@ -2745,6 +2747,161 @@ async fn write_document(
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageMarkupQuery {
+    id: String,
+    expected_etag: String,
+}
+
+const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+fn metadata_etag(metadata: &std::fs::Metadata) -> String {
+    format!(
+        "\"{:x}-{:x}-{:x}\"",
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime_nsec() ^ metadata.mtime()
+    )
+}
+
+fn has_png_signature(signature: &[u8]) -> bool {
+    signature.starts_with(PNG_SIGNATURE)
+}
+
+async fn publish_image_markup_file(temporary: &Path, source: &Path) -> ApiResult<PathBuf> {
+    let directory = source
+        .parent()
+        .ok_or_else(|| ApiError::bad("invalid_path", "The source has no parent directory"))?;
+    let mut base = source
+        .file_stem()
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| OsStr::new("image"))
+        .to_os_string();
+    base.push("-markup");
+    for suffix in 1..=10_000 {
+        let mut name = base.clone();
+        if suffix > 1 {
+            name.push(format!("-{suffix}"));
+        }
+        name.push(".png");
+        let target = directory.join(name);
+        match fs::hard_link(temporary, &target).await {
+            Ok(()) => {
+                fs::remove_file(temporary).await?;
+                return Ok(target);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(ApiError::conflict(
+        "too_many_collisions",
+        "Could not choose a unique markup filename",
+    ))
+}
+
+#[utoipa::path(post, path = "/api/v1/editor/image-markup", tag = "editor", params(("id" = String, Query), ("expectedEtag" = String, Query), ("x-csrf-token" = String, Header)), request_body(content = String, content_type = "multipart/form-data", description = "PNG markup file field"), security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 201, body = Entry), (status = 400, body = Problem), (status = 409, body = Problem), (status = 413, body = Problem)))]
+async fn save_image_markup(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Query(query): Query<ImageMarkupQuery>,
+    mut multipart: Multipart,
+) -> ApiResult<(StatusCode, Json<Entry>)> {
+    require_csrf(&state, &jar, &headers)?;
+    let source = resolve_existing(&state.config, &query.id).await?;
+    let metadata = fs::symlink_metadata(&source).await?;
+    let mime = mime_guess::from_path(&source).first_or_octet_stream();
+    if !metadata.is_file() || mime.type_() != mime_guess::mime::IMAGE {
+        return Err(ApiError::bad(
+            "not_image",
+            "The markup source is no longer a regular image",
+        ));
+    }
+    if metadata_etag(&metadata) != query.expected_etag {
+        return Err(ApiError::conflict(
+            "image_changed",
+            "The source image changed after markup began",
+        ));
+    }
+    let directory = source
+        .parent()
+        .ok_or_else(|| ApiError::bad("invalid_path", "The source has no parent directory"))?;
+    let temporary = directory.join(format!(".rfb-image-markup-{}.png", Uuid::new_v4()));
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .await?;
+
+    let write_result: ApiResult<()> = async {
+        let mut field = multipart
+            .next_field()
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::bad("missing_markup", "No markup PNG was supplied"))?;
+        if field.name() != Some("file") {
+            return Err(ApiError::bad(
+                "missing_markup",
+                "The markup upload must use the file field",
+            ));
+        }
+        let mut written = 0u64;
+        let mut signature = Vec::with_capacity(PNG_SIGNATURE.len());
+        while let Some(chunk) = field.chunk().await.map_err(ApiError::internal)? {
+            written += chunk.len() as u64;
+            if written > state.config.upload_max {
+                return Err(ApiError(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "markup_too_large",
+                    "Markup exceeds the configured upload limit".into(),
+                ));
+            }
+            if signature.len() < PNG_SIGNATURE.len() {
+                let needed = PNG_SIGNATURE.len() - signature.len();
+                signature.extend_from_slice(&chunk[..chunk.len().min(needed)]);
+            }
+            output.write_all(&chunk).await?;
+        }
+        if !has_png_signature(&signature) {
+            return Err(ApiError::bad(
+                "invalid_markup",
+                "The markup upload is not a PNG image",
+            ));
+        }
+        output.flush().await?;
+        output.sync_all().await?;
+        Ok(())
+    }
+    .await;
+    drop(output);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary).await;
+        return Err(error);
+    }
+    if let Err(error) = fs::set_permissions(
+        &temporary,
+        std::fs::Permissions::from_mode(metadata.mode() & 0o777),
+    )
+    .await
+    {
+        let _ = fs::remove_file(&temporary).await;
+        return Err(error.into());
+    }
+    let target = match publish_image_markup_file(&temporary, &source).await {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+    };
+    Ok((
+        StatusCode::CREATED,
+        Json(entry_from_path(&state, target).await?),
+    ))
+}
+
+#[derive(Deserialize)]
 struct PreviewQuery {
     id: String,
     size: Option<String>,
@@ -2889,6 +3046,18 @@ struct VfxProblem {
     error: Option<String>,
 }
 
+fn vfx_integration_key(id: &str, metadata: &std::fs::Metadata) -> String {
+    let version = format!(
+        "\"{:x}-{:x}-{:x}\"",
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime_nsec() ^ metadata.mtime()
+    );
+    blake3::hash(format!("remote-file-browser\0{id}\0{version}").as_bytes())
+        .to_hex()
+        .to_string()
+}
+
 fn vfx_service_error(status: reqwest::StatusCode, problem: Option<VfxProblem>) -> ApiError {
     let message = problem
         .and_then(|value| value.error)
@@ -2938,16 +3107,7 @@ async fn open_vfx_project(
         ));
     }
 
-    let version = format!(
-        "\"{:x}-{:x}-{:x}\"",
-        metadata.ino(),
-        metadata.len(),
-        metadata.mtime_nsec() ^ metadata.mtime()
-    );
-    let integration_key =
-        blake3::hash(format!("remote-file-browser\0{}\0{}", input.id, version).as_bytes())
-            .to_hex()
-            .to_string();
+    let integration_key = vfx_integration_key(&input.id, &metadata);
     let endpoint =
         format!("{api_url}/api/integrations/remote-file-browser/projects/{integration_key}");
     let client = reqwest::Client::builder()
@@ -3012,6 +3172,187 @@ async fn open_vfx_project(
     Ok(Json(VfxProjectResponse {
         project_id: project.id,
         reused: false,
+    }))
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct VfxExportRequest {
+    id: String,
+    project_id: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct VfxExportResponse {
+    id: String,
+    name: String,
+}
+
+async fn publish_vfx_export_file(temporary: &Path, source: &Path) -> ApiResult<PathBuf> {
+    let directory = source
+        .parent()
+        .ok_or_else(|| ApiError::bad("invalid_path", "The source has no parent directory"))?;
+    let mut base = source
+        .file_stem()
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| OsStr::new("video"))
+        .to_os_string();
+    base.push("-edited");
+    for suffix in 1..=10_000 {
+        let mut name = base.clone();
+        if suffix > 1 {
+            name.push(format!("-{suffix}"));
+        }
+        name.push(".mp4");
+        let target = directory.join(name);
+        match fs::hard_link(temporary, &target).await {
+            Ok(()) => {
+                fs::remove_file(temporary).await?;
+                return Ok(target);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(ApiError::conflict(
+        "too_many_collisions",
+        "Could not choose a unique export filename",
+    ))
+}
+
+#[utoipa::path(post, path = "/api/v1/integrations/vfx/exports", tag = "media", params(("x-csrf-token" = String, Header)), request_body = VfxExportRequest, security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 200, body = VfxExportResponse), (status = 400, body = Problem), (status = 401, body = Problem), (status = 403, body = Problem), (status = 409, body = Problem), (status = 502, body = Problem), (status = 503, body = Problem)))]
+async fn save_vfx_export(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Json(input): Json<VfxExportRequest>,
+) -> ApiResult<Json<VfxExportResponse>> {
+    require_csrf(&state, &jar, &headers)?;
+    let api_url = state.config.vfx_editor_api_url.as_deref().ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "vfx_unavailable",
+            "VFX Editor is not configured".into(),
+        )
+    })?;
+    let source = resolve_existing(&state.config, &input.id).await?;
+    let metadata = fs::symlink_metadata(&source).await?;
+    if !metadata.is_file() {
+        return Err(ApiError::bad(
+            "not_video",
+            "The original source is no longer a regular file",
+        ));
+    }
+    let integration_key = vfx_integration_key(&input.id, &metadata);
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(ApiError::internal)?;
+    let lookup_endpoint =
+        format!("{api_url}/api/integrations/remote-file-browser/projects/{integration_key}");
+    let lookup = client.get(lookup_endpoint).send().await.map_err(|error| {
+        warn!(%error, "VFX Editor export validation failed");
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "vfx_unavailable",
+            "VFX Editor is unavailable".into(),
+        )
+    })?;
+    if !lookup.status().is_success() {
+        return Err(ApiError::conflict(
+            "vfx_source_changed",
+            "The original video changed after it was opened in VFX Editor",
+        ));
+    }
+    let project: VfxProject = lookup.json().await.map_err(ApiError::internal)?;
+    if project.id != input.project_id {
+        return Err(ApiError::forbidden(
+            "vfx_project_mismatch",
+            "The VFX project does not belong to this source video",
+        ));
+    }
+
+    let response = client
+        .get(format!(
+            "{api_url}/api/projects/{}/media/export",
+            input.project_id
+        ))
+        .send()
+        .await
+        .map_err(|error| {
+            warn!(%error, "VFX Editor export download failed");
+            ApiError(
+                StatusCode::BAD_GATEWAY,
+                "vfx_export_failed",
+                "Could not retrieve the completed VFX export".into(),
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            "vfx_export_failed",
+            "The completed VFX export is unavailable".into(),
+        ));
+    }
+
+    let directory = source
+        .parent()
+        .ok_or_else(|| ApiError::bad("invalid_path", "The source has no parent directory"))?;
+    let temporary = directory.join(format!(".rfb-vfx-export-{}.mp4", Uuid::new_v4()));
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .await?;
+    let write_result: ApiResult<()> = async {
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                warn!(%error, "VFX Editor export stream failed");
+                ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "vfx_export_failed",
+                    "The VFX export stream was interrupted".into(),
+                )
+            })?;
+            output.write_all(&chunk).await?;
+        }
+        output.flush().await?;
+        output.sync_all().await?;
+        Ok(())
+    }
+    .await;
+    drop(output);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary).await;
+        return Err(error);
+    }
+    if let Err(error) = fs::set_permissions(
+        &temporary,
+        std::fs::Permissions::from_mode(metadata.mode() & 0o777),
+    )
+    .await
+    {
+        let _ = fs::remove_file(&temporary).await;
+        return Err(error.into());
+    }
+    let target = match publish_vfx_export_file(&temporary, &source).await {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+    };
+    let relative = target
+        .strip_prefix(&state.config.root)
+        .map_err(ApiError::internal)?;
+    Ok(Json(VfxExportResponse {
+        id: encode_path(relative.as_os_str()),
+        name: target
+            .file_name()
+            .unwrap_or_else(|| OsStr::new("export.mp4"))
+            .to_string_lossy()
+            .into_owned(),
     }))
 }
 
@@ -4334,6 +4675,32 @@ async fn request_cache_cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
+
+    fn markup_request(id: &str, etag: &str, bytes: &[u8]) -> axum::http::Request<Body> {
+        let boundary = "rfb-markup-test-boundary";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"markup.png\"\r\nContent-Type: image/png\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let encoded_etag = format!("%22{}%22", etag.trim_matches('"'));
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/api/v1/editor/image-markup?id={id}&expectedEtag={encoded_etag}"
+            ))
+            .header(header::COOKIE, "rfb_session=session-token")
+            .header("x-csrf-token", "csrf-token")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap()
+    }
+
     fn test_state(root: &Path, token: Option<&str>) -> AppState {
         let cache = root.join(".cache/remote-file-browser");
         std::fs::create_dir_all(cache.join("hls")).unwrap();
@@ -4491,6 +4858,56 @@ mod tests {
             non_video,
             Err(ApiError(StatusCode::BAD_REQUEST, "not_video", _))
         ));
+    }
+    #[tokio::test]
+    async fn vfx_export_is_streamed_beside_its_verified_source() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mock = Router::new()
+            .route(
+                "/api/integrations/remote-file-browser/projects/{key}",
+                get(|| async { Json(serde_json::json!({ "id": "project-1" })) }),
+            )
+            .route(
+                "/api/projects/project-1/media/export",
+                get(|| async { ([(header::CONTENT_TYPE, "video/mp4")], b"final-video") }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("source.mov"), b"source-video").unwrap();
+        let mut state = test_state(root.path(), None);
+        Arc::get_mut(&mut state.config).unwrap().vfx_editor_api_url =
+            Some(format!("http://{address}"));
+        state.sessions.insert(
+            "session-token".into(),
+            Session {
+                csrf: "csrf-token".into(),
+                expires: SystemTime::now() + Duration::from_secs(60),
+            },
+        );
+        let jar = CookieJar::new().add(Cookie::new(SESSION_COOKIE, "session-token"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-csrf-token", "csrf-token".parse().unwrap());
+        let Json(published) = save_vfx_export(
+            State(state),
+            jar,
+            headers,
+            Json(VfxExportRequest {
+                id: encode_path(OsStr::new("source.mov")),
+                project_id: "project-1".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(published.name, "source-edited.mp4");
+        assert_eq!(published.id, encode_path(OsStr::new("source-edited.mp4")));
+        assert_eq!(
+            std::fs::read(root.path().join("source-edited.mp4")).unwrap(),
+            b"final-video"
+        );
+        server.abort();
     }
     #[test]
     fn terminal_messages_enforce_types_and_limits() {
@@ -4726,6 +5143,7 @@ mod tests {
             ("/api/v1/fs/operations", &["post"][..]),
             ("/api/v1/fs/trash", &["post"][..]),
             ("/api/v1/editor/document", &["get", "put"][..]),
+            ("/api/v1/editor/image-markup", &["post"][..]),
             ("/api/v1/trash", &["get", "delete"][..]),
             ("/api/v1/trash/{id}/restore", &["post"][..]),
             ("/api/v1/trash/{id}", &["delete"][..]),
@@ -5081,6 +5499,121 @@ mod tests {
         assert_eq!(std::fs::read(first).unwrap(), b"first");
         assert_eq!(std::fs::read(second).unwrap(), b"second");
         assert!(!first_temporary.exists() && !second_temporary.exists());
+    }
+    #[tokio::test]
+    async fn vfx_export_publication_uses_source_name_and_never_overwrites() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("original.mov");
+        std::fs::write(&source, b"source").unwrap();
+        let first_temporary = directory.path().join("first.tmp");
+        std::fs::write(&first_temporary, b"first").unwrap();
+        let first = publish_vfx_export_file(&first_temporary, &source)
+            .await
+            .unwrap();
+        let second_temporary = directory.path().join("second.tmp");
+        std::fs::write(&second_temporary, b"second").unwrap();
+        let second = publish_vfx_export_file(&second_temporary, &source)
+            .await
+            .unwrap();
+        assert_eq!(first.file_name().unwrap(), "original-edited.mp4");
+        assert_eq!(second.file_name().unwrap(), "original-edited-2.mp4");
+        assert_eq!(std::fs::read(first).unwrap(), b"first");
+        assert_eq!(std::fs::read(second).unwrap(), b"second");
+        assert!(!first_temporary.exists() && !second_temporary.exists());
+    }
+    #[tokio::test]
+    async fn image_markup_publication_uses_source_name_and_never_overwrites() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("reference.jpg");
+        std::fs::write(&source, b"source").unwrap();
+        let first_temporary = directory.path().join("first.tmp");
+        std::fs::write(&first_temporary, b"first").unwrap();
+        let first = publish_image_markup_file(&first_temporary, &source)
+            .await
+            .unwrap();
+        let second_temporary = directory.path().join("second.tmp");
+        std::fs::write(&second_temporary, b"second").unwrap();
+        let second = publish_image_markup_file(&second_temporary, &source)
+            .await
+            .unwrap();
+        assert_eq!(first.file_name().unwrap(), "reference-markup.png");
+        assert_eq!(second.file_name().unwrap(), "reference-markup-2.png");
+        assert_eq!(std::fs::read(first).unwrap(), b"first");
+        assert_eq!(std::fs::read(second).unwrap(), b"second");
+        assert!(!first_temporary.exists() && !second_temporary.exists());
+    }
+    #[test]
+    fn image_markup_requires_a_png_signature() {
+        assert!(has_png_signature(PNG_SIGNATURE));
+        assert!(has_png_signature(b"\x89PNG\r\n\x1a\nmore bytes"));
+        assert!(!has_png_signature(b"not a png"));
+        assert!(!has_png_signature(&PNG_SIGNATURE[..7]));
+    }
+    #[tokio::test]
+    async fn image_markup_endpoint_rejects_stale_or_invalid_uploads_and_saves_png() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("reference.jpg");
+        std::fs::write(&source, b"source image").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let state = test_state(root.path(), None);
+        state.sessions.insert(
+            "session-token".into(),
+            Session {
+                csrf: "csrf-token".into(),
+                expires: SystemTime::now() + Duration::from_secs(60),
+            },
+        );
+        let app = Router::new()
+            .route("/api/v1/editor/image-markup", post(save_image_markup))
+            .with_state(state);
+        let etag = metadata_etag(&std::fs::metadata(&source).unwrap());
+        let source_id = encode_path(OsStr::new("reference.jpg"));
+
+        let stale = app
+            .clone()
+            .oneshot(markup_request(&source_id, "stale", PNG_SIGNATURE))
+            .await
+            .unwrap();
+        let stale_status = stale.status();
+        let stale_body = axum::body::to_bytes(stale.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            stale_status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&stale_body)
+        );
+        let invalid = app
+            .clone()
+            .oneshot(markup_request(&source_id, &etag, b"not a png"))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !std::fs::read_dir(root.path())
+                .unwrap()
+                .flatten()
+                .any(|item| item
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".rfb-image-markup-"))
+        );
+
+        let mut png = PNG_SIGNATURE.to_vec();
+        png.extend_from_slice(b"markup payload");
+        let saved = app
+            .oneshot(markup_request(&source_id, &etag, &png))
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::CREATED);
+        let target = root.path().join("reference-markup.png");
+        assert_eq!(std::fs::read(&target).unwrap(), png);
+        assert_eq!(
+            std::fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read(source).unwrap(), b"source image");
     }
     #[test]
     fn playlist_requires_segments_and_endlist_to_be_ready() {

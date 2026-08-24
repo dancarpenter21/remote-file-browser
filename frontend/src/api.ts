@@ -96,6 +96,10 @@ export const api = {
   trash: (ids: string[]) => request<void>('/fs/trash', { method: 'POST', body: JSON.stringify({ ids }) }),
   readDocument: (id: string) => request<DocumentFile>(`/editor/document?id=${encodeURIComponent(id)}`),
   saveDocument: (document: DocumentFile) => request<DocumentFile>('/editor/document', { method: 'PUT', body: JSON.stringify({ id: document.id, content: document.content, expectedEtag: document.etag }) }),
+  saveImageMarkup: (id: string, expectedEtag: string, png: Blob) => {
+    const body = new FormData(); body.append('file', png, 'markup.png')
+    return request<Entry>(`/editor/image-markup?id=${encodeURIComponent(id)}&expectedEtag=${encodeURIComponent(expectedEtag)}`, { method: 'POST', body })
+  },
   listTrash: () => request<TrashEntry[]>('/trash'),
   restore: (id: string, destinationId?: string, replace = false) => request<Entry>(`/trash/${id}/restore`, { method: 'POST', body: JSON.stringify({ destinationId, replace }) }),
   purge: (id: string) => request<void>(`/trash/${id}`, { method: 'DELETE' }),

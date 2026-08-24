@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createContext, forwardRef, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import CodeMirror from '@uiw/react-codemirror'
 import { markdown } from '@codemirror/lang-markdown'
@@ -8,9 +8,9 @@ import remarkGfm from 'remark-gfm'
 import rehypeSanitize from 'rehype-sanitize'
 import Hls from 'hls.js'
 import {
-  Camera, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
-  Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal, Play,
-  ExternalLink, Link2, Minus, Plus, RefreshCw, RotateCw, Save, Scissors, Search, SquareTerminal, Trash2, Upload, WrapText, X, ZoomIn, ZoomOut,
+  Camera, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Download, Edit3, Eraser, Eye, File, FileImage, FileText,
+  Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal, Pencil, Play,
+  ExternalLink, Link2, Minus, Plus, RefreshCw, RotateCw, Save, Scissors, Search, SquareTerminal, Trash2, Undo2, Upload, WrapText, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import { api, ApiFailure, CacheCleanupReport, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, ExtractionJob, LiveEvent, liveEventsUrl, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { deleteConfirmationMessage } from './deleteConfirmation'
@@ -25,6 +25,7 @@ import { TerminalDock } from './TerminalDock'
 import { ClipboardOperation, RemoteClipboard, clipboardIdsForEntry, clipboardShortcut, movableClipboardIds, pasteProblem, shouldHandleClipboardShortcut } from './fileClipboard'
 import { markdownSanitizeSchema, markdownUrlTransform, resolveMarkdownImageSource } from './markdownPreview'
 import { launchVfxEditor } from './vfxLaunch'
+import { canvasPng, drawMarkupStroke, MarkupStroke, markupPoint, markupStrokeWidth } from './imageMarkup'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type EditorMode = 'edit' | 'split' | 'preview'
@@ -493,6 +494,9 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     </div>
     {editor && <EditorWindow document={editor} onClose={() => setEditor(null)} onSaved={setEditor} />}
     {viewer && <ViewerWindow {...viewer} images={viewerImages} onNavigate={entry => {
+      setViewer({ entry, type: 'image' }); setSelected(new Set([entry.id])); setPrimary(entry)
+    }} onMarkupSaved={async entry => {
+      await refresh(entry.parentId)
       setViewer({ entry, type: 'image' }); setSelected(new Set([entry.id])); setPrimary(entry)
     }} onClose={() => setViewer(null)} />}
     {trash && <TrashWindow items={trash} onClose={() => setTrash(null)} onChanged={async () => setTrash(await api.listTrash())} onRestored={entry => refresh(entry.parentId)} setError={setError} />}
@@ -1051,18 +1055,34 @@ function EditorWindow({ document, onClose, onSaved }: { document: DocumentFile; 
   </FloatingWindow>
 }
 
-function ViewerWindow({ entry, type, images, onNavigate, onClose }: { entry: Entry; type: 'image' | 'video'; images: Entry[]; onNavigate: (entry: Entry) => void; onClose: () => void }) {
+function ViewerWindow({ entry, type, images, onNavigate, onMarkupSaved, onClose }: { entry: Entry; type: 'image' | 'video'; images: Entry[]; onNavigate: (entry: Entry) => void; onMarkupSaved: (entry: Entry) => Promise<void>; onClose: () => void }) {
+  const confirmAction = useConfirm()
   const [zoom, setZoom] = useState(1)
   const [rotate, setRotate] = useState(0)
   const [mediaDimensions, setMediaDimensions] = useState<{ width: number; height: number }>()
   const [viewport, setViewport] = useState(() => ({ width: innerWidth, height: innerHeight }))
+  const [marking, setMarking] = useState(false)
+  const [strokes, setStrokes] = useState<MarkupStroke[]>([])
+  const [markupReady, setMarkupReady] = useState(false)
+  const [savingMarkup, setSavingMarkup] = useState(false)
+  const [markupMessage, setMarkupMessage] = useState('')
+  const markupCanvas = useRef<HTMLCanvasElement>(null)
   const imageIndex = images.findIndex(image => image.id === entry.id)
-  const navigate = useCallback((direction: -1 | 1) => {
+  const discardMarkup = useCallback(async () => {
+    if (savingMarkup) { setMarkupMessage('Wait for the markup to finish saving.'); return false }
+    if (marking && strokes.length && !await confirmAction('Your unsaved markup will be lost.', { title: 'Discard markup?', confirmLabel: 'Discard', danger: true })) return false
+    setMarking(false); setStrokes([]); setMarkupReady(false); setMarkupMessage('')
+    return true
+  }, [confirmAction, marking, savingMarkup, strokes.length])
+  const navigate = useCallback(async (direction: -1 | 1) => {
     if (images.length < 2) return
+    if (!await discardMarkup()) return
     const current = imageIndex >= 0 ? imageIndex : 0
     onNavigate(images[(current + direction + images.length) % images.length])
-  }, [imageIndex, images, onNavigate])
-  useEffect(() => { setZoom(1); setRotate(0); setMediaDimensions(undefined) }, [entry.etag, entry.id])
+  }, [discardMarkup, imageIndex, images, onNavigate])
+  useEffect(() => {
+    setZoom(1); setRotate(0); setMediaDimensions(undefined); setMarking(false); setStrokes([]); setMarkupReady(false); setSavingMarkup(false); setMarkupMessage('')
+  }, [entry.etag, entry.id])
   useEffect(() => {
     const resized = () => setViewport({ width: innerWidth, height: innerHeight })
     addEventListener('resize', resized)
@@ -1071,32 +1091,123 @@ function ViewerWindow({ entry, type, images, onNavigate, onClose }: { entry: Ent
   useEffect(() => {
     if (type !== 'image') return
     const keyboard = (event: KeyboardEvent) => {
+      if (marking) {
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
+          event.preventDefault(); event.stopPropagation(); setStrokes(current => current.slice(0, -1))
+        }
+        return
+      }
       if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
       event.preventDefault(); event.stopPropagation()
-      navigate(event.key === 'ArrowLeft' ? -1 : 1)
+      void navigate(event.key === 'ArrowLeft' ? -1 : 1)
     }
     addEventListener('keydown', keyboard, { capture: true })
     return () => removeEventListener('keydown', keyboard, { capture: true })
-  }, [navigate, type])
+  }, [marking, navigate, type])
+  const toggleMarkup = async () => {
+    if (marking) { await discardMarkup(); return }
+    setRotate(0); setStrokes([]); setMarkupMessage(''); setMarking(true)
+  }
+  const saveMarkup = async () => {
+    if (!markupCanvas.current || !strokes.length) return
+    setSavingMarkup(true); setMarkupMessage('')
+    try {
+      const saved = await api.saveImageMarkup(entry.id, entry.etag, await canvasPng(markupCanvas.current))
+      setStrokes([]); setMarking(false); setMarkupMessage(`Saved ${saved.name}`)
+      await onMarkupSaved(saved)
+    } catch (error) { setMarkupMessage(messageOf(error)) } finally { setSavingMarkup(false) }
+  }
+  const requestClose = async () => { if (await discardMarkup()) onClose() }
   const compact = viewport.width <= 800
   const windowSize = mediaDimensions && fitMediaWindow(
     mediaDimensions.width,
     mediaDimensions.height,
     Math.max(320, viewport.width - (compact ? 20 : 48)),
     Math.max(260, viewport.height - (compact ? 80 : 48)),
-    type === 'image' ? 81 : 110,
+    type === 'image' ? (marking ? 123 : 81) : 110,
   )
-  return <FloatingWindow title={entry.name} onClose={onClose} className="viewer-window" size={windowSize}>
+  return <FloatingWindow title={entry.name} onClose={() => void requestClose()} className={`viewer-window ${marking ? 'marking' : ''}`} size={windowSize}>
     {type === 'image' ? <>
-      <div className="window-toolbar"><button onClick={() => setZoom(z => Math.max(.25, z - .25))}><ZoomOut /></button><span>{Math.round(zoom * 100)}%</span><button onClick={() => setZoom(z => Math.min(5, z + .25))}><ZoomIn /></button><button onClick={() => setRotate(r => r + 90)}><RotateCw /></button><a className="button" href={contentUrl(entry.id)}><Download /> Download</a></div>
-      <div className="image-stage">
-        <button className="image-nav previous" disabled={images.length < 2} aria-label="Previous image" title="Previous image (Left Arrow)" onClick={() => navigate(-1)}><ChevronLeft /></button>
-        <img src={mediaUrl(entry.id, entry.etag)} alt={entry.name} style={{ transform: `scale(${zoom}) rotate(${rotate}deg)` }} onLoad={event => setMediaDimensions({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} />
-        <button className="image-nav next" disabled={images.length < 2} aria-label="Next image" title="Next image (Right Arrow)" onClick={() => navigate(1)}><ChevronRight /></button>
+      <div className="window-toolbar image-toolbar"><button onClick={() => setZoom(z => Math.max(.25, z - .25))}><ZoomOut /></button><span>{Math.round(zoom * 100)}%</span><button onClick={() => setZoom(z => Math.min(5, z + .25))}><ZoomIn /></button><button disabled={marking} title={marking ? 'Rotation is unavailable while marking up' : 'Rotate clockwise'} onClick={() => setRotate(r => r + 90)}><RotateCw /></button><button className={marking ? 'active' : ''} aria-pressed={marking} disabled={!mediaDimensions} title={marking ? 'Leave markup mode' : 'Mark up image'} onClick={() => void toggleMarkup()}><Pencil /> Mark up</button>
+        {marking && <><button disabled={!strokes.length || savingMarkup} title="Undo last stroke (Ctrl/Cmd+Z)" onClick={() => setStrokes(current => current.slice(0, -1))}><Undo2 /> Undo</button><button disabled={!strokes.length || savingMarkup} onClick={() => setStrokes([])}><Eraser /> Clear</button><button className="primary compact" disabled={!strokes.length || !markupReady || savingMarkup} onClick={() => void saveMarkup()}><Save /> {savingMarkup ? 'Saving…' : 'Save'}</button></>}
+        {markupMessage && <span className="markup-message" role="status">{markupMessage}</span>}<span className="toolbar-spacer" /><a className="button" href={contentUrl(entry.id)}><Download /> Download</a></div>
+      <div className={`image-stage ${marking ? 'marking' : ''}`}>
+        <button className="image-nav previous" disabled={marking || images.length < 2} aria-label="Previous image" title="Previous image (Left Arrow)" onClick={() => void navigate(-1)}><ChevronLeft /></button>
+        {marking ? <ImageMarkupCanvas ref={markupCanvas} entry={entry} zoom={zoom} strokes={strokes} setStrokes={setStrokes} onDimensions={(width, height) => setMediaDimensions({ width, height })} onReady={setMarkupReady} onError={setMarkupMessage} /> :
+          <img src={mediaUrl(entry.id, entry.etag)} alt={entry.name} style={{ transform: `scale(${zoom}) rotate(${rotate}deg)` }} onLoad={event => setMediaDimensions({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} />}
+        <button className="image-nav next" disabled={marking || images.length < 2} aria-label="Next image" title="Next image (Right Arrow)" onClick={() => void navigate(1)}><ChevronRight /></button>
       </div>
     </> : <VideoPlayer entry={entry} editing onMediaSize={(width, height) => setMediaDimensions({ width, height })} />}
   </FloatingWindow>
 }
+
+const ImageMarkupCanvas = forwardRef<HTMLCanvasElement, { entry: Entry; zoom: number; strokes: MarkupStroke[]; setStrokes: React.Dispatch<React.SetStateAction<MarkupStroke[]>>; onDimensions: (width: number, height: number) => void; onReady: (ready: boolean) => void; onError: (message: string) => void }>(function ImageMarkupCanvas({ entry, zoom, strokes, setStrokes, onDimensions, onReady, onError }, forwardedRef) {
+  const localCanvas = useRef<HTMLCanvasElement>(null)
+  const sourceImage = useRef<HTMLImageElement | null>(null)
+  const activeStroke = useRef<{ pointerId: number; stroke: MarkupStroke } | null>(null)
+  const assignCanvas = (canvas: HTMLCanvasElement | null) => {
+    localCanvas.current = canvas
+    if (typeof forwardedRef === 'function') forwardedRef(canvas)
+    else if (forwardedRef) forwardedRef.current = canvas
+  }
+  const paint = (nextStrokes: MarkupStroke[]) => {
+    const canvas = localCanvas.current
+    const image = sourceImage.current
+    const context = canvas?.getContext('2d')
+    if (!canvas || !image || !context) return
+    context.clearRect(0, 0, canvas.width, canvas.height)
+    context.drawImage(image, 0, 0, canvas.width, canvas.height)
+    const lineWidth = markupStrokeWidth(canvas.width, canvas.height)
+    nextStrokes.forEach(stroke => drawMarkupStroke(context, stroke, lineWidth))
+  }
+  useEffect(() => {
+    let cancelled = false
+    onReady(false); onError('')
+    const image = new Image()
+    image.onload = () => {
+      if (cancelled || !localCanvas.current) return
+      const canvas = localCanvas.current
+      canvas.width = image.naturalWidth; canvas.height = image.naturalHeight
+      sourceImage.current = image
+      onDimensions(image.naturalWidth, image.naturalHeight)
+      paint(strokes); onReady(true)
+    }
+    image.onerror = () => { if (!cancelled) { onReady(false); onError('The source image could not be loaded for markup.') } }
+    image.src = mediaUrl(entry.id, entry.etag)
+    return () => { cancelled = true; sourceImage.current = null; activeStroke.current = null }
+  }, [entry.etag, entry.id])
+  useEffect(() => { paint(strokes) }, [strokes])
+  const pointFor = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    const canvas = event.currentTarget
+    return markupPoint(event.clientX, event.clientY, canvas.getBoundingClientRect(), canvas.width, canvas.height)
+  }
+  const start = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (event.button !== 0 || activeStroke.current || !sourceImage.current) return
+    event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId)
+    const stroke = { points: [pointFor(event)] }
+    activeStroke.current = { pointerId: event.pointerId, stroke }
+    const context = event.currentTarget.getContext('2d')
+    if (context) drawMarkupStroke(context, stroke, markupStrokeWidth(event.currentTarget.width, event.currentTarget.height))
+  }
+  const move = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    const active = activeStroke.current
+    if (!active || active.pointerId !== event.pointerId) return
+    event.preventDefault()
+    const point = pointFor(event)
+    const previous = active.stroke.points.at(-1)!
+    active.stroke.points.push(point)
+    const context = event.currentTarget.getContext('2d')
+    if (context) drawMarkupStroke(context, { points: [previous, point] }, markupStrokeWidth(event.currentTarget.width, event.currentTarget.height))
+  }
+  const finish = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    const active = activeStroke.current
+    if (!active || active.pointerId !== event.pointerId) return
+    activeStroke.current = null
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+    setStrokes(current => [...current, active.stroke])
+  }
+  return <canvas ref={assignCanvas} className="markup-canvas" aria-label={`Mark up ${entry.name}`} style={{ transform: `scale(${zoom})` }} onPointerDown={start} onPointerMove={move} onPointerUp={finish} onPointerCancel={finish} />
+})
 
 function VideoPlayer({ entry, autoPlay = true, editing = false, onMediaSize }: { entry: Entry; autoPlay?: boolean; editing?: boolean; onMediaSize?: (width: number, height: number) => void }) {
   const videoRef = useRef<HTMLVideoElement>(null)
