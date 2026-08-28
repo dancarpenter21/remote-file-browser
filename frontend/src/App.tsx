@@ -12,7 +12,7 @@ import {
   Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal, Pencil, Play,
   ExternalLink, Link2, Minus, Plus, RefreshCw, RotateCw, Save, Scissors, Search, SquareTerminal, Trash2, Undo2, Upload, WrapText, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
-import { api, ApiFailure, CacheCleanupReport, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, ExtractionJob, LiveEvent, liveEventsUrl, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
+import { api, ApiFailure, CacheCleanupReport, ConcatenationJob, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, ExtractionJob, LiveEvent, liveEventsUrl, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { deleteConfirmationMessage } from './deleteConfirmation'
 import { updateFinderPathForSelection } from './finderPath'
 import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState'
@@ -340,6 +340,15 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   }
   const deleteSelected = () => deleteItems(Array.from(selected))
   const deleteEntry = (entry: Entry) => deleteItems(selected.has(entry.id) ? Array.from(selected) : [entry.id])
+  const concatenateVideos = async (entries: Entry[]) => {
+    const first = entries[0]
+    if (!first) return
+    const stem = first.name.replace(/\.[^.]+$/, '') || 'videos'
+    const outputName = await promptAction({ title: 'Concatenate videos', label: 'Output filename', initialValue: `${stem}-concatenated.mp4`, submitLabel: 'Concatenate' })
+    if (!outputName) return
+    try { await api.startConcatenation(entries.map(entry => entry.id), outputName); setError('') }
+    catch (error) { setError(messageOf(error)) }
+  }
   const stageClipboard = (operation: ClipboardOperation, target?: Entry) => {
     const ids = target ? clipboardIdsForEntry(target.id, selected) : Array.from(selected)
     if (!ids.length) return
@@ -485,8 +494,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         {error && <div className="banner error"><span>{error}</span><button onClick={() => setError('')}><X size={15} /></button></div>}
         <div className="browser-body"><div className="browser-view" onContextMenu={view === 'details' ? undefined : event => showFolderMenu(event, currentDir, columnPath.at(-1)?.path ?? '/fs-root')}>
           {!root ? <div className="center"><span className="spinner" /></div> : view === 'details' ?
-            <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} cutIds={cutIds} primary={primary} defaultColumnWidth={defaultColumnWidth} columnWidths={columnWidths} setColumnWidth={(key, width) => setColumnWidths(previous => ({ ...previous, [key]: width }))} navigate={navigateColumn} loadDirectory={loadDirectory} selectItems={selectColumnItems} selectDragItems={(ids, entry) => { setSelected(ids); setPrimary(entry) }} selectParent={selectParentColumn} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showFolderMenu={showFolderMenu} showProperties={entry => showProperties(entry.id, entry)} setError={setError} /> :
-            !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view={view} selected={selected} cutIds={cutIds} setSelected={setSelected} setPrimary={setPrimary} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showProperties={entry => showProperties(entry.id, entry)} setError={setError} />}
+            <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} cutIds={cutIds} primary={primary} defaultColumnWidth={defaultColumnWidth} columnWidths={columnWidths} setColumnWidth={(key, width) => setColumnWidths(previous => ({ ...previous, [key]: width }))} navigate={navigateColumn} loadDirectory={loadDirectory} selectItems={selectColumnItems} selectDragItems={(ids, entry) => { setSelected(ids); setPrimary(entry) }} selectParent={selectParentColumn} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showFolderMenu={showFolderMenu} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} /> :
+            !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view={view} selected={selected} cutIds={cutIds} setSelected={setSelected} setPrimary={setPrimary} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} />}
         </div>{showPreview && <ColumnPreview entries={previewEntries} primary={primary} />}</div>
         </main>
         {terminal && <TerminalDock directoryId={terminal.directoryId} hidden={terminal.hidden} onHide={() => setTerminal(current => current && ({ ...current, hidden: true }))} onClose={() => setTerminal(null)} />}
@@ -509,6 +518,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
 function ConversionJobs() {
   const [jobs, setJobs] = useState<ConversionJob[]>([])
   const [extractions, setExtractions] = useState<ExtractionJob[]>([])
+  const [concatenations, setConcatenations] = useState<ConcatenationJob[]>([])
   const [cleaning, setCleaning] = useState(false)
   const [cleanupReport, setCleanupReport] = useState<CacheCleanupReport>()
   const [cleanupError, setCleanupError] = useState('')
@@ -520,11 +530,11 @@ function ConversionJobs() {
     const refresh = () => {
       const request = ++refreshRevision
       const revision = liveRevision
-      return Promise.all([api.conversionJobs(), api.extractionJobs()]).then(([nextJobs, nextExtractions]) => {
+      return Promise.all([api.conversionJobs(), api.extractionJobs(), api.concatenationJobs()]).then(([nextJobs, nextExtractions, nextConcatenations]) => {
         if (active && request === refreshRevision && revision === liveRevision) {
           const becamePlayable = nextJobs.some(job => job.playable && !playableJobs.current[job.key])
           playableJobs.current = Object.fromEntries(nextJobs.map(job => [job.key, job.playable]))
-          setJobs(nextJobs); setExtractions(nextExtractions)
+          setJobs(nextJobs); setExtractions(nextExtractions); setConcatenations(nextConcatenations)
           if (becamePlayable) dispatchEvent(new Event('rfb:video-ready'))
         }
       }).catch(() => {})
@@ -535,7 +545,7 @@ function ConversionJobs() {
       if (event.type === 'mediaSnapshot') {
         const becamePlayable = event.jobs.some(job => job.playable && !playableJobs.current[job.key])
         playableJobs.current = Object.fromEntries(event.jobs.map(job => [job.key, job.playable]))
-        setJobs(event.jobs); setExtractions(event.extractions)
+        setJobs(event.jobs); setExtractions(event.extractions); setConcatenations(event.concatenations)
         if (becamePlayable) dispatchEvent(new Event('rfb:video-ready'))
       } else if (event.type === 'mediaJob') {
         const becamePlayable = event.job.playable && !playableJobs.current[event.job.key]
@@ -544,6 +554,8 @@ function ConversionJobs() {
         if (becamePlayable) dispatchEvent(new Event('rfb:video-ready'))
       } else if (event.type === 'extractionJob') {
         setExtractions(previous => upsertJob(previous, event.job))
+      } else if (event.type === 'concatenationJob') {
+        setConcatenations(previous => upsertJob(previous, event.job))
       } else if (event.type === 'cacheCleanup') {
         setCleaning(event.state === 'started')
         if (event.report) { setCleanupReport(event.report); setCleanupError('') }
@@ -561,12 +573,15 @@ function ConversionJobs() {
     catch (error) { setCleanupError(messageOf(error)) }
     finally { setCleaning(false) }
   }
-  const working = cleaning || jobs.some(job => job.status === 'working') || extractions.some(job => job.status === 'working')
+  const working = cleaning || jobs.some(job => job.status === 'working') || extractions.some(job => job.status === 'working') || concatenations.some(job => job.status === 'working')
   const progressLabel = (progress: number | null) => `${progressPercent(progress)}%`
   return <div className="conversion-jobs" aria-label="Media jobs">
     <div className="conversion-jobs-heading"><Film /> <span>Media jobs</span>{working && <span className="conversion-pulse" title="Media work in progress" />}<button className="cache-cleanup" disabled={cleaning} title="Reconcile and clean stale media cache" aria-label="Clean stale media cache" onClick={() => void cleanup()}><RefreshCw /></button></div>
     <div className="conversion-job-list">
-      {jobs.length === 0 && extractions.length === 0 ? <p>No media jobs yet.</p> : <>{extractions.map(job => <div className={`conversion-job ${job.status}`} key={`extract-${job.key}`} title={job.fileName}>
+      {jobs.length === 0 && extractions.length === 0 && concatenations.length === 0 ? <p>No media jobs yet.</p> : <>{concatenations.map(job => <div className={`conversion-job ${job.status}`} key={`concat-${job.key}`} title={job.fileName}>
+        <span className="conversion-status" aria-label={job.status} />
+        <div><strong>{job.result?.name ?? job.fileName}</strong><small>{job.status === 'failed' ? job.error ?? 'Concatenation failed' : `Concatenating videos${job.status === 'ready' ? ' complete' : ` · ${progressLabel(job.progress)}`}`}</small>{job.status === 'working' && <progress max={1} value={job.progress ?? 0} aria-label={`Concatenation ${progressLabel(job.progress)}`} />}</div>
+      </div>)}{extractions.map(job => <div className={`conversion-job ${job.status}`} key={`extract-${job.key}`} title={job.fileName}>
         <span className="conversion-status" aria-label={job.status} />
         <div><strong>{job.result?.name ?? job.fileName}</strong><small>{job.status === 'failed' ? job.error ?? 'Extraction failed' : `${job.kind === 'frame' ? 'Frame extraction' : 'Clip extraction'}${job.status === 'ready' ? ' complete' : job.progress === null ? '…' : ` · ${progressLabel(job.progress)}`}`}</small>{job.status === 'working' && job.progress !== null && <progress max={1} value={job.progress} aria-label={`Clip extraction ${progressLabel(job.progress)}`} />}</div>
       </div>)}{jobs.map(job => <div className={`conversion-job ${job.status}`} key={job.key} title={job.fileName}>
@@ -580,7 +595,7 @@ function ConversionJobs() {
 }
 
 type BrowserColumn = { directoryId: string; page?: EntryPage; label: string }
-function ColumnBrowser({ root, path, pages, filter, selected, cutIds, primary, defaultColumnWidth, columnWidths, setColumnWidth, navigate, loadDirectory, selectItems, selectDragItems, selectParent, activate, renameEntry, moveEntries, deleteEntry, stageClipboard, pasteInto, hasClipboard, showFolderMenu, showProperties, setError }: {
+function ColumnBrowser({ root, path, pages, filter, selected, cutIds, primary, defaultColumnWidth, columnWidths, setColumnWidth, navigate, loadDirectory, selectItems, selectDragItems, selectParent, activate, renameEntry, moveEntries, deleteEntry, stageClipboard, pasteInto, hasClipboard, showFolderMenu, showProperties, concatenateVideos, setError }: {
   root: EntryPage; path: Entry[]; pages: Record<string, EntryPage>; filter: string; selected: Set<string>; cutIds: Set<string>; primary: Entry | null
   defaultColumnWidth: number; columnWidths: Record<string, number>; setColumnWidth: (key: string, width: number) => void
   navigate: (entry: Entry, columnIndex: number) => Promise<void>; loadDirectory: (entry: Entry) => Promise<boolean>
@@ -589,7 +604,7 @@ function ColumnBrowser({ root, path, pages, filter, selected, cutIds, primary, d
   activate: (entry: Entry) => void; renameEntry: (entry: Entry) => Promise<void>; moveEntries: (ids: string[], destinationId: string, requireConfirmation?: boolean) => Promise<boolean>
   stageClipboard: (operation: ClipboardOperation, entry: Entry) => void; pasteInto: (entry: Entry) => Promise<void>; hasClipboard: boolean
   deleteEntry: (entry: Entry) => Promise<void>; showFolderMenu: (event: React.MouseEvent, directoryId: string, path: string) => void
-  showProperties: (entry: Entry) => void; setError: (message: string) => void
+  showProperties: (entry: Entry) => void; concatenateVideos: (entries: Entry[]) => Promise<void>; setError: (message: string) => void
 }) {
   const [dragPath, setDragPath] = useState<Entry[] | null>(null)
   const visiblePath = dragPath ?? path
@@ -747,7 +762,7 @@ function ColumnBrowser({ root, path, pages, filter, selected, cutIds, primary, d
         <div className="column-resizer" role="separator" aria-orientation="vertical" aria-label={`Resize ${column.label} column`} title="Resize column" onPointerDown={event => startResize(event, targetKey, width)} />
       </div>
     })}
-    {menu && <ContextMenu entry={menu.entry} x={menu.x} y={menu.y} close={() => setMenu(null)} open={() => menu.entry.kind === 'directory' ? void navigate(menu.entry, menu.columnIndex) : activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={pasteInto} hasClipboard={hasClipboard} showProperties={showProperties} setError={setError} />}
+    {menu && <ContextMenu entry={menu.entry} selectedEntries={(columns[menu.columnIndex].page?.entries ?? []).filter(entry => selected.has(entry.id))} x={menu.x} y={menu.y} close={() => setMenu(null)} open={() => menu.entry.kind === 'directory' ? void navigate(menu.entry, menu.columnIndex) : activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={pasteInto} hasClipboard={hasClipboard} showProperties={showProperties} concatenateVideos={concatenateVideos} setError={setError} />}
   </div>
 }
 
@@ -798,12 +813,12 @@ function ProvenanceEditor({ entry }: { entry: Entry }) {
 
 type Row = { entry: Entry; depth: number }
 
-function FileList({ rows, view, selected, cutIds, setSelected, setPrimary, activate, renameEntry, moveEntries, deleteEntry, stageClipboard, pasteInto, hasClipboard, showProperties, setError }: {
+function FileList({ rows, view, selected, cutIds, setSelected, setPrimary, activate, renameEntry, moveEntries, deleteEntry, stageClipboard, pasteInto, hasClipboard, showProperties, concatenateVideos, setError }: {
   rows: Row[]; view: ViewMode; selected: Set<string>; cutIds: Set<string>; setSelected: (value: Set<string>) => void; setPrimary: (entry: Entry | null) => void
   activate: (entry: Entry) => void; renameEntry: (entry: Entry) => Promise<void>
   moveEntries: (ids: string[], destinationId: string) => Promise<boolean>
   stageClipboard: (operation: ClipboardOperation, entry: Entry) => void; pasteInto: (entry: Entry) => Promise<void>; hasClipboard: boolean
-  deleteEntry: (entry: Entry) => Promise<void>; showProperties: (entry: Entry) => void; setError: (message: string) => void
+  deleteEntry: (entry: Entry) => Promise<void>; showProperties: (entry: Entry) => void; concatenateVideos: (entries: Entry[]) => Promise<void>; setError: (message: string) => void
 }) {
   const [menu, setMenu] = useState<{ entry: Entry; x: number; y: number } | null>(null)
   const [dropTarget, setDropTarget] = useState<string | null>(null)
@@ -857,7 +872,7 @@ function FileList({ rows, view, selected, cutIds, setSelected, setPrimary, activ
       void moveEntries(ids, entry.id)
     },
   })
-  const contextMenu = menu && <ContextMenu {...menu} close={() => setMenu(null)} open={() => activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={pasteInto} hasClipboard={hasClipboard} showProperties={showProperties} setError={setError} />
+  const contextMenu = menu && <ContextMenu {...menu} selectedEntries={rows.map(row => row.entry).filter(entry => selected.has(entry.id))} close={() => setMenu(null)} open={() => activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={pasteInto} hasClipboard={hasClipboard} showProperties={showProperties} concatenateVideos={concatenateVideos} setError={setError} />
   return <div className={`preview-list ${view}`}>
     {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => selectEntry(entry, index, event)} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
       <button className="card-menu" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>
@@ -891,7 +906,7 @@ function PositionedContextMenu({ x, y, children }: { x: number; y: number; child
   return <div ref={menuRef} className="context-menu" style={{ left: position.x, top: position.y }} role="menu" onPointerDown={event => event.stopPropagation()}>{children}</div>
 }
 
-function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, stageClipboard, pasteInto, hasClipboard, showProperties, setError }: { entry: Entry; x: number; y: number; close: () => void; open: () => void; renameEntry: (entry: Entry) => Promise<void>; deleteEntry: (entry: Entry) => Promise<void>; stageClipboard: (operation: ClipboardOperation, entry: Entry) => void; pasteInto: (entry: Entry) => Promise<void>; hasClipboard: boolean; showProperties: (entry: Entry) => void; setError: (message: string) => void }) {
+function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, deleteEntry, stageClipboard, pasteInto, hasClipboard, showProperties, concatenateVideos, setError }: { entry: Entry; selectedEntries: Entry[]; x: number; y: number; close: () => void; open: () => void; renameEntry: (entry: Entry) => Promise<void>; deleteEntry: (entry: Entry) => Promise<void>; stageClipboard: (operation: ClipboardOperation, entry: Entry) => void; pasteInto: (entry: Entry) => Promise<void>; hasClipboard: boolean; showProperties: (entry: Entry) => void; concatenateVideos: (entries: Entry[]) => Promise<void>; setError: (message: string) => void }) {
   const promptAction = usePrompt()
   const vfxEditorEnabled = useContext(VfxEditorContext)
   const copyPath = async () => {
@@ -930,6 +945,8 @@ function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, stage
     close()
     void launchVfxEditor(entry.id, (url, target) => window.open(url, target), api.openVfxProject).catch(error => setError(messageOf(error)))
   }
+  const canConcatenate = selectedEntries.length >= 2 && selectedEntries.some(item => item.id === entry.id) && selectedEntries.every(item => item.kind === 'file' && item.mime.startsWith('video/'))
+  const concatenate = () => { close(); void concatenateVideos(selectedEntries) }
   return <PositionedContextMenu x={x} y={y}>
     <button role="menuitem" autoFocus onClick={() => { close(); open() }}><FolderOpen /> Open</button>
     <button role="menuitem" onClick={() => stage('move')}><Scissors /> Cut</button>
@@ -939,6 +956,7 @@ function ContextMenu({ entry, x, y, close, open, renameEntry, deleteEntry, stage
     <button role="menuitem" onClick={copyPath}><Copy /> Copy path</button>
     <button role="menuitem" onClick={properties}><Info /> Properties</button>
     <span className="context-divider" />
+    {canConcatenate && <button role="menuitem" onClick={concatenate}><Film /> Concatenate videos</button>}
     {vfxEditorEnabled && entry.kind === 'file' && entry.mime.startsWith('video/') && <button role="menuitem" onClick={editWithVfx}><ExternalLink /> Edit with VFX Editor</button>}
     {entry.kind === 'file' && <button role="menuitem" onClick={() => void addProvenance()}><Link2 /> Add provenance URL</button>}
     {entry.kind === 'file' && entry.hasProvenance && <button role="menuitem" onClick={() => void copyProvenance()}><Copy /> Copy Provenance URL</button>}

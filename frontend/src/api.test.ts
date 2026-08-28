@@ -37,4 +37,20 @@ describe('preview URLs', () => {
     expect(init?.body).toBeInstanceOf(FormData)
     expect((init?.body as FormData).get('file')).toBeInstanceOf(Blob)
   })
+
+  it('submits an authenticated video concatenation request', async () => {
+    setCsrf('csrf-token')
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ key: 'job' }), {
+      status: 202,
+      headers: { 'content-type': 'application/json' },
+    }))
+
+    await api.startConcatenation(['clips/one.mp4', 'clips/two.mp4'], 'combined.mp4')
+
+    const [url, init] = fetch.mock.calls[0]
+    expect(url).toBe('/api/v1/media/concatenations')
+    expect(init?.method).toBe('POST')
+    expect(new Headers(init?.headers).get('x-csrf-token')).toBe('csrf-token')
+    expect(init?.body).toBe(JSON.stringify({ ids: ['clips/one.mp4', 'clips/two.mp4'], outputName: 'combined.mp4' }))
+  })
 })

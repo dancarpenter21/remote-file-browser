@@ -49,14 +49,24 @@ export type ExtractionJob = {
   error?: string
   result?: Entry
 }
+export type ConcatenationJob = {
+  key: string
+  fileName: string
+  status: 'working' | 'ready' | 'failed'
+  startedAt: string
+  progress: number | null
+  error?: string
+  result?: Entry
+}
 export type CacheCleanupReport = { artifactsRemoved: number; recordsRemoved: number; bytesReclaimed: number }
 export type LiveEvent =
   | { type: 'resync' }
   | { type: 'filesystem'; directoryIds: string[] }
   | { type: 'provenance'; change: ProvenanceChange }
-  | { type: 'mediaSnapshot'; jobs: ConversionJob[]; extractions: ExtractionJob[] }
+  | { type: 'mediaSnapshot'; jobs: ConversionJob[]; extractions: ExtractionJob[]; concatenations: ConcatenationJob[] }
   | { type: 'mediaJob'; job: ConversionJob }
   | { type: 'extractionJob'; job: ExtractionJob }
+  | { type: 'concatenationJob'; job: ConcatenationJob }
   | { type: 'cacheCleanup'; state: 'started' | 'complete' | 'failed'; report?: CacheCleanupReport | null; error?: string | null }
 
 export class ApiFailure extends Error {
@@ -115,6 +125,8 @@ export const api = {
     request<ExtractionJob>('/media/extractions', { method: 'POST', body: JSON.stringify(input) }),
   extractionJobs: () => request<ExtractionJob[]>('/media/extractions'),
   extractionStatus: (key: string) => request<ExtractionJob>(`/media/extractions/${encodeURIComponent(key)}`),
+  startConcatenation: (ids: string[], outputName: string) => request<ConcatenationJob>('/media/concatenations', { method: 'POST', body: JSON.stringify({ ids, outputName }) }),
+  concatenationJobs: () => request<ConcatenationJob[]>('/media/concatenations'),
 }
 
 export const contentUrl = (id: string) => `/api/v1/fs/content?id=${encodeURIComponent(id)}`

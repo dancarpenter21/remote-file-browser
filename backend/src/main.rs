@@ -58,6 +58,7 @@ struct AppState {
     media_jobs: Arc<DashMap<String, MediaJob>>,
     direct_playable: Arc<DashMap<String, bool>>,
     extraction_jobs: Arc<DashMap<String, ExtractionJob>>,
+    concatenation_jobs: Arc<DashMap<String, ConcatenationJob>>,
     provenance: Arc<RwLock<HashMap<String, Vec<String>>>>,
     provenance_write: Arc<Mutex<()>>,
     cache_index: Arc<RwLock<CacheIndex>>,
@@ -249,6 +250,8 @@ type ApiResult<T> = Result<T, ApiError>;
         start_extraction,
         list_extraction_jobs,
         extraction_status,
+        start_concatenation,
+        list_concatenation_jobs,
         start_hls,
         list_media_jobs,
         request_cache_cleanup,
@@ -283,6 +286,8 @@ type ApiResult<T> = Result<T, ApiError>;
         MediaInfo,
         ExtractionRequest,
         ExtractionJob,
+        ConcatenationRequest,
+        ConcatenationJob,
         CacheCleanupReport,
         VfxProjectRequest,
         VfxProjectResponse,
@@ -393,6 +398,7 @@ async fn main() {
         media_jobs: Arc::new(DashMap::new()),
         direct_playable: Arc::new(DashMap::new()),
         extraction_jobs: Arc::new(DashMap::new()),
+        concatenation_jobs: Arc::new(DashMap::new()),
         provenance: Arc::new(RwLock::new(provenance)),
         provenance_write: Arc::new(Mutex::new(())),
         cache_index: Arc::new(RwLock::new(cache_index)),
@@ -439,6 +445,10 @@ async fn main() {
             post(start_extraction).get(list_extraction_jobs),
         )
         .route("/media/extractions/{key}", get(extraction_status))
+        .route(
+            "/media/concatenations",
+            post(start_concatenation).get(list_concatenation_jobs),
+        )
         .route("/media/hls", post(start_hls))
         .route("/media/jobs", get(list_media_jobs))
         .route("/media/cache/cleanup", post(request_cache_cleanup))
@@ -897,12 +907,16 @@ enum LiveEvent {
     MediaSnapshot {
         jobs: Vec<MediaJob>,
         extractions: Vec<ExtractionJob>,
+        concatenations: Vec<ConcatenationJob>,
     },
     MediaJob {
         job: Box<MediaJob>,
     },
     ExtractionJob {
         job: Box<ExtractionJob>,
+    },
+    ConcatenationJob {
+        job: Box<ConcatenationJob>,
     },
     CacheCleanup {
         state: String,
@@ -1267,7 +1281,18 @@ fn media_snapshot(state: &AppState) -> LiveEvent {
         .collect::<Vec<_>>();
     extractions.sort_by_key(|job| std::cmp::Reverse(job.started_at));
     extractions.truncate(20);
-    LiveEvent::MediaSnapshot { jobs, extractions }
+    let mut concatenations = state
+        .concatenation_jobs
+        .iter()
+        .map(|job| job.value().clone())
+        .collect::<Vec<_>>();
+    concatenations.sort_by_key(|job| std::cmp::Reverse(job.started_at));
+    concatenations.truncate(20);
+    LiveEvent::MediaSnapshot {
+        jobs,
+        extractions,
+        concatenations,
+    }
 }
 
 async fn send_live_event(socket: &mut WebSocket, event: &LiveEvent) -> bool {
@@ -3786,6 +3811,296 @@ async fn extraction_status(
     Ok(Json(job))
 }
 
+#[derive(Clone, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct ConcatenationRequest {
+    ids: Vec<String>,
+    output_name: String,
+}
+
+#[derive(Clone, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct ConcatenationJob {
+    key: String,
+    file_name: String,
+    status: String,
+    started_at: DateTime<Utc>,
+    progress: Option<f64>,
+    error: Option<String>,
+    result: Option<Entry>,
+}
+
+fn valid_concat_output_name(name: &str) -> bool {
+    let path = Path::new(name);
+    !name.is_empty()
+        && name.len() <= 255
+        && path.components().count() == 1
+        && path
+            .file_name()
+            .is_some_and(|value| value == OsStr::new(name))
+        && name.to_ascii_lowercase().ends_with(".mp4")
+        && path.file_stem().is_some_and(|stem| !stem.is_empty())
+}
+
+fn concat_list_line(path: &Path) -> String {
+    let escaped = path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('\'', "'\\\\''");
+    format!("file '{escaped}'\\n")
+}
+
+fn concat_compatible(left: &ProbeOutput, right: &ProbeOutput) -> bool {
+    left.streams == right.streams
+}
+
+async fn run_concatenation(
+    state: &AppState,
+    key: &str,
+    sources: Vec<PathBuf>,
+    output_name: &str,
+    duration: f64,
+) -> ApiResult<Entry> {
+    let directory = sources
+        .first()
+        .and_then(|source| source.parent())
+        .ok_or_else(|| ApiError::bad("invalid_path", "Video has no parent directory"))?;
+    let list = directory.join(format!(".rfb-concat-{key}.txt"));
+    let temporary = directory.join(format!(".rfb-concat-{key}.mp4"));
+    fs::write(
+        &list,
+        sources
+            .iter()
+            .map(|source| concat_list_line(source))
+            .collect::<String>(),
+    )
+    .await?;
+    let mut command = Command::new("ffmpeg");
+    command
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-i",
+        ])
+        .arg(&list)
+        .args([
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-sn",
+            "-dn",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            "-y",
+        ])
+        .arg(&temporary);
+    let output = match command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(mut child) => {
+            let progress = child.stdout.take().map(|stdout| {
+                tokio::spawn(track_concatenation_progress(
+                    stdout,
+                    state.clone(),
+                    key.to_owned(),
+                    duration,
+                ))
+            });
+            let output = child.wait_with_output().await.map_err(ApiError::internal)?;
+            if let Some(progress) = progress {
+                let _ = progress.await;
+            }
+            output
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&list).await;
+            return Err(ApiError::internal(error));
+        }
+    };
+    let _ = fs::remove_file(&list).await;
+    if !output.status.success() {
+        let _ = fs::remove_file(&temporary).await;
+        error!(detail = %String::from_utf8_lossy(&output.stderr), "video concatenation failed");
+        return Err(ApiError::bad(
+            "concatenation_failed",
+            "FFmpeg could not concatenate the videos",
+        ));
+    }
+    let base = Path::new(output_name)
+        .file_stem()
+        .unwrap()
+        .to_string_lossy();
+    let target = match publish_extraction(&temporary, directory, &base, "mp4").await {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+    };
+    entry_from_path(state, target).await
+}
+
+#[utoipa::path(post, path = "/api/v1/media/concatenations", tag = "media", params(("x-csrf-token" = String, Header)), request_body = ConcatenationRequest, security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 202, body = ConcatenationJob), (status = 400, body = Problem)))]
+async fn start_concatenation(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Json(request): Json<ConcatenationRequest>,
+) -> ApiResult<(StatusCode, Json<ConcatenationJob>)> {
+    require_csrf(&state, &jar, &headers)?;
+    if request.ids.len() < 2
+        || request.ids.len() > 100
+        || request.ids.iter().collect::<HashSet<_>>().len() != request.ids.len()
+    {
+        return Err(ApiError::bad(
+            "invalid_sources",
+            "Select between two and 100 unique video files",
+        ));
+    }
+    if !valid_concat_output_name(&request.output_name) {
+        return Err(ApiError::bad(
+            "invalid_output_name",
+            "Choose a single .mp4 filename",
+        ));
+    }
+    let mut sources = Vec::with_capacity(request.ids.len());
+    let mut total_duration = 0.0;
+    let mut first_probe = None;
+    let mut parent = None;
+    for id in &request.ids {
+        let source = resolve_existing(&state.config, id).await?;
+        if !fs::metadata(&source).await?.is_file() {
+            return Err(ApiError::bad(
+                "not_file",
+                "All selected items must be regular video files",
+            ));
+        }
+        let probe = probe_codec_info(&source)
+            .await
+            .ok_or_else(|| ApiError::bad("not_video", "FFprobe could not read a selected video"))?;
+        if !probe
+            .streams
+            .iter()
+            .any(|stream| stream.codec_type.as_deref() == Some("video"))
+        {
+            return Err(ApiError::bad(
+                "not_video",
+                "All selected items must contain a video stream",
+            ));
+        }
+        if let Some(first) = &first_probe {
+            if !concat_compatible(first, &probe) {
+                return Err(ApiError::bad(
+                    "incompatible_videos",
+                    "Selected videos must have compatible streams",
+                ));
+            }
+        } else {
+            first_probe = Some(probe);
+        }
+        let source_parent = source.parent().map(Path::to_path_buf);
+        if parent.is_some() && parent != source_parent {
+            return Err(ApiError::bad(
+                "different_directories",
+                "Selected videos must be in the same folder",
+            ));
+        }
+        parent = source_parent;
+        total_duration += probe_media(&source).await?.duration_seconds;
+        sources.push(source);
+    }
+    let key = Uuid::new_v4().simple().to_string();
+    let job = ConcatenationJob {
+        key: key.clone(),
+        file_name: request.output_name.clone(),
+        status: "working".into(),
+        started_at: Utc::now(),
+        progress: Some(0.0),
+        error: None,
+        result: None,
+    };
+    state.concatenation_jobs.insert(key.clone(), job.clone());
+    if state.concatenation_jobs.len() > 100 {
+        let mut oldest = state
+            .concatenation_jobs
+            .iter()
+            .filter(|candidate| candidate.status != "working")
+            .map(|candidate| (candidate.started_at, candidate.key.clone()))
+            .collect::<Vec<_>>();
+        oldest.sort_by_key(|candidate| candidate.0);
+        for (_, old_key) in oldest
+            .into_iter()
+            .take(state.concatenation_jobs.len().saturating_sub(100))
+        {
+            state.concatenation_jobs.remove(&old_key);
+        }
+    }
+    let _ = state.live_events.send(LiveEvent::ConcatenationJob {
+        job: Box::new(job.clone()),
+    });
+    let task_state = state.clone();
+    tokio::spawn(async move {
+        let outcome = run_concatenation(
+            &task_state,
+            &key,
+            sources,
+            &request.output_name,
+            total_duration,
+        )
+        .await;
+        emit_concatenation_job(&task_state, &key, |job| match outcome {
+            Ok(entry) => {
+                job.status = "ready".into();
+                job.progress = Some(1.0);
+                job.result = Some(entry);
+            }
+            Err(error) => {
+                job.status = "failed".into();
+                job.error = Some(error.2);
+            }
+        });
+    });
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+#[utoipa::path(get, path = "/api/v1/media/concatenations", tag = "media", security(("sessionCookie" = [])), responses((status = 200, body = [ConcatenationJob])))]
+async fn list_concatenation_jobs(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> ApiResult<Json<Vec<ConcatenationJob>>> {
+    require_session(&state, &jar)?;
+    let mut jobs = state
+        .concatenation_jobs
+        .iter()
+        .map(|job| job.value().clone())
+        .collect::<Vec<_>>();
+    jobs.sort_by_key(|job| std::cmp::Reverse(job.started_at));
+    jobs.truncate(20);
+    Ok(Json(jobs))
+}
+
 #[derive(Deserialize, utoipa::ToSchema)]
 struct HlsRequest {
     id: String,
@@ -3837,6 +4152,18 @@ fn emit_extraction_job(state: &AppState, key: &str, update: impl FnOnce(&mut Ext
         let _ = state
             .live_events
             .send(LiveEvent::ExtractionJob { job: Box::new(job) });
+    }
+}
+
+fn emit_concatenation_job(state: &AppState, key: &str, update: impl FnOnce(&mut ConcatenationJob)) {
+    let job = state.concatenation_jobs.get_mut(key).map(|mut job| {
+        update(&mut job);
+        job.clone()
+    });
+    if let Some(job) = job {
+        let _ = state
+            .live_events
+            .send(LiveEvent::ConcatenationJob { job: Box::new(job) });
     }
 }
 
@@ -3895,6 +4222,31 @@ async fn track_extraction_progress(
     }
 }
 
+async fn track_concatenation_progress(
+    reader: tokio::process::ChildStdout,
+    state: AppState,
+    key: String,
+    duration: f64,
+) {
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Some(seconds) = ffmpeg_progress_seconds(&line) else {
+            continue;
+        };
+        let progress = (seconds / duration).clamp(0.0, 0.995);
+        let should_emit = state
+            .concatenation_jobs
+            .get(&key)
+            .and_then(|job| job.progress)
+            .is_none_or(|previous| progress >= previous + 0.002);
+        if should_emit {
+            emit_concatenation_job(&state, &key, |job| {
+                job.progress = Some(progress.max(job.progress.unwrap_or(0.0)));
+            });
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConversionMode {
     Remux,
@@ -3918,11 +4270,19 @@ struct ProbeOutput {
     format: Option<ProbeFormat>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Eq)]
 struct ProbeStream {
     codec_type: Option<String>,
     codec_name: Option<String>,
+    profile: Option<String>,
     pix_fmt: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    r_frame_rate: Option<String>,
+    time_base: Option<String>,
+    sample_rate: Option<String>,
+    channels: Option<u32>,
+    channel_layout: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3998,7 +4358,7 @@ async fn probe_codec_info(source: &Path) -> Option<ProbeOutput> {
             "-v",
             "error",
             "-show_entries",
-            "format=format_name:stream=codec_type,codec_name,pix_fmt",
+            "format=format_name:stream=codec_type,codec_name,profile,pix_fmt,width,height,r_frame_rate,time_base,sample_rate,channels,channel_layout",
             "-of",
             "json",
         ])
@@ -4731,6 +5091,7 @@ mod tests {
             media_jobs: Arc::new(DashMap::new()),
             direct_playable: Arc::new(DashMap::new()),
             extraction_jobs: Arc::new(DashMap::new()),
+            concatenation_jobs: Arc::new(DashMap::new()),
             provenance: Arc::new(RwLock::new(HashMap::new())),
             provenance_write: Arc::new(Mutex::new(())),
             cache_index: Arc::new(RwLock::new(CacheIndex::default())),
@@ -5013,13 +5374,29 @@ mod tests {
         let mut streams = vec![ProbeStream {
             codec_type: Some("video".into()),
             codec_name: Some(video.0.into()),
+            profile: None,
             pix_fmt: Some(video.1.into()),
+            width: None,
+            height: None,
+            r_frame_rate: None,
+            time_base: None,
+            sample_rate: None,
+            channels: None,
+            channel_layout: None,
         }];
         if let Some(codec) = audio {
             streams.push(ProbeStream {
                 codec_type: Some("audio".into()),
                 codec_name: Some(codec.into()),
+                profile: None,
                 pix_fmt: None,
+                width: None,
+                height: None,
+                r_frame_rate: None,
+                time_base: None,
+                sample_rate: None,
+                channels: None,
+                channel_layout: None,
             });
         }
         ProbeOutput {
@@ -5152,6 +5529,7 @@ mod tests {
             ("/api/v1/media/info", &["get"][..]),
             ("/api/v1/media/extractions", &["get", "post"][..]),
             ("/api/v1/media/extractions/{key}", &["get"][..]),
+            ("/api/v1/media/concatenations", &["get", "post"][..]),
             ("/api/v1/media/hls", &["post"][..]),
             ("/api/v1/media/jobs", &["get"][..]),
             ("/api/v1/media/cache/cleanup", &["post"][..]),
@@ -5280,6 +5658,25 @@ mod tests {
         assert!(!valid_media_time(10.0, 10.0));
         assert!(!valid_media_time(f64::NAN, 10.0));
         assert_eq!(timestamp_label(3661.234), "01-01-01.234");
+    }
+    #[test]
+    fn concat_requests_require_safe_mp4_names_and_escape_list_paths() {
+        assert!(valid_concat_output_name("combined.mp4"));
+        assert!(valid_concat_output_name("COMBINED.MP4"));
+        assert!(!valid_concat_output_name("combined.mov"));
+        assert!(!valid_concat_output_name("folder/combined.mp4"));
+        assert_eq!(
+            concat_list_line(Path::new("/videos/one's clip.mp4")),
+            "file '/videos/one'\\\\''s clip.mp4'\\n"
+        );
+    }
+    #[test]
+    fn concat_requires_matching_stream_layouts() {
+        let first = probe(("h264", "yuv420p"), Some("aac"));
+        let same = probe(("h264", "yuv420p"), Some("aac"));
+        let different_audio = probe(("h264", "yuv420p"), Some("opus"));
+        assert!(concat_compatible(&first, &same));
+        assert!(!concat_compatible(&first, &different_audio));
     }
     #[test]
     fn frame_extraction_seeks_accurately_before_opening_the_input() {
