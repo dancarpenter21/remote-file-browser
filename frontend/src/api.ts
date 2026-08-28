@@ -63,7 +63,7 @@ export type LiveEvent =
   | { type: 'resync' }
   | { type: 'filesystem'; directoryIds: string[] }
   | { type: 'provenance'; change: ProvenanceChange }
-  | { type: 'mediaSnapshot'; jobs: ConversionJob[]; extractions: ExtractionJob[]; concatenations: ConcatenationJob[] }
+  | { type: 'mediaSnapshot'; jobs: ConversionJob[]; extractions: ExtractionJob[]; concatenations?: ConcatenationJob[] }
   | { type: 'mediaJob'; job: ConversionJob }
   | { type: 'extractionJob'; job: ExtractionJob }
   | { type: 'concatenationJob'; job: ConcatenationJob }

@@ -9,3 +9,7 @@ export function upsertJob<T extends KeyedJob>(jobs: T[], update: T, limit = 20) 
 export function progressPercent(progress: number | null) {
   return Math.round(Math.min(1, Math.max(0, progress ?? 0)) * 100)
 }
+
+export function jobsFromSnapshot<T>(jobs: T[] | undefined) {
+  return jobs ?? []
+}

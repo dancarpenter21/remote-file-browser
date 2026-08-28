@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { progressPercent, upsertJob } from './mediaJobState'
+import { jobsFromSnapshot, progressPercent, upsertJob } from './mediaJobState'
 
 describe('media job state', () => {
   it('replaces job updates and keeps newest jobs first', () => {
@@ -15,5 +15,10 @@ describe('media job state', () => {
     expect(progressPercent(null)).toBe(0)
     expect(progressPercent(.426)).toBe(43)
     expect(progressPercent(2)).toBe(100)
+  })
+
+  it('accepts snapshots from backends without newer job collections', () => {
+    expect(jobsFromSnapshot(undefined)).toEqual([])
+    expect(jobsFromSnapshot([{ key: 'concat' }])).toEqual([{ key: 'concat' }])
   })
 })

@@ -17,7 +17,7 @@ import { deleteConfirmationMessage } from './deleteConfirmation'
 import { updateFinderPathForSelection } from './finderPath'
 import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState'
 import { fitMediaWindow, formatMediaTime, ignoresVideoShortcut, shouldAutoLoop, stepFrame, validSegment } from './videoPlayerState'
-import { progressPercent, upsertJob } from './mediaJobState'
+import { jobsFromSnapshot, progressPercent, upsertJob } from './mediaJobState'
 import { fitContextMenuToViewport } from './contextMenuPosition'
 import { isAdjacentColumnMove, moveConfirmationMessage, springLoadedPath } from './columnDrag'
 import { directoryContentsLabel, propertyTypeLabel } from './propertiesState'
@@ -545,7 +545,7 @@ function ConversionJobs() {
       if (event.type === 'mediaSnapshot') {
         const becamePlayable = event.jobs.some(job => job.playable && !playableJobs.current[job.key])
         playableJobs.current = Object.fromEntries(event.jobs.map(job => [job.key, job.playable]))
-        setJobs(event.jobs); setExtractions(event.extractions); setConcatenations(event.concatenations)
+        setJobs(event.jobs); setExtractions(event.extractions); setConcatenations(jobsFromSnapshot(event.concatenations))
         if (becamePlayable) dispatchEvent(new Event('rfb:video-ready'))
       } else if (event.type === 'mediaJob') {
         const becamePlayable = event.job.playable && !playableJobs.current[event.job.key]
