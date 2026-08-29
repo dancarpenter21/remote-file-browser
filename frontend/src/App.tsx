@@ -8,7 +8,7 @@ import remarkGfm from 'remark-gfm'
 import rehypeSanitize from 'rehype-sanitize'
 import Hls from 'hls.js'
 import {
-  Camera, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Download, Edit3, Eraser, Eye, File, FileImage, FileText,
+  Camera, Check, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Download, Edit3, Eraser, Eye, File, FileImage, FileText,
   Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal, Pencil, Play,
   ExternalLink, Link2, Minus, Plus, RefreshCw, RotateCw, Save, Scissors, Search, SquareTerminal, Trash2, Undo2, Upload, WrapText, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
@@ -26,9 +26,11 @@ import { ClipboardOperation, RemoteClipboard, clipboardIdsForEntry, clipboardSho
 import { markdownSanitizeSchema, markdownUrlTransform, resolveMarkdownImageSource } from './markdownPreview'
 import { launchVfxEditor } from './vfxLaunch'
 import { canvasPng, drawMarkupStroke, MarkupStroke, markupPoint, markupStrokeWidth } from './imageMarkup'
+import { editorSaveShortcut, proportionalScrollTop, shouldApplyDocumentResponse, wheelDeltaPixels } from './editorState'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type EditorMode = 'edit' | 'split' | 'preview'
+type OpenEditor = { document: DocumentFile; entry: Pick<Entry, 'id' | 'name' | 'path'> }
 type ConfirmOptions = { title?: string; confirmLabel?: string; danger?: boolean }
 type ConfirmRequest = ConfirmOptions & { message: string; resolve: (answer: boolean) => void }
 const ConfirmContext = createContext<(message: string, options?: ConfirmOptions) => Promise<boolean>>(async () => false)
@@ -124,7 +126,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [hidden, setHidden] = useState(() => localStorage.getItem('rfb-hidden') === 'true')
   const [filter, setFilter] = useState('')
   const [clipboard, setClipboard] = useState<RemoteClipboard>(null)
-  const [editor, setEditor] = useState<DocumentFile | null>(null)
+  const [editor, setEditor] = useState<OpenEditor | null>(null)
+  const [editorDirty, setEditorDirty] = useState(false)
   const [viewer, setViewer] = useState<{ entry: Entry; type: 'image' | 'video' } | null>(null)
   const [trash, setTrash] = useState<TrashEntry[] | null>(null)
   const [error, setError] = useState('')
@@ -142,6 +145,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     catch { return {} }
   })
   const inputRef = useRef<HTMLInputElement>(null)
+  const documentRequest = useRef(0)
   const liveState = useRef({ root, expanded })
   liveState.current = { root, expanded }
 
@@ -286,10 +290,19 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     setSelected(new Set([parent.id])); setPrimary(parent); setColumnPath(previous => previous.slice(0, columnIndex)); setCurrentDir(parent.id)
   }
   const activate = async (entry: Entry) => {
-    if (entry.kind === 'directory') return navigateGrid(entry)
-    if (entry.mime.startsWith('image/')) return setViewer({ entry, type: 'image' })
-    if (entry.mime.startsWith('video/')) return setViewer({ entry, type: 'video' })
-    try { setEditor(await api.readDocument(entry.id)) } catch { window.location.href = contentUrl(entry.id) }
+    if (entry.kind === 'directory') { documentRequest.current++; return navigateGrid(entry) }
+    if (entry.mime.startsWith('image/')) { documentRequest.current++; return setViewer({ entry, type: 'image' }) }
+    if (entry.mime.startsWith('video/')) { documentRequest.current++; return setViewer({ entry, type: 'video' }) }
+    if (editor?.document.id === entry.id) { documentRequest.current++; return }
+    if (editor && editorDirty && !await confirmAction('Your unsaved edits will be lost.', { title: 'Discard unsaved changes?', confirmLabel: 'Discard', danger: true })) return
+    const requestGeneration = ++documentRequest.current
+    try {
+      const document = await api.readDocument(entry.id)
+      if (!shouldApplyDocumentResponse(requestGeneration, documentRequest.current, entry.id, document.id)) return
+      setEditor({ document, entry: { id: entry.id, name: entry.name, path: entry.path } }); setEditorDirty(false)
+    } catch {
+      if (requestGeneration === documentRequest.current) window.location.href = contentUrl(entry.id)
+    }
   }
   const mutate = async (action: () => Promise<unknown>, dir = currentDir, replace?: () => Promise<unknown>) => {
     setError(''); try { await action(); await refresh(dir) } catch (e) {
@@ -501,7 +514,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         {terminal && <TerminalDock directoryId={terminal.directoryId} hidden={terminal.hidden} onHide={() => setTerminal(current => current && ({ ...current, hidden: true }))} onClose={() => setTerminal(null)} />}
       </div>
     </div>
-    {editor && <EditorWindow document={editor} onClose={() => setEditor(null)} onSaved={setEditor} />}
+    {editor && <EditorWindow key={editor.document.id} document={editor.document} entry={editor.entry} onDirtyChange={setEditorDirty} onClose={() => { documentRequest.current++; setEditor(null); setEditorDirty(false) }} onSaved={saved => setEditor(current => current?.document.id === saved.id ? { ...current, document: saved } : current)} />}
     {viewer && <ViewerWindow {...viewer} images={viewerImages} onNavigate={entry => {
       setViewer({ entry, type: 'image' }); setSelected(new Set([entry.id])); setPrimary(entry)
     }} onMarkupSaved={async entry => {
@@ -1040,35 +1053,103 @@ function ViewSelector({ view, setView }: { view: ViewMode; setView: (view: ViewM
   </div>
 }
 
-function EditorWindow({ document, onClose, onSaved }: { document: DocumentFile; onClose: () => void; onSaved: (doc: DocumentFile) => void }) {
+function EditorWindow({ document, entry, onClose, onSaved, onDirtyChange }: { document: DocumentFile; entry: Pick<Entry, 'name' | 'path'>; onClose: () => void; onSaved: (doc: DocumentFile) => void; onDirtyChange: (dirty: boolean) => void }) {
   const confirmAction = useConfirm()
   const [content, setContent] = useState(document.content)
   const isMarkdown = document.mime.includes('markdown') || document.id.endsWith('bWQ')
   const [mode, setMode] = useState<EditorMode>(isMarkdown ? 'split' : 'edit')
   const [wordWrap, setWordWrap] = useState(() => localStorage.getItem('rfb-editor-word-wrap') === 'true')
+  const [saving, setSaving] = useState(false)
+  const [saveMessage, setSaveMessage] = useState('')
   const [error, setError] = useState('')
+  const [editorScroll, setEditorScroll] = useState<HTMLElement | null>(null)
+  const preview = useRef<HTMLElement>(null)
+  const previewContent = useRef<HTMLDivElement>(null)
+  const latestContent = useRef(content)
+  const savingRef = useRef(false)
+  latestContent.current = content
+  const dirty = content !== document.content
   useEffect(() => { localStorage.setItem('rfb-editor-word-wrap', String(wordWrap)) }, [wordWrap])
-  const save = async () => { try { onSaved(await api.saveDocument({ ...document, content })); setError('') } catch (e) { setError(messageOf(e)) } }
-  return <FloatingWindow title="Text editor" onClose={async () => { if (content === document.content || await confirmAction('Your unsaved edits will be lost.', { title: 'Discard unsaved changes?', confirmLabel: 'Discard', danger: true })) onClose() }} className="editor-window">
+  useEffect(() => { onDirtyChange(dirty) }, [dirty, onDirtyChange])
+  const syncPreview = useCallback(() => {
+    if (mode !== 'split' || !editorScroll || !preview.current) return
+    preview.current.scrollTop = proportionalScrollTop(editorScroll, preview.current)
+  }, [editorScroll, mode])
+  useLayoutEffect(() => {
+    if (mode !== 'split' || !editorScroll || !preview.current) return
+    let frame = 0
+    const scheduleSync = () => {
+      cancelAnimationFrame(frame)
+      frame = requestAnimationFrame(syncPreview)
+    }
+    editorScroll.addEventListener('scroll', scheduleSync, { passive: true })
+    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(scheduleSync)
+    observer?.observe(editorScroll)
+    const editorContent = editorScroll.querySelector('.cm-content')
+    if (editorContent) observer?.observe(editorContent)
+    if (previewContent.current) observer?.observe(previewContent.current)
+    scheduleSync()
+    return () => { cancelAnimationFrame(frame); editorScroll.removeEventListener('scroll', scheduleSync); observer?.disconnect() }
+  }, [editorScroll, mode, syncPreview])
+  useLayoutEffect(() => {
+    const frame = requestAnimationFrame(syncPreview)
+    return () => cancelAnimationFrame(frame)
+  }, [content, mode, syncPreview, wordWrap])
+  const save = useCallback(async () => {
+    if (savingRef.current || content === document.content) return
+    const snapshot = { ...document, content }
+    savingRef.current = true; setSaving(true); setSaveMessage(''); setError('')
+    try {
+      const saved = await api.saveDocument(snapshot)
+      if (saved.id !== document.id) throw new Error('The server returned a different file after saving.')
+      onSaved(saved)
+      setSaveMessage(latestContent.current === snapshot.content ? `Saved ${entry.name}` : `Saved ${entry.name}; newer changes are unsaved.`)
+    } catch (reason) { setError(messageOf(reason)) }
+    finally { savingRef.current = false; setSaving(false) }
+  }, [content, document, entry.name, onSaved])
+  useEffect(() => {
+    const shortcut = (event: KeyboardEvent) => {
+      if (!editorSaveShortcut(event)) return
+      event.preventDefault(); void save()
+    }
+    addEventListener('keydown', shortcut)
+    return () => removeEventListener('keydown', shortcut)
+  }, [save])
+  const changeContent = (value: string) => {
+    latestContent.current = value; setContent(value); onDirtyChange(value !== document.content); setSaveMessage(''); setError('')
+  }
+  const close = async () => {
+    if (savingRef.current) { setSaveMessage('Wait for the file to finish saving.'); return }
+    if (!dirty || await confirmAction('Your unsaved edits will be lost.', { title: 'Discard unsaved changes?', confirmLabel: 'Discard', danger: true })) onClose()
+  }
+  const scrollFromPreview = (event: React.WheelEvent<HTMLElement>) => {
+    if (mode !== 'split' || !editorScroll || event.deltaY === 0) return
+    event.preventDefault()
+    const computedLineHeight = Number.parseFloat(getComputedStyle(editorScroll).lineHeight)
+    editorScroll.scrollTop += wheelDeltaPixels(event, Number.isFinite(computedLineHeight) ? computedLineHeight : 18, editorScroll.clientHeight)
+  }
+  const saveComplete = !dirty && Boolean(saveMessage) && !saving
+  return <FloatingWindow title={`${entry.name} — Text editor`} onClose={() => void close()} className="editor-window">
     <div className="window-toolbar">
-      <button className="primary compact" onClick={save}><Save size={15} /> Save</button>
+      <button className="primary compact editor-save" disabled={!dirty || saving} aria-busy={saving} title="Save (Ctrl/Cmd+S)" onClick={() => void save()}>{saveComplete ? <Check size={15} /> : <Save size={15} />} {saving ? 'Saving…' : saveComplete ? 'Saved' : 'Save'}</button>
       {isMarkdown && <div className="editor-mode-selector" role="group" aria-label="Markdown view">
         <button className={mode === 'edit' ? 'active' : ''} aria-pressed={mode === 'edit'} onClick={() => setMode('edit')}><Edit3 size={15} /> Edit</button>
         <button className={mode === 'split' ? 'active' : ''} aria-pressed={mode === 'split'} onClick={() => setMode('split')}><Columns3 size={15} /> Split</button>
         <button className={mode === 'preview' ? 'active' : ''} aria-pressed={mode === 'preview'} onClick={() => setMode('preview')}><Eye size={15} /> Preview</button>
       </div>}
       <button className={wordWrap ? 'active' : ''} aria-pressed={wordWrap} disabled={mode === 'preview'} title={mode === 'preview' ? 'Word wrap applies to the editor' : 'Toggle editor word wrap'} onClick={() => setWordWrap(value => !value)}><WrapText size={15} /> Word wrap</button>
-      <span className="toolbar-spacer" /><code>{document.mime}</code>
+      {saveMessage && <span className="editor-save-status" role="status" aria-live="polite">{saveMessage}</span>}
+      <span className="toolbar-spacer" /><code title={entry.path}>{entry.path}</code>
     </div>
-    {error && <div className="banner error">{error}</div>}
+    {error && <div className="banner error" role="alert">{error}</div>}
     <div className={`editor-body mode-${mode}`}>
-      <CodeMirror value={content} height="100%" theme="dark" extensions={[...(isMarkdown ? [markdown()] : []), ...(wordWrap ? [EditorView.lineWrapping] : [])]} onChange={setContent} />
-      {mode !== 'edit' && <article className="markdown"><ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[[rehypeSanitize, markdownSanitizeSchema]]}
-        urlTransform={markdownUrlTransform}
-        components={{ img: ({ src, ...props }) => <img {...props} src={resolveMarkdownImageSource(document.id, src)} /> }}
-      >{content}</ReactMarkdown></article>}
+      <CodeMirror className="editor-pane" value={content} height="100%" theme="dark" extensions={[...(isMarkdown ? [markdown()] : []), ...(wordWrap ? [EditorView.lineWrapping] : [])]} onCreateEditor={view => setEditorScroll(view.scrollDOM)} onUpdate={update => { if (update.docChanged) changeContent(update.state.doc.toString()) }} />
+      {mode !== 'edit' && <article ref={preview} className="markdown" onWheel={scrollFromPreview}><div ref={previewContent} className="markdown-content"><ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          rehypePlugins={[[rehypeSanitize, markdownSanitizeSchema]]}
+          urlTransform={markdownUrlTransform}
+          components={{ img: ({ src, ...props }) => <img {...props} src={resolveMarkdownImageSource(document.id, src)} /> }}
+        >{content}</ReactMarkdown></div></article>}
     </div>
   </FloatingWindow>
 }

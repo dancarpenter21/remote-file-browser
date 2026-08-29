@@ -53,6 +53,7 @@ services:
   frontend:
     image: rfb-frontend
     container_name: rfb-frontend
+    profiles: [prod]
     build:
       context: ./frontend
       dockerfile: Dockerfile
@@ -82,7 +83,7 @@ services:
     container_name: rfb-frontend-dev
     profiles: [dev]
     working_dir: /app
-    command: ["sh", "-c", "npm ci; exec npm run dev"]
+    command: ["sh", "-c", "npm ci && exec npm run dev"]
     environment:
       VITE_PROXY_TARGET: http://backend:8080
       CHOKIDAR_USEPOLLING: "${RFB_DEV_POLLING:-false}"

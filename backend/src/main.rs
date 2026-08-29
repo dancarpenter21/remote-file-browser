@@ -5104,6 +5104,94 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn document_editor_reads_and_writes_only_the_requested_file() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("first.md"), b"first content").unwrap();
+        std::fs::write(root.path().join("second.md"), b"second content").unwrap();
+        let state = test_state(root.path(), None);
+        state.sessions.insert(
+            "session-token".into(),
+            Session {
+                csrf: "csrf-token".into(),
+                expires: SystemTime::now() + Duration::from_secs(60),
+            },
+        );
+        let jar = CookieJar::new().add(Cookie::new(SESSION_COOKIE, "session-token"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-csrf-token", "csrf-token".parse().unwrap());
+        let first_id = encode_path(OsStr::new("first.md"));
+        let second_id = encode_path(OsStr::new("second.md"));
+
+        let Json(first) = read_document(
+            State(state.clone()),
+            jar.clone(),
+            Query(IdQuery {
+                id: first_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(second) = read_document(
+            State(state.clone()),
+            jar.clone(),
+            Query(IdQuery {
+                id: second_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.id, first_id);
+        assert_eq!(first.content, "first content");
+        assert_eq!(second.id, second_id);
+        assert_eq!(second.content, "second content");
+
+        let Json(saved) = write_document(
+            State(state.clone()),
+            jar.clone(),
+            headers.clone(),
+            Json(WriteDocument {
+                id: first.id.clone(),
+                content: "updated first".into(),
+                expected_etag: first.etag.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.id, first.id);
+        assert_eq!(
+            std::fs::read(root.path().join("first.md")).unwrap(),
+            b"updated first"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("second.md")).unwrap(),
+            b"second content"
+        );
+
+        let stale = write_document(
+            State(state),
+            jar,
+            headers,
+            Json(WriteDocument {
+                id: first.id,
+                content: "stale overwrite".into(),
+                expected_etag: first.etag,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            stale,
+            Err(ApiError(StatusCode::CONFLICT, "edit_conflict", _))
+        ));
+        assert_eq!(
+            std::fs::read(root.path().join("first.md")).unwrap(),
+            b"updated first"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("second.md")).unwrap(),
+            b"second content"
+        );
+    }
+    #[tokio::test]
     async fn login_reloads_rotated_password_file_and_handles_unreadable_secrets() {
         let root = tempfile::tempdir().unwrap();
         let password_path = root.path().join("admin_password");

@@ -7,7 +7,7 @@ A Dockerized, single-administrator file manager for a remote Linux server. It us
 1. Copy `.env.example` to `.env` and set `RFB_ROOT_PATH`, `RFB_UID`, and `RFB_GID` to the existing directory and numeric identity that should own file operations.
 2. Create `secrets/admin_password` containing the administrator password.
 3. Place a certificate and key at `secrets/tls.crt` and `secrets/tls.key`.
-4. Run `docker compose up --build -d`, then open the server over HTTPS.
+4. Run `docker compose --profile prod up --build -d`, then open the server over HTTPS.
 
 To rotate the administrator password, replace the contents of `secrets/admin_password`. The new value is used for subsequent login attempts without restarting the stack; existing authenticated sessions remain valid.
 
@@ -31,43 +31,9 @@ Terminal access is enabled by default for the authenticated administrator becaus
 
 An enabled terminal grants arbitrary command execution within the backend container to anyone who can authenticate. Keep the application behind HTTPS, use a strong administrator password, and disable the terminal when interactive command execution is not required.
 
-## API documentation and provenance automation
+## API documentation
 
 The complete OpenAPI document is available at `/api/openapi.json`, with interactive Swagger documentation at `/api/docs/`. Documentation is public, but each operation still enforces the authentication shown in its Swagger security section.
-
-An external agent can append a provenance URL to a file by configuring a dedicated bearer token. Create an untracked secret containing at least 32 characters:
-
-```sh
-openssl rand -base64 32 > secrets/provenance_api_token
-```
-
-Add a Compose override such as `compose.provenance.yaml`:
-
-```yaml
-services:
-  backend:
-    environment:
-      RFB_PROVENANCE_API_TOKEN_FILE: /run/secrets/provenance_api_token
-    secrets:
-      - provenance_api_token
-
-secrets:
-  provenance_api_token:
-    file: ./secrets/provenance_api_token
-```
-
-Start Compose with both files, then submit a path relative to the mounted root. A leading slash is allowed, but `~`, `/fs-root`, and host absolute paths are not:
-
-```sh
-docker compose -f compose.yaml -f compose.provenance.yaml up --build -d
-curl --fail-with-body \
-  -H "Authorization: Bearer $(tr -d '\n' < secrets/provenance_api_token)" \
-  -H 'Content-Type: application/json' \
-  -d '{"path":".wdb/WWVV/Megan Avalon vs Kala.mp4","url":"https://example.com/source"}' \
-  https://localhost/api/v1/fs/provenance
-```
-
-The operation appends uniquely and returns the file's complete provenance URL list. Connected browser sessions receive the change immediately. Use HTTPS whenever the request crosses an untrusted network. If the token is not configured, the automation endpoint returns `503 provenance_api_disabled`; browser provenance editing remains available.
 
 ## Choosing a mounted filesystem
 
@@ -84,24 +50,23 @@ Keep the copied, machine-specific files untracked. For example:
 ```sh
 cp .env.wsl.example .env.wsl
 # Edit RFB_ROOT_PATH and identity values.
-docker compose --env-file .env.wsl up --build
+docker compose --env-file .env.wsl --profile prod up --build
 ```
 
-For a Linux home directory, use `cp .env.linux.example .env` and run ordinary `docker compose up --build`. WSL-mounted Windows filesystems do not reproduce every POSIX permission and ownership behavior, so permission testing should also be run against a native Linux directory.
+For a Linux home directory, use `cp .env.linux.example .env` and run `docker compose --profile prod up --build`. WSL-mounted Windows filesystems do not reproduce every POSIX permission and ownership behavior, so permission testing should also be run against a native Linux directory.
 
 ## Development
 
-For a containerized frontend with Vite hot reload, start the `dev` profile and
-target its development service explicitly:
+For a containerized frontend with Vite hot reload, start the `dev` profile:
 
 ```sh
-RFB_SECURE_COOKIES=false docker compose --profile dev up frontend-dev
+RFB_SECURE_COOKIES=false docker compose --profile dev up
 ```
 
 Open `http://localhost:5173` (or replace `localhost` with the server hostname).
 The frontend source directory is bind-mounted, while dependencies are kept in a
-named Docker volume. The existing backend image is reused and Vite proxies
-`/api` to it. Stop the profile with:
+named Docker volume. The production frontend is excluded, the existing backend
+image is reused, and Vite proxies `/api` to it. Stop the profile with:
 
 ```sh
 docker compose --profile dev down
@@ -129,7 +94,7 @@ docker compose -f compose.yaml -f compose.vfx.yaml --profile dev up -d --build f
 
 Remote Files remains on port 5173. Direct VFX development access uses port 5174, while integrated access uses `http://localhost:5173/vfx/`.
 
-For production, set `VFX_EDITOR_ALLOWED_ORIGINS` in the VFX deployment to the exact public Remote Files origin, start its `prod` profile, then start Remote Files with `compose.vfx.yaml`. VFX publishes no production port; nginx proxies `/vfx/` through the existing Remote Files session and TLS boundary. Omit the overlay to run Remote Files without VFX Editor; the context-menu action will be hidden.
+For production, set `VFX_EDITOR_ALLOWED_ORIGINS` in the VFX deployment to the exact public Remote Files origin, start its `prod` profile, then start Remote Files with `compose.vfx.yaml` and the `prod` profile. VFX publishes no production port; nginx proxies `/vfx/` through the existing Remote Files session and TLS boundary. Omit the overlay to run Remote Files without VFX Editor; the context-menu action will be hidden.
 
 To run both processes directly on the host instead, use the following commands.
 
