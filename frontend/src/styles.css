@@ -91,9 +91,10 @@ button svg, .button svg { width: 16px; height: 16px; } button.primary { backgrou
   .browser-body { min-height: 0; }
   .column-preview { display: none !important; }
   .browser-view>.preview-list.mobile-file-list { width: 100%; padding: 4px 8px max(30px, env(safe-area-inset-bottom)); display: flex; flex-direction: column; gap: 2px; align-content: initial; }
-  .mobile-file-list .preview-card { min-height: 58px; margin-left: 0 !important; padding: 6px 42px 6px 7px; flex-direction: row; align-items: center; gap: 9px; border-bottom: 1px solid #242424; border-radius: 6px; }
+  .mobile-file-list .preview-card { min-height: 50px; margin-left: 0 !important; padding: 5px 42px 5px 7px; flex-direction: row; align-items: center; gap: 9px; border-bottom: 1px solid #242424; border-radius: 6px; }
   .mobile-file-list .preview-card>input { position: static; z-index: auto; flex: none; width: 20px; height: 20px; margin: 0; }
-  .mobile-file-list .preview-image { width: 42px; height: 42px; margin: 0; flex: none; }
+  .mobile-file-list .preview-card>.glyph { width: 21px; height: 21px; flex: none; }
+  .mobile-file-list .preview-card>.file-glyph>svg { width: 21px; height: 21px; }
   .mobile-file-list .filename { flex: 1; width: auto; justify-content: flex-start; text-align: left; font-size: 13px; }
   .mobile-file-list .card-menu { top: 9px; right: 5px; width: 38px; height: 38px; padding: 8px; justify-content: center; opacity: 1; }
   .mobile-menu-backdrop { position: fixed; z-index: 90; inset: 0; background: #0009; backdrop-filter: blur(2px); }

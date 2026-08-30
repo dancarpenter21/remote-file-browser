@@ -143,6 +143,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [terminal, setTerminal] = useState<{ directoryId: string; hidden: boolean } | null>(null)
   const isMobile = useMobileMode()
   const [drawerOpen, setDrawerOpen] = useState(false)
+  const [mobileSelectionMenu, setMobileSelectionMenu] = useState(false)
   const [showPreview, setShowPreview] = useState(() => localStorage.getItem('rfb-column-preview') !== 'false')
   const [defaultColumnWidth] = useState(() => Math.min(480, Math.max(180, Number(localStorage.getItem('rfb-column-width')) || 240)))
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>(() => {
@@ -492,6 +493,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     return () => removeEventListener('keydown', escape)
   }, [drawerOpen])
   useEffect(() => { if (!isMobile) setDrawerOpen(false) }, [isMobile])
+  useEffect(() => { if (!isMobile || !selected.size) setMobileSelectionMenu(false) }, [isMobile, selected.size])
 
   const activePage = currentDir === '' ? root : expanded[currentDir]
   const gridRows = (activePage?.entries ?? []).filter(entry => entry.name.toLowerCase().includes(filter.toLowerCase())).map(entry => ({ entry, depth: 0 }))
@@ -509,6 +511,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     setCurrentDir(parent?.id ?? ''); setSelected(new Set()); setPrimary(null); setColumnPath(parentPath)
   }
   const openCurrentFolderMenu = () => setFolderMenu({ directoryId: currentDir, path: columnPath.at(-1)?.path ?? '/fs-root', x: innerWidth - 12, y: 80 })
+  const mobileSelectionEntry = primary && selected.has(primary.id) ? primary : previewEntries[0]
   return <div className={`app-shell ${isMobile ? 'mobile-mode' : ''}`}>
     <header className="topbar">
       {isMobile && <button className="icon-button mobile-menu-button" title="Open navigation" aria-label="Open navigation" aria-expanded={drawerOpen} onClick={() => setDrawerOpen(true)}><Menu size={20} /></button>}
@@ -534,18 +537,11 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
             <button className="icon-button" title="Clear selection" aria-label="Clear selection" onClick={() => { setSelected(new Set()); setPrimary(null) }}><X /></button>
             <strong className="selection-count">{selected.size} selected</strong>
             <span className="toolbar-spacer" />
-            <button className="icon-button" title="Copy selected" aria-label="Copy selected" onClick={() => stageClipboard('copy')}><Copy /></button>
-            <button className="icon-button" title="Cut selected" aria-label="Cut selected" onClick={() => stageClipboard('move')}><Scissors /></button>
-            {selected.size === 1 && <button className="icon-button" title="Rename selected" aria-label="Rename selected" onClick={() => void rename()}><Edit3 /></button>}
-            <button className="icon-button danger" title="Delete selected" aria-label="Delete selected" onClick={deleteSelected}><Trash2 /></button>
+            <button title="Selected item actions" aria-label="Selected item actions" onClick={() => setMobileSelectionMenu(true)}><MoreHorizontal /><span>Actions</span></button>
           </> : <>
-            <button title="New folder" onClick={() => createItem('directory')}><Plus /><span>Folder</span></button>
             <button title="Upload files" onClick={() => inputRef.current?.click()}><Upload /><span>Upload</span></button>
-            <button className="icon-button" disabled={!clipboard} title="Paste" aria-label="Paste" onClick={() => void paste()}><ClipboardPaste /></button>
             <span className="toolbar-spacer" />
-            <button className={`icon-button ${hidden ? 'active' : ''}`} title={hidden ? 'Hide hidden files' : 'Show hidden files'} aria-label={hidden ? 'Hide hidden files' : 'Show hidden files'} aria-pressed={hidden} onClick={() => setHidden(value => !value)}><Eye /></button>
-            <button className="icon-button" title="Refresh" aria-label="Refresh" onClick={() => refresh()}><RefreshCw /></button>
-            <button className="icon-button" title="More folder actions" aria-label="More folder actions" onClick={openCurrentFolderMenu}><MoreHorizontal /></button>
+            <button title="Folder actions" aria-label="Folder actions" onClick={openCurrentFolderMenu}><MoreHorizontal /><span>Actions</span></button>
           </>}
           <input ref={inputRef} type="file" multiple hidden onChange={e => e.target.files && mutate(() => api.upload(currentDir, e.target.files!), currentDir, () => api.upload(currentDir, e.target.files!, true))} />
         </div> : <div className="toolbar">
@@ -585,7 +581,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       setViewer({ entry, type: 'image' }); setSelected(new Set([entry.id])); setPrimary(entry)
     }} onClose={() => setViewer(null)} />}
     {trash && <TrashWindow items={trash} onClose={() => setTrash(null)} onChanged={async () => setTrash(await api.listTrash())} onRestored={entry => refresh(entry.parentId)} setError={setError} />}
-    {folderMenu && <FolderContextMenu {...folderMenu} close={() => setFolderMenu(null)} createItem={createItem} paste={() => paste(folderMenu.directoryId, folderMenu.path)} hasClipboard={Boolean(clipboard)} showProperties={id => showProperties(id)} setError={setError} />}
+    {folderMenu && <FolderContextMenu {...folderMenu} close={() => setFolderMenu(null)} createItem={createItem} paste={() => paste(folderMenu.directoryId, folderMenu.path)} hasClipboard={Boolean(clipboard)} showProperties={id => showProperties(id)} setError={setError} mobileControls={isMobile ? { hidden, toggleHidden: () => setHidden(value => !value), refresh: () => refresh(folderMenu.directoryId) } : undefined} />}
+    {isMobile && mobileSelectionMenu && mobileSelectionEntry && <ContextMenu entry={mobileSelectionEntry} selectedEntries={previewEntries} x={innerWidth - 12} y={80} close={() => setMobileSelectionMenu(false)} open={() => activate(mobileSelectionEntry)} renameEntry={rename} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} />}
     {properties && <PropertiesDialog {...properties} onClose={() => setProperties(null)} />}
     <div id="window-tray" className="window-tray" role="region" aria-label="Minimized windows" />
   </div>
@@ -958,7 +955,7 @@ function FileList({ rows, view, mobile = false, selected, cutIds, setSelected, s
     {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => mobile ? activate(entry) : selectEntry(entry, index, event)} onDoubleClick={mobile ? undefined : () => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...(mobile ? {} : dragProps(entry))}>
       {mobile && <input type="checkbox" aria-label={`Select ${entry.name}`} checked={selected.has(entry.id)} onClick={event => event.stopPropagation()} onChange={() => toggleMobileSelection(entry)} />}
       <button className="card-menu" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>
-      {entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : entry.mime.startsWith('image/') || (view !== 'small' && entry.mime.startsWith('video/')) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view, entry.etag)} loading="lazy" />{entry.mime.startsWith('video/') && entry.browserReady && <VideoReadyBadge />}</button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
+      {mobile ? <FileGlyph entry={entry} /> : entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : entry.mime.startsWith('image/') || (view !== 'small' && entry.mime.startsWith('video/')) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view, entry.etag)} loading="lazy" />{entry.mime.startsWith('video/') && entry.browserReady && <VideoReadyBadge />}</button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
       <button className="filename" tabIndex={-1} title={entry.name}>{entry.name}</button>
       {view !== 'small' && <small>{formatBytes(entry.size)}</small>}
     </div>)}
@@ -1048,7 +1045,7 @@ function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, d
   </PositionedContextMenu>
 }
 
-function FolderContextMenu({ directoryId, path, x, y, close, createItem, paste, hasClipboard, showProperties, setError }: { directoryId: string; path: string; x: number; y: number; close: () => void; createItem: (kind: 'file' | 'directory', directoryId?: string) => Promise<void>; paste: () => Promise<void>; hasClipboard: boolean; showProperties: (id: string) => void; setError: (message: string) => void }) {
+function FolderContextMenu({ directoryId, path, x, y, close, createItem, paste, hasClipboard, showProperties, setError, mobileControls }: { directoryId: string; path: string; x: number; y: number; close: () => void; createItem: (kind: 'file' | 'directory', directoryId?: string) => Promise<void>; paste: () => Promise<void>; hasClipboard: boolean; showProperties: (id: string) => void; setError: (message: string) => void; mobileControls?: { hidden: boolean; toggleHidden: () => void; refresh: () => void } }) {
   useEffect(() => {
     const dismiss = () => close()
     const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') close() }
@@ -1062,11 +1059,15 @@ function FolderContextMenu({ directoryId, path, x, y, close, createItem, paste, 
     close()
   }
   const properties = () => { close(); showProperties(directoryId) }
+  const refresh = () => { close(); mobileControls?.refresh() }
+  const toggleHidden = () => { close(); mobileControls?.toggleHidden() }
   return <PositionedContextMenu x={x} y={y}>
     <button role="menuitem" autoFocus onClick={() => create('directory')}><Folder /> New Folder</button>
     <button role="menuitem" onClick={() => create('file')}><File /> New File</button>
     <span className="context-divider" />
     <button role="menuitem" disabled={!hasClipboard} onClick={pasteHere}><ClipboardPaste /> Paste</button>
+    {mobileControls && <button role="menuitem" onClick={refresh}><RefreshCw /> Refresh</button>}
+    {mobileControls && <button role="menuitem" onClick={toggleHidden}><Eye /> {mobileControls.hidden ? 'Hide hidden files' : 'Show hidden files'}</button>}
     <button role="menuitem" onClick={copyPath}><Copy /> Copy Path</button>
     <button role="menuitem" onClick={properties}><Info /> Properties</button>
   </PositionedContextMenu>
