@@ -23,7 +23,7 @@ import { isAdjacentColumnMove, moveConfirmationMessage, springLoadedPath } from 
 import { directoryContentsLabel, propertyTypeLabel } from './propertiesState'
 import { TerminalDock } from './TerminalDock'
 import { ClipboardOperation, RemoteClipboard, clipboardIdsForEntry, clipboardShortcut, movableClipboardIds, pasteProblem, shouldHandleClipboardShortcut } from './fileClipboard'
-import { markdownSanitizeSchema, markdownUrlTransform, resolveMarkdownImageSource } from './markdownPreview'
+import { isMarkdownLocalTarget, isMarkdownMp4Source, markdownSanitizeSchema, markdownUrlTransform, resolveMarkdownFileId, resolveMarkdownMediaSource } from './markdownPreview'
 import { launchVfxEditor } from './vfxLaunch'
 import { canvasPng, drawMarkupStroke, MarkupStroke, markupPoint, markupStrokeWidth } from './imageMarkup'
 import { editorSaveShortcut, proportionalScrollTop, shouldApplyDocumentResponse, wheelDeltaPixels } from './editorState'
@@ -319,6 +319,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       if (requestGeneration === documentRequest.current) window.location.href = contentUrl(entry.id)
     }
   }
+  const activateMarkdownLink = async (id: string) => activate(await api.metadata(id))
   const mutate = async (action: () => Promise<unknown>, dir = currentDir, replace?: () => Promise<unknown>) => {
     setError(''); try { await action(); await refresh(dir) } catch (e) {
       if (replace && e instanceof ApiFailure && e.code === 'already_exists' && await confirmAction(`${e.message}. Replace it and move the old item to Trash?`, { title: 'Replace existing item?', confirmLabel: 'Replace', danger: true })) { try { await replace(); await refresh(dir); return } catch (retryError) { setError(messageOf(retryError)); return } }
@@ -529,7 +530,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         {terminal && <TerminalDock directoryId={terminal.directoryId} hidden={terminal.hidden} onHide={() => setTerminal(current => current && ({ ...current, hidden: true }))} onClose={() => setTerminal(null)} />}
       </div>
     </div>
-    {editor && <EditorWindow key={editor.document.id} document={editor.document} entry={editor.entry} onDirtyChange={setEditorDirty} onClose={() => { documentRequest.current++; setEditor(null); setEditorDirty(false) }} onSaved={saved => setEditor(current => current?.document.id === saved.id ? { ...current, document: saved } : current)} />}
+    {editor && <EditorWindow key={editor.document.id} document={editor.document} entry={editor.entry} onOpenFile={activateMarkdownLink} onDirtyChange={setEditorDirty} onClose={() => { documentRequest.current++; setEditor(null); setEditorDirty(false) }} onSaved={saved => setEditor(current => current?.document.id === saved.id ? { ...current, document: saved } : current)} />}
     {viewer && <ViewerWindow {...viewer} images={viewerImages} onNavigate={entry => {
       setViewer({ entry, type: 'image' }); setSelected(new Set([entry.id])); setPrimary(entry)
     }} onMarkupSaved={async entry => {
@@ -1068,7 +1069,7 @@ function ViewSelector({ view, setView }: { view: ViewMode; setView: (view: ViewM
   </div>
 }
 
-function EditorWindow({ document, entry, onClose, onSaved, onDirtyChange }: { document: DocumentFile; entry: Pick<Entry, 'name' | 'path'>; onClose: () => void; onSaved: (doc: DocumentFile) => void; onDirtyChange: (dirty: boolean) => void }) {
+function EditorWindow({ document, entry, onClose, onSaved, onDirtyChange, onOpenFile }: { document: DocumentFile; entry: Pick<Entry, 'name' | 'path'>; onClose: () => void; onSaved: (doc: DocumentFile) => void; onDirtyChange: (dirty: boolean) => void; onOpenFile: (id: string) => Promise<void> }) {
   const confirmAction = useConfirm()
   const [content, setContent] = useState(document.content)
   const isMarkdown = document.mime.includes('markdown') || document.id.endsWith('bWQ')
@@ -1143,6 +1144,13 @@ function EditorWindow({ document, entry, onClose, onSaved, onDirtyChange }: { do
     const computedLineHeight = Number.parseFloat(getComputedStyle(editorScroll).lineHeight)
     editorScroll.scrollTop += wheelDeltaPixels(event, Number.isFinite(computedLineHeight) ? computedLineHeight : 18, editorScroll.clientHeight)
   }
+  const openMarkdownLink = (event: React.MouseEvent<HTMLAnchorElement>, href?: string) => {
+    if (!isMarkdownLocalTarget(href)) return
+    event.preventDefault(); setError('')
+    const id = resolveMarkdownFileId(document.id, href)
+    if (!id) { setError('The link must remain below the filesystem root.'); return }
+    void onOpenFile(id).catch(reason => setError(messageOf(reason)))
+  }
   const saveComplete = !dirty && Boolean(saveMessage) && !saving
   return <FloatingWindow title={`${entry.name} — Text editor`} onClose={() => void close()} className="editor-window">
     <div className="window-toolbar">
@@ -1163,7 +1171,12 @@ function EditorWindow({ document, entry, onClose, onSaved, onDirtyChange }: { do
           remarkPlugins={[remarkGfm]}
           rehypePlugins={[[rehypeSanitize, markdownSanitizeSchema]]}
           urlTransform={markdownUrlTransform}
-          components={{ img: ({ src, ...props }) => <img {...props} src={resolveMarkdownImageSource(document.id, src)} /> }}
+          components={{
+            a: ({ href, node: _node, ...props }) => <a {...props} href={href} onClick={event => openMarkdownLink(event, href)} />,
+            img: ({ src, alt, title, node: _node, ...props }) => isMarkdownMp4Source(src)
+              ? <video src={resolveMarkdownMediaSource(document.id, src)} controls preload="metadata" playsInline aria-label={alt || title || 'Embedded video'} title={title}>Your browser cannot play this video.</video>
+              : <img {...props} src={resolveMarkdownMediaSource(document.id, src)} alt={alt} title={title} />,
+          }}
         >{content}</ReactMarkdown></div></article>}
     </div>
   </FloatingWindow>

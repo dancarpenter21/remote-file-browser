@@ -17,34 +17,65 @@ export function markdownUrlTransform(url: string, key: string) {
   return defaultUrlTransform(url)
 }
 
-export function resolveMarkdownImageSource(documentId: string, source?: string) {
-  if (!source || source.startsWith('#') || source.startsWith('//') || urlScheme.test(source)) return source
+export function resolveMarkdownFileId(documentId: string, target?: string) {
+  const path = resolveMarkdownPath(documentId, target)
+  return path ? encodeFileId(path) : undefined
+}
+
+export function isMarkdownLocalTarget(target?: string): target is string {
+  return Boolean(target && !target.startsWith('#') && !target.startsWith('?') && !target.startsWith('//') && !urlScheme.test(target))
+}
+
+export function resolveMarkdownMediaSource(documentId: string, source?: string) {
+  if (!isMarkdownLocalTarget(source)) return source
+
+  const path = resolveMarkdownPath(documentId, source)
+  if (!path) return ''
+  const fragmentAt = source.indexOf('#')
+  const fragment = fragmentAt === -1 ? '' : source.slice(fragmentAt)
+  return `/api/v1/media/file?id=${encodeURIComponent(encodeFileId(path))}${fragment}`
+}
+
+export function isMarkdownMp4Source(source?: string) {
+  if (!source) return false
+  const pathEnd = suffixStart(source)
+  try {
+    return decodeURIComponent(source.slice(0, pathEnd)).toLowerCase().endsWith('.mp4')
+  } catch {
+    return false
+  }
+}
+
+function resolveMarkdownPath(documentId: string, target?: string) {
+  if (!isMarkdownLocalTarget(target)) return undefined
 
   try {
     const documentPath = decodeFileId(documentId)
-    const fragmentAt = source.indexOf('#')
-    const fragment = fragmentAt === -1 ? '' : source.slice(fragmentAt)
-    const withoutFragment = fragmentAt === -1 ? source : source.slice(0, fragmentAt)
-    const queryAt = withoutFragment.indexOf('?')
-    const encodedPath = queryAt === -1 ? withoutFragment : withoutFragment.slice(0, queryAt)
-    const imagePath = decodeURIComponent(encodedPath)
-    const parts = imagePath.startsWith('/') ? [] : documentPath.split('/').slice(0, -1)
+    const encodedPath = target.slice(0, suffixStart(target))
+    if (!encodedPath) return undefined
+    const targetPath = decodeURIComponent(encodedPath)
+    const parts = targetPath.startsWith('/') ? [] : documentPath.split('/').slice(0, -1)
 
-    for (const part of imagePath.split('/')) {
+    for (const part of targetPath.split('/')) {
       if (!part || part === '.') continue
       if (part === '..') {
-        if (!parts.length) return source
+        if (!parts.length) return undefined
         parts.pop()
       } else {
         parts.push(part)
       }
     }
 
-    if (!parts.length) return source
-    return `/api/v1/media/file?id=${encodeURIComponent(encodeFileId(parts.join('/')))}${fragment}`
+    return parts.length ? parts.join('/') : undefined
   } catch {
-    return source
+    return undefined
   }
+}
+
+function suffixStart(value: string) {
+  return [value.indexOf('?'), value.indexOf('#')]
+    .filter(index => index >= 0)
+    .reduce((end, index) => Math.min(end, index), value.length)
 }
 
 function decodeFileId(id: string) {
