@@ -1,0 +1,20 @@
+services:
+  frontend:
+    environment:
+      RFB_TLS_MODE: http
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: traefik-ingress
+      traefik.http.routers.remote-file-browser.rule: "Host(`${RFB_HOSTNAME:?Set RFB_HOSTNAME}`)"
+      traefik.http.routers.remote-file-browser.entrypoints: websecure
+      traefik.http.routers.remote-file-browser.tls: "true"
+      traefik.http.routers.remote-file-browser.service: remote-file-browser
+      traefik.http.services.remote-file-browser.loadbalancer.server.port: "8080"
+    networks:
+      - default
+      - traefik-ingress
+
+networks:
+  traefik-ingress:
+    external: true
+    name: traefik-ingress

@@ -4,14 +4,31 @@ A Dockerized, single-administrator file manager for a remote Linux server. It us
 
 ## Quick start
 
-1. Copy `.env.example` to `.env` and set `RFB_ROOT_PATH`, `RFB_UID`, and `RFB_GID` to the existing directory and numeric identity that should own file operations.
-2. Create `secrets/admin_password` containing the administrator password and generate `secrets/provenance_db_password` with `openssl rand -base64 32 > secrets/provenance_db_password`.
-3. Place a certificate and key at `secrets/tls.crt` and `secrets/tls.key`.
-4. Run `docker compose --profile prod up --build -d`, then open the server over HTTPS.
+1. Deploy the sibling `../traefik-ingress` Compose project and create its external `traefik-ingress` Docker network as described in that project's README.
+2. Copy `.env.example` to `.env` and set `RFB_ROOT_PATH`, `RFB_UID`, `RFB_GID`, and `RFB_HOSTNAME`. Private DNS must resolve that hostname to the ingress server, and the Traefik certificate must cover it.
+3. Create `secrets/admin_password` containing the administrator password and generate `secrets/provenance_db_password` with `openssl rand -base64 32 > secrets/provenance_db_password`.
+4. Run `docker compose -f compose.yaml -f compose.traefik.yaml --profile prod up --build -d`, then open the configured HTTPS hostname.
 
 To rotate the administrator password, replace the contents of `secrets/admin_password`. The new value is used for subsequent login attempts without restarting the stack; existing authenticated sessions remain valid.
 
-Only the frontend is published. The backend is reachable solely on the Compose network. HTTP mode is available for isolated development by setting `RFB_TLS_MODE=http` and `RFB_SECURE_COOKIES=false`; never use it across an untrusted network.
+Only the frontend joins the shared ingress network. It serves plain HTTP on that private Docker network while Traefik supplies the HTTPS boundary. The backend, provenance API, and database remain reachable solely on application networks. HTTP mode is available through the isolated `dev` profile with `RFB_SECURE_COOKIES=false`; never publish it across an untrusted network.
+
+### Direct TLS recovery
+
+If the shared ingress is unavailable, stop Traefik first and start the explicit
+direct-TLS overlay. Both deployments bind ports 80 and 443 and cannot run at the
+same time. Point the certificate variables at the centralized files used by
+Traefik rather than maintaining another copy of the private key.
+
+```sh
+cd ../traefik-ingress
+docker compose down
+cd ../remote-file-browser
+docker compose -f compose.yaml -f compose.direct.yaml --profile prod up -d --build
+```
+
+Return to normal operation by stopping the direct deployment, starting Traefik,
+and recreating Remote Files with `compose.traefik.yaml`.
 
 The application owns `.trash` and `.cache/remote-file-browser` inside the mounted root. Files deleted from ordinary folders are moved into `.trash`; permanent deletion is available only from the Trash view.
 
@@ -55,7 +72,7 @@ The complete OpenAPI document is available at `/api/openapi.json`, with interact
 
 Tracked templates cover the common cases:
 
-- `.env.linux.example` targets a native Linux home directory with HTTPS defaults.
+- `.env.linux.example` targets a native Linux home directory behind Traefik.
 - `.env.wsl.example` targets a directory under `/mnt/c/Users/...` and uses high, HTTP-only development ports.
 - `.env.example` is the generic starting point.
 
@@ -64,10 +81,10 @@ Keep the copied, machine-specific files untracked. For example:
 ```sh
 cp .env.wsl.example .env.wsl
 # Edit RFB_ROOT_PATH and identity values.
-docker compose --env-file .env.wsl --profile prod up --build
+docker compose --env-file .env.wsl --profile dev up --build
 ```
 
-For a Linux home directory, use `cp .env.linux.example .env` and run `docker compose --profile prod up --build`. WSL-mounted Windows filesystems do not reproduce every POSIX permission and ownership behavior, so permission testing should also be run against a native Linux directory.
+For a Linux home directory, use `cp .env.linux.example .env` and run the Traefik-backed production command from Quick start. WSL-mounted Windows filesystems do not reproduce every POSIX permission and ownership behavior, so permission testing should also be run against a native Linux directory.
 
 ## Development
 
@@ -108,7 +125,17 @@ docker compose -f compose.yaml -f compose.vfx.yaml --profile dev up -d --build f
 
 Remote Files remains on port 5173. Direct VFX development access uses port 5174, while integrated access uses `http://localhost:5173/vfx/`.
 
-For production, set `VFX_EDITOR_ALLOWED_ORIGINS` in the VFX deployment to the exact public Remote Files origin, start its `prod` profile, then start Remote Files with `compose.vfx.yaml` and the `prod` profile. VFX publishes no production port; nginx proxies `/vfx/` through the existing Remote Files session and TLS boundary. Omit the overlay to run Remote Files without VFX Editor; the context-menu action will be hidden.
+For production, set `VFX_EDITOR_ALLOWED_ORIGINS` to the exact HTTPS Remote Files
+origin, start the VFX `prod` profile, then run:
+
+```sh
+docker compose -f compose.yaml -f compose.vfx.yaml -f compose.traefik.yaml \
+  --profile prod up -d --build
+```
+
+VFX remains available only at `/vfx/` under the Remote Files hostname and is
+protected by the Remote Files login. It has no Traefik labels or independent
+hostname. Omit `compose.vfx.yaml` to run without VFX Editor.
 
 To run both processes directly on the host instead, use the following commands.
 
