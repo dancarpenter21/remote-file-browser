@@ -90,13 +90,24 @@ button svg, .button svg { width: 16px; height: 16px; } button.primary { backgrou
   .location>span { flex: none; font-size: 11px; }
   .browser-body { min-height: 0; }
   .column-preview { display: none !important; }
-  .browser-view>.preview-list.mobile-file-list { width: 100%; padding: 4px 8px max(30px, env(safe-area-inset-bottom)); display: flex; flex-direction: column; gap: 2px; align-content: initial; }
-  .mobile-file-list .preview-card { min-height: 50px; margin-left: 0 !important; padding: 5px 42px 5px 7px; flex-direction: row; align-items: center; gap: 9px; border-bottom: 1px solid #242424; border-radius: 6px; }
-  .mobile-file-list .preview-card>input { position: static; z-index: auto; flex: none; width: 20px; height: 20px; margin: 0; }
-  .mobile-file-list .preview-card>.glyph { width: 21px; height: 21px; flex: none; }
-  .mobile-file-list .preview-card>.file-glyph>svg { width: 21px; height: 21px; }
-  .mobile-file-list .filename { flex: 1; width: auto; justify-content: flex-start; text-align: left; font-size: 13px; }
-  .mobile-file-list .card-menu { top: 9px; right: 5px; width: 38px; height: 38px; padding: 8px; justify-content: center; opacity: 1; }
+  .mobile-directory-list { width: 100%; padding: 0 8px max(30px, env(safe-area-inset-bottom)); }
+  .mobile-directory-row { min-height: 58px; display: flex; align-items: stretch; border-bottom: 1px solid #292929; }
+  .mobile-directory-row.selected { background: #26384c; }
+  .mobile-directory-row.cut { opacity: .52; }
+  .mobile-directory-row>input { flex: none; width: 20px; height: 20px; margin: 19px 4px 0 8px; accent-color: #ccc; }
+  .mobile-entry-open, .mobile-parent-row { min-width: 0; min-height: 58px; padding: 7px 4px; flex: 1; display: flex; align-items: center; gap: 11px; border: 0; border-radius: 0; background: transparent; text-align: left; }
+  .mobile-entry-open:hover, .mobile-parent-row:hover { background: #1b1b1b; }
+  .mobile-glyph-slot { width: 28px; height: 28px; flex: 0 0 28px; display: grid; place-items: center; color: #aaa; }
+  .mobile-glyph-slot>.glyph, .mobile-glyph-slot>.file-glyph, .mobile-glyph-slot>svg { width: 22px; height: 22px; margin: 0; }
+  .mobile-glyph-slot>.file-glyph>svg { width: 22px; height: 22px; }
+  .mobile-entry-label { min-width: 0; flex: 1; display: grid; gap: 3px; }
+  .mobile-entry-label strong, .mobile-entry-label small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mobile-entry-label strong { color: #ddd; font-size: 14px; font-weight: 500; }
+  .mobile-entry-label small { color: #777; font-size: 11px; }
+  .mobile-directory-arrow { width: 18px; height: 18px; flex: none; color: #666; }
+  .mobile-row-actions { width: 44px; min-width: 44px; padding: 10px; justify-content: center; border: 0; border-radius: 0; background: transparent; }
+  .mobile-parent-row { width: 100%; border-bottom: 1px solid #353535; }
+  .mobile-parent-row .mobile-glyph-slot { color: #ccc; }
   .mobile-menu-backdrop { position: fixed; z-index: 90; inset: 0; background: #0009; backdrop-filter: blur(2px); }
   .mobile-menu-backdrop .context-menu { right: 8px !important; bottom: max(8px, env(safe-area-inset-bottom)) !important; left: 8px !important; top: auto !important; width: auto; max-height: min(72dvh, 620px); padding: 8px; border-radius: 12px; box-shadow: 0 -16px 60px #000d; }
   .mobile-menu-backdrop .context-menu button { min-height: 46px; }
@@ -118,8 +129,4 @@ button svg, .button svg { width: 16px; height: 16px; } button.primary { backgrou
   .terminal-heading { min-height: 44px; height: 44px; }
   .terminal-heading button { min-width: 38px; min-height: 38px; justify-content: center; }
   .image-nav { width: 44px; height: 58px; }
-}
-
-@media (max-width: 380px) {
-  .mobile-toolbar button>span { display: none; }
 }

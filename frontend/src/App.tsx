@@ -143,6 +143,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [terminal, setTerminal] = useState<{ directoryId: string; hidden: boolean } | null>(null)
   const isMobile = useMobileMode()
   const [drawerOpen, setDrawerOpen] = useState(false)
+  const [mobileSelecting, setMobileSelecting] = useState(false)
   const [mobileSelectionMenu, setMobileSelectionMenu] = useState(false)
   const [showPreview, setShowPreview] = useState(() => localStorage.getItem('rfb-column-preview') !== 'false')
   const [defaultColumnWidth] = useState(() => Math.min(480, Math.max(180, Number(localStorage.getItem('rfb-column-width')) || 240)))
@@ -492,7 +493,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     addEventListener('keydown', escape)
     return () => removeEventListener('keydown', escape)
   }, [drawerOpen])
-  useEffect(() => { if (!isMobile) setDrawerOpen(false) }, [isMobile])
+  useEffect(() => { if (!isMobile) { setDrawerOpen(false); setMobileSelecting(false) } }, [isMobile])
   useEffect(() => { if (!isMobile || !selected.size) setMobileSelectionMenu(false) }, [isMobile, selected.size])
 
   const activePage = currentDir === '' ? root : expanded[currentDir]
@@ -504,11 +505,11 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     ? ((viewer.entry.parentId === '' ? root : expanded[viewer.entry.parentId])?.entries.filter(entry => entry.mime.startsWith('image/')) ?? [viewer.entry])
     : []
   const toggleTerminal = () => setTerminal(current => current ? { ...current, hidden: !current.hidden } : { directoryId: currentDir, hidden: false })
-  const goToRoot = () => { setCurrentDir(''); setSelected(new Set()); setPrimary(null); setColumnPath([]) }
+  const goToRoot = () => { setCurrentDir(''); setSelected(new Set()); setPrimary(null); setColumnPath([]); setMobileSelecting(false) }
   const goToParent = () => {
     const parentPath = columnPath.slice(0, -1)
     const parent = parentPath.at(-1)
-    setCurrentDir(parent?.id ?? ''); setSelected(new Set()); setPrimary(null); setColumnPath(parentPath)
+    setCurrentDir(parent?.id ?? ''); setSelected(new Set()); setPrimary(null); setColumnPath(parentPath); setMobileSelecting(false)
   }
   const openCurrentFolderMenu = () => setFolderMenu({ directoryId: currentDir, path: columnPath.at(-1)?.path ?? '/fs-root', x: innerWidth - 12, y: 80 })
   const mobileSelectionEntry = primary && selected.has(primary.id) ? primary : previewEntries[0]
@@ -533,14 +534,15 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       <div className="content-stack">
         <main className={`browser ${view === 'details' ? 'column-view' : ''}`}>
         {isMobile ? <div className={`toolbar mobile-toolbar ${selected.size ? 'selection-toolbar' : ''}`}>
-          {selected.size ? <>
-            <button className="icon-button" title="Clear selection" aria-label="Clear selection" onClick={() => { setSelected(new Set()); setPrimary(null) }}><X /></button>
+          {mobileSelecting ? <>
+            <button title="Finish selecting" onClick={() => { setMobileSelecting(false); setSelected(new Set()); setPrimary(null) }}><Check /><span>Done</span></button>
             <strong className="selection-count">{selected.size} selected</strong>
             <span className="toolbar-spacer" />
-            <button title="Selected item actions" aria-label="Selected item actions" onClick={() => setMobileSelectionMenu(true)}><MoreHorizontal /><span>Actions</span></button>
+            <button disabled={!selected.size} title="Selected item actions" aria-label="Selected item actions" onClick={() => setMobileSelectionMenu(true)}><MoreHorizontal /><span>Actions</span></button>
           </> : <>
             <button title="Upload files" onClick={() => inputRef.current?.click()}><Upload /><span>Upload</span></button>
             <span className="toolbar-spacer" />
+            <button title="Select files" onClick={() => { setSelected(new Set()); setPrimary(null); setMobileSelecting(true) }}><Check /><span>Select</span></button>
             <button title="Folder actions" aria-label="Folder actions" onClick={openCurrentFolderMenu}><MoreHorizontal /><span>Actions</span></button>
           </>}
           <input ref={inputRef} type="file" multiple hidden onChange={e => e.target.files && mutate(() => api.upload(currentDir, e.target.files!), currentDir, () => api.upload(currentDir, e.target.files!, true))} />
@@ -565,7 +567,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         {error && <div className="banner error"><span>{error}</span><button onClick={() => setError('')}><X size={15} /></button></div>}
         <div className="browser-body"><div className="browser-view" onContextMenu={view === 'details' ? undefined : event => showFolderMenu(event, currentDir, columnPath.at(-1)?.path ?? '/fs-root')}>
           {!root ? <div className="center"><span className="spinner" /></div> : isMobile ?
-            !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view="small" mobile selected={selected} cutIds={cutIds} setSelected={setSelected} setPrimary={setPrimary} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} /> : view === 'details' ?
+            !activePage ? <div className="center"><span className="spinner" /></div> : <MobileDirectoryList rows={gridRows} selecting={mobileSelecting} canNavigateUp={Boolean(columnPath.length)} selected={selected} cutIds={cutIds} setSelected={setSelected} setPrimary={setPrimary} navigateUp={goToParent} activate={entry => { setMobileSelecting(false); activate(entry) }} renameEntry={rename} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} /> : view === 'details' ?
             <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} cutIds={cutIds} primary={primary} defaultColumnWidth={defaultColumnWidth} columnWidths={columnWidths} setColumnWidth={(key, width) => setColumnWidths(previous => ({ ...previous, [key]: width }))} navigate={navigateColumn} loadDirectory={loadDirectory} selectItems={selectColumnItems} selectDragItems={(ids, entry) => { setSelected(ids); setPrimary(entry) }} selectParent={selectParentColumn} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showFolderMenu={showFolderMenu} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} /> :
             !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view={view} selected={selected} cutIds={cutIds} setSelected={setSelected} setPrimary={setPrimary} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} />}
         </div>{!isMobile && showPreview && <ColumnPreview entries={previewEntries} primary={primary} />}</div>
@@ -886,8 +888,8 @@ function ProvenanceEditor({ entry }: { entry: Entry }) {
 
 type Row = { entry: Entry; depth: number }
 
-function FileList({ rows, view, mobile = false, selected, cutIds, setSelected, setPrimary, activate, renameEntry, moveEntries, deleteEntry, stageClipboard, pasteInto, hasClipboard, showProperties, concatenateVideos, setError }: {
-  rows: Row[]; view: ViewMode; mobile?: boolean; selected: Set<string>; cutIds: Set<string>; setSelected: (value: Set<string>) => void; setPrimary: (entry: Entry | null) => void
+function FileList({ rows, view, selected, cutIds, setSelected, setPrimary, activate, renameEntry, moveEntries, deleteEntry, stageClipboard, pasteInto, hasClipboard, showProperties, concatenateVideos, setError }: {
+  rows: Row[]; view: ViewMode; selected: Set<string>; cutIds: Set<string>; setSelected: (value: Set<string>) => void; setPrimary: (entry: Entry | null) => void
   activate: (entry: Entry) => void; renameEntry: (entry: Entry) => Promise<void>
   moveEntries: (ids: string[], destinationId: string) => Promise<boolean>
   stageClipboard: (operation: ClipboardOperation, entry: Entry) => void; pasteInto: (entry: Entry) => Promise<void>; hasClipboard: boolean
@@ -919,11 +921,6 @@ function FileList({ rows, view, mobile = false, selected, cutIds, setSelected, s
     }
     setSelected(new Set([entry.id])); setPrimary(entry); anchor.current = index
   }
-  const toggleMobileSelection = (entry: Entry) => {
-    const next = new Set(selected)
-    next.has(entry.id) ? next.delete(entry.id) : next.add(entry.id)
-    setSelected(next); setPrimary(next.has(entry.id) ? entry : next.size ? rows.find(row => next.has(row.entry.id))?.entry ?? null : null)
-  }
   const dragProps = (entry: Entry) => ({
     draggable: true,
     onDragStart: (event: React.DragEvent) => {
@@ -951,15 +948,52 @@ function FileList({ rows, view, mobile = false, selected, cutIds, setSelected, s
     },
   })
   const contextMenu = menu && <ContextMenu {...menu} selectedEntries={rows.map(row => row.entry).filter(entry => selected.has(entry.id))} close={() => setMenu(null)} open={() => activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={pasteInto} hasClipboard={hasClipboard} showProperties={showProperties} concatenateVideos={concatenateVideos} setError={setError} />
-  return <div className={`preview-list ${view} ${mobile ? 'mobile-file-list' : ''}`}>
-    {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => mobile ? activate(entry) : selectEntry(entry, index, event)} onDoubleClick={mobile ? undefined : () => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...(mobile ? {} : dragProps(entry))}>
-      {mobile && <input type="checkbox" aria-label={`Select ${entry.name}`} checked={selected.has(entry.id)} onClick={event => event.stopPropagation()} onChange={() => toggleMobileSelection(entry)} />}
+  return <div className={`preview-list ${view}`}>
+    {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => selectEntry(entry, index, event)} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
       <button className="card-menu" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>
-      {mobile ? <FileGlyph entry={entry} /> : entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : entry.mime.startsWith('image/') || (view !== 'small' && entry.mime.startsWith('video/')) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view, entry.etag)} loading="lazy" />{entry.mime.startsWith('video/') && entry.browserReady && <VideoReadyBadge />}</button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
+      {entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : entry.mime.startsWith('image/') || (view !== 'small' && entry.mime.startsWith('video/')) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view, entry.etag)} loading="lazy" />{entry.mime.startsWith('video/') && entry.browserReady && <VideoReadyBadge />}</button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
       <button className="filename" tabIndex={-1} title={entry.name}>{entry.name}</button>
       {view !== 'small' && <small>{formatBytes(entry.size)}</small>}
     </div>)}
     {contextMenu}
+  </div>
+}
+
+function MobileDirectoryList({ rows, selecting, canNavigateUp, selected, cutIds, setSelected, setPrimary, navigateUp, activate, renameEntry, deleteEntry, stageClipboard, pasteInto, hasClipboard, showProperties, concatenateVideos, setError }: {
+  rows: Row[]; selecting: boolean; canNavigateUp: boolean; selected: Set<string>; cutIds: Set<string>
+  setSelected: (value: Set<string>) => void; setPrimary: (entry: Entry | null) => void; navigateUp: () => void; activate: (entry: Entry) => void
+  renameEntry: (entry: Entry) => Promise<void>; deleteEntry: (entry: Entry) => Promise<void>; stageClipboard: (operation: ClipboardOperation, entry: Entry) => void
+  pasteInto: (entry: Entry) => Promise<void>; hasClipboard: boolean; showProperties: (entry: Entry) => void; concatenateVideos: (entries: Entry[]) => Promise<void>; setError: (message: string) => void
+}) {
+  const [menu, setMenu] = useState<{ entry: Entry; x: number; y: number } | null>(null)
+  useEffect(() => {
+    if (!menu) return
+    const close = () => setMenu(null)
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') close() }
+    addEventListener('pointerdown', close); addEventListener('keydown', escape)
+    return () => { removeEventListener('pointerdown', close); removeEventListener('keydown', escape) }
+  }, [menu])
+  const toggle = (entry: Entry) => {
+    const next = new Set(selected)
+    next.has(entry.id) ? next.delete(entry.id) : next.add(entry.id)
+    setSelected(next); setPrimary(next.has(entry.id) ? entry : rows.find(row => next.has(row.entry.id))?.entry ?? null)
+  }
+  const showMenu = (event: React.MouseEvent, entry: Entry) => {
+    event.preventDefault(); event.stopPropagation(); setMenu({ entry, x: event.clientX, y: event.clientY })
+  }
+  return <div className="mobile-directory-list" role="list" aria-label="Directory contents">
+    {canNavigateUp && <button className="mobile-parent-row" onClick={navigateUp}><span className="mobile-glyph-slot"><ChevronLeft /></span><span className="mobile-entry-label"><strong>Parent folder</strong><small>Go up one level</small></span></button>}
+    {!rows.length && <Empty />}
+    {rows.map(({ entry }) => <div className={`mobile-directory-row ${selected.has(entry.id) ? 'selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''}`} role="listitem" key={entry.id}>
+      {selecting && <input type="checkbox" aria-label={`Select ${entry.name}`} checked={selected.has(entry.id)} onChange={() => toggle(entry)} />}
+      <button className="mobile-entry-open" onClick={() => selecting ? toggle(entry) : activate(entry)}>
+        <span className="mobile-glyph-slot"><FileGlyph entry={entry} /></span>
+        <span className="mobile-entry-label"><strong title={entry.name}>{entry.name}</strong><small>{entry.kind === 'directory' ? 'Folder' : formatBytes(entry.size)}</small></span>
+        {entry.kind === 'directory' && <ChevronRight className="mobile-directory-arrow" />}
+      </button>
+      {!selecting && <button className="mobile-row-actions" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>}
+    </div>)}
+    {menu && <ContextMenu {...menu} selectedEntries={rows.map(row => row.entry).filter(entry => selected.has(entry.id))} close={() => setMenu(null)} open={() => activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={pasteInto} hasClipboard={hasClipboard} showProperties={showProperties} concatenateVideos={concatenateVideos} setError={setError} />}
   </div>
 }
 
