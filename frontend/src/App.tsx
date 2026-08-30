@@ -27,6 +27,7 @@ import { isMarkdownLocalTarget, isMarkdownMp4Source, markdownSanitizeSchema, mar
 import { launchVfxEditor } from './vfxLaunch'
 import { canvasPng, drawMarkupStroke, MarkupStroke, markupPoint, markupStrokeWidth } from './imageMarkup'
 import { editorSaveShortcut, proportionalScrollTop, shouldApplyDocumentResponse, wheelDeltaPixels } from './editorState'
+import { MOBILE_MEDIA_QUERY, observeMobileMode } from './mobileMode'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type EditorMode = 'edit' | 'split' | 'preview'
@@ -41,6 +42,12 @@ type PromptOptions = { title: string; label?: string; initialValue?: string; sub
 type PromptRequest = PromptOptions & { resolve: (answer: string | null) => void }
 const PromptContext = createContext<(options: PromptOptions) => Promise<string | null>>(async () => null)
 const VfxEditorContext = createContext(false)
+
+function useMobileMode() {
+  const [mobile, setMobile] = useState(() => matchMedia(MOBILE_MEDIA_QUERY).matches)
+  useEffect(() => observeMobileMode(window.matchMedia.bind(window), setMobile), [])
+  return mobile
+}
 
 function ConfirmProvider({ children }: { children: React.ReactNode }) {
   const [request, setRequest] = useState<ConfirmRequest | null>(null)
@@ -134,6 +141,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [folderMenu, setFolderMenu] = useState<{ directoryId: string; path: string; x: number; y: number } | null>(null)
   const [properties, setProperties] = useState<{ id: string; initial?: Entry } | null>(null)
   const [terminal, setTerminal] = useState<{ directoryId: string; hidden: boolean } | null>(null)
+  const isMobile = useMobileMode()
+  const [drawerOpen, setDrawerOpen] = useState(false)
   const [showPreview, setShowPreview] = useState(() => localStorage.getItem('rfb-column-preview') !== 'false')
   const [defaultColumnWidth] = useState(() => Math.min(480, Math.max(180, Number(localStorage.getItem('rfb-column-width')) || 240)))
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>(() => {
@@ -476,6 +485,14 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const openTrash = async () => { try { setTrash(await api.listTrash()) } catch (e) { setError(messageOf(e)) } }
   const logout = async () => { try { await api.logout() } finally { onLogout() } }
 
+  useEffect(() => {
+    if (!drawerOpen) return
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') setDrawerOpen(false) }
+    addEventListener('keydown', escape)
+    return () => removeEventListener('keydown', escape)
+  }, [drawerOpen])
+  useEffect(() => { if (!isMobile) setDrawerOpen(false) }, [isMobile])
+
   const activePage = currentDir === '' ? root : expanded[currentDir]
   const gridRows = (activePage?.entries ?? []).filter(entry => entry.name.toLowerCase().includes(filter.toLowerCase())).map(entry => ({ entry, depth: 0 }))
   const visibleCount = gridRows.length
@@ -485,24 +502,53 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     ? ((viewer.entry.parentId === '' ? root : expanded[viewer.entry.parentId])?.entries.filter(entry => entry.mime.startsWith('image/')) ?? [viewer.entry])
     : []
   const toggleTerminal = () => setTerminal(current => current ? { ...current, hidden: !current.hidden } : { directoryId: currentDir, hidden: false })
-  return <div className="app-shell">
+  const goToRoot = () => { setCurrentDir(''); setSelected(new Set()); setPrimary(null); setColumnPath([]) }
+  const goToParent = () => {
+    const parentPath = columnPath.slice(0, -1)
+    const parent = parentPath.at(-1)
+    setCurrentDir(parent?.id ?? ''); setSelected(new Set()); setPrimary(null); setColumnPath(parentPath)
+  }
+  const openCurrentFolderMenu = () => setFolderMenu({ directoryId: currentDir, path: columnPath.at(-1)?.path ?? '/fs-root', x: innerWidth - 12, y: 80 })
+  return <div className={`app-shell ${isMobile ? 'mobile-mode' : ''}`}>
     <header className="topbar">
+      {isMobile && <button className="icon-button mobile-menu-button" title="Open navigation" aria-label="Open navigation" aria-expanded={drawerOpen} onClick={() => setDrawerOpen(true)}><Menu size={20} /></button>}
       <div className="brand"><FolderOpen size={20} /><strong>Remote Files</strong><span>/fs-root</span></div>
       <div className="search"><Search size={16} /><input placeholder="Filter visible files" value={filter} onChange={e => setFilter(e.target.value)} />{filter && <button type="button" className="search-clear" title="Clear file filter" aria-label="Clear file filter" onClick={() => setFilter('')}><X /></button>}</div>
-      {session.terminalEnabled && <button className={`icon-button ${terminal && !terminal.hidden ? 'active' : ''}`} title={terminal && !terminal.hidden ? 'Hide terminal' : 'Show terminal'} aria-label={terminal && !terminal.hidden ? 'Hide terminal' : 'Show terminal'} aria-pressed={Boolean(terminal && !terminal.hidden)} onClick={toggleTerminal}><SquareTerminal size={18} /></button>}
-      <button className="icon-button" title="Sign out" onClick={logout}><LogOut size={18} /></button>
+      {!isMobile && session.terminalEnabled && <button className={`icon-button ${terminal && !terminal.hidden ? 'active' : ''}`} title={terminal && !terminal.hidden ? 'Hide terminal' : 'Show terminal'} aria-label={terminal && !terminal.hidden ? 'Hide terminal' : 'Show terminal'} aria-pressed={Boolean(terminal && !terminal.hidden)} onClick={toggleTerminal}><SquareTerminal size={18} /></button>}
+      {!isMobile && <button className="icon-button" title="Sign out" onClick={logout}><LogOut size={18} /></button>}
     </header>
     <div className="workspace">
-      <aside>
-        <button className="nav-item active"><Folder size={17} /> Files</button>
-        <button className="nav-item" onClick={openTrash}><Trash2 size={17} /> Trash</button>
-        {session.terminalEnabled && <button className={`nav-item ${terminal && !terminal.hidden ? 'active' : ''}`} aria-pressed={Boolean(terminal && !terminal.hidden)} onClick={toggleTerminal}><SquareTerminal size={17} /> Terminal</button>}
+      {isMobile && drawerOpen && <div className="drawer-backdrop" role="presentation" onPointerDown={() => setDrawerOpen(false)} />}
+      <aside className={`navigation-sidebar ${drawerOpen ? 'open' : ''}`} role={isMobile ? 'dialog' : undefined} aria-modal={isMobile && drawerOpen ? true : undefined} aria-hidden={isMobile && !drawerOpen ? true : undefined} aria-label="Navigation">
+        <div className="drawer-heading"><strong>Remote Files</strong><button key={drawerOpen ? 'drawer-open' : 'drawer-closed'} className="icon-button" aria-label="Close navigation" autoFocus={isMobile && drawerOpen} onClick={() => setDrawerOpen(false)}><X /></button></div>
+        <button className="nav-item active" onClick={() => { goToRoot(); setDrawerOpen(false) }}><Folder size={17} /> Files</button>
+        <button className="nav-item" onClick={() => { void openTrash(); setDrawerOpen(false) }}><Trash2 size={17} /> Trash</button>
+        {session.terminalEnabled && <button className={`nav-item ${terminal && !terminal.hidden ? 'active' : ''}`} aria-pressed={Boolean(terminal && !terminal.hidden)} onClick={() => { toggleTerminal(); setDrawerOpen(false) }}><SquareTerminal size={17} /> Terminal</button>}
         <ConversionJobs />
-        <div className="aside-note"><span>Signed in as</span><strong>{session.username}</strong></div>
+        <div className="aside-note"><span>Signed in as</span><strong>{session.username}</strong>{isMobile && <button onClick={() => void logout()}><LogOut /> Sign out</button>}</div>
       </aside>
       <div className="content-stack">
         <main className={`browser ${view === 'details' ? 'column-view' : ''}`}>
-        <div className="toolbar">
+        {isMobile ? <div className={`toolbar mobile-toolbar ${selected.size ? 'selection-toolbar' : ''}`}>
+          {selected.size ? <>
+            <button className="icon-button" title="Clear selection" aria-label="Clear selection" onClick={() => { setSelected(new Set()); setPrimary(null) }}><X /></button>
+            <strong className="selection-count">{selected.size} selected</strong>
+            <span className="toolbar-spacer" />
+            <button className="icon-button" title="Copy selected" aria-label="Copy selected" onClick={() => stageClipboard('copy')}><Copy /></button>
+            <button className="icon-button" title="Cut selected" aria-label="Cut selected" onClick={() => stageClipboard('move')}><Scissors /></button>
+            {selected.size === 1 && <button className="icon-button" title="Rename selected" aria-label="Rename selected" onClick={() => void rename()}><Edit3 /></button>}
+            <button className="icon-button danger" title="Delete selected" aria-label="Delete selected" onClick={deleteSelected}><Trash2 /></button>
+          </> : <>
+            <button title="New folder" onClick={() => createItem('directory')}><Plus /><span>Folder</span></button>
+            <button title="Upload files" onClick={() => inputRef.current?.click()}><Upload /><span>Upload</span></button>
+            <button className="icon-button" disabled={!clipboard} title="Paste" aria-label="Paste" onClick={() => void paste()}><ClipboardPaste /></button>
+            <span className="toolbar-spacer" />
+            <button className={`icon-button ${hidden ? 'active' : ''}`} title={hidden ? 'Hide hidden files' : 'Show hidden files'} aria-label={hidden ? 'Hide hidden files' : 'Show hidden files'} aria-pressed={hidden} onClick={() => setHidden(value => !value)}><Eye /></button>
+            <button className="icon-button" title="Refresh" aria-label="Refresh" onClick={() => refresh()}><RefreshCw /></button>
+            <button className="icon-button" title="More folder actions" aria-label="More folder actions" onClick={openCurrentFolderMenu}><MoreHorizontal /></button>
+          </>}
+          <input ref={inputRef} type="file" multiple hidden onChange={e => e.target.files && mutate(() => api.upload(currentDir, e.target.files!), currentDir, () => api.upload(currentDir, e.target.files!, true))} />
+        </div> : <div className="toolbar">
           <button onClick={() => createItem('directory')}><Plus size={16} /> Folder</button>
           <button onClick={() => createItem('file')}><File size={16} /> File</button>
           <button onClick={() => inputRef.current?.click()}><Upload size={16} /> Upload</button>
@@ -518,14 +564,15 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
           <button className="icon-button" title="Refresh" onClick={() => refresh()}><RefreshCw size={16} /></button>
           <button className={`icon-button ${showPreview ? 'active' : ''}`} title={`${showPreview ? 'Hide' : 'Show'} preview`} aria-pressed={showPreview} onClick={() => setShowPreview(value => !value)}><Eye size={16} /></button>
           <ViewSelector view={view} setView={setView} />
-        </div>
-        <div className="location"><nav className="breadcrumbs" aria-label="Current directory"><button onClick={() => { setCurrentDir(''); setSelected(new Set()); setPrimary(null); setColumnPath([]) }}>fs-root</button>{columnPath.map((entry, index) => <span key={entry.id}><ChevronRight /><button onClick={() => { setCurrentDir(entry.id); setSelected(new Set()); setPrimary(null); setColumnPath(previous => previous.slice(0, index + 1)) }}>{entry.name}</button></span>)}</nav><span>{visibleCount} visible</span></div>
+        </div>}
+        <div className="location">{isMobile && <button className="mobile-back" disabled={!columnPath.length} title="Parent folder" aria-label="Go to parent folder" onClick={goToParent}><ChevronLeft /></button>}<nav className="breadcrumbs" aria-label="Current directory"><button onClick={goToRoot}>fs-root</button>{columnPath.map((entry, index) => <span key={entry.id}><ChevronRight /><button onClick={() => { setCurrentDir(entry.id); setSelected(new Set()); setPrimary(null); setColumnPath(previous => previous.slice(0, index + 1)) }}>{entry.name}</button></span>)}</nav><span>{visibleCount} visible</span></div>
         {error && <div className="banner error"><span>{error}</span><button onClick={() => setError('')}><X size={15} /></button></div>}
         <div className="browser-body"><div className="browser-view" onContextMenu={view === 'details' ? undefined : event => showFolderMenu(event, currentDir, columnPath.at(-1)?.path ?? '/fs-root')}>
-          {!root ? <div className="center"><span className="spinner" /></div> : view === 'details' ?
+          {!root ? <div className="center"><span className="spinner" /></div> : isMobile ?
+            !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view="small" mobile selected={selected} cutIds={cutIds} setSelected={setSelected} setPrimary={setPrimary} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} /> : view === 'details' ?
             <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} cutIds={cutIds} primary={primary} defaultColumnWidth={defaultColumnWidth} columnWidths={columnWidths} setColumnWidth={(key, width) => setColumnWidths(previous => ({ ...previous, [key]: width }))} navigate={navigateColumn} loadDirectory={loadDirectory} selectItems={selectColumnItems} selectDragItems={(ids, entry) => { setSelected(ids); setPrimary(entry) }} selectParent={selectParentColumn} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showFolderMenu={showFolderMenu} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} /> :
             !activePage ? <div className="center"><span className="spinner" /></div> : gridRows.length === 0 ? <Empty /> : <FileList rows={gridRows} view={view} selected={selected} cutIds={cutIds} setSelected={setSelected} setPrimary={setPrimary} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} />}
-        </div>{showPreview && <ColumnPreview entries={previewEntries} primary={primary} />}</div>
+        </div>{!isMobile && showPreview && <ColumnPreview entries={previewEntries} primary={primary} />}</div>
         </main>
         {terminal && <TerminalDock directoryId={terminal.directoryId} hidden={terminal.hidden} onHide={() => setTerminal(current => current && ({ ...current, hidden: true }))} onClose={() => setTerminal(null)} />}
       </div>
@@ -842,8 +889,8 @@ function ProvenanceEditor({ entry }: { entry: Entry }) {
 
 type Row = { entry: Entry; depth: number }
 
-function FileList({ rows, view, selected, cutIds, setSelected, setPrimary, activate, renameEntry, moveEntries, deleteEntry, stageClipboard, pasteInto, hasClipboard, showProperties, concatenateVideos, setError }: {
-  rows: Row[]; view: ViewMode; selected: Set<string>; cutIds: Set<string>; setSelected: (value: Set<string>) => void; setPrimary: (entry: Entry | null) => void
+function FileList({ rows, view, mobile = false, selected, cutIds, setSelected, setPrimary, activate, renameEntry, moveEntries, deleteEntry, stageClipboard, pasteInto, hasClipboard, showProperties, concatenateVideos, setError }: {
+  rows: Row[]; view: ViewMode; mobile?: boolean; selected: Set<string>; cutIds: Set<string>; setSelected: (value: Set<string>) => void; setPrimary: (entry: Entry | null) => void
   activate: (entry: Entry) => void; renameEntry: (entry: Entry) => Promise<void>
   moveEntries: (ids: string[], destinationId: string) => Promise<boolean>
   stageClipboard: (operation: ClipboardOperation, entry: Entry) => void; pasteInto: (entry: Entry) => Promise<void>; hasClipboard: boolean
@@ -875,6 +922,11 @@ function FileList({ rows, view, selected, cutIds, setSelected, setPrimary, activ
     }
     setSelected(new Set([entry.id])); setPrimary(entry); anchor.current = index
   }
+  const toggleMobileSelection = (entry: Entry) => {
+    const next = new Set(selected)
+    next.has(entry.id) ? next.delete(entry.id) : next.add(entry.id)
+    setSelected(next); setPrimary(next.has(entry.id) ? entry : next.size ? rows.find(row => next.has(row.entry.id))?.entry ?? null : null)
+  }
   const dragProps = (entry: Entry) => ({
     draggable: true,
     onDragStart: (event: React.DragEvent) => {
@@ -902,8 +954,9 @@ function FileList({ rows, view, selected, cutIds, setSelected, setPrimary, activ
     },
   })
   const contextMenu = menu && <ContextMenu {...menu} selectedEntries={rows.map(row => row.entry).filter(entry => selected.has(entry.id))} close={() => setMenu(null)} open={() => activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={pasteInto} hasClipboard={hasClipboard} showProperties={showProperties} concatenateVideos={concatenateVideos} setError={setError} />
-  return <div className={`preview-list ${view}`}>
-    {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => selectEntry(entry, index, event)} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
+  return <div className={`preview-list ${view} ${mobile ? 'mobile-file-list' : ''}`}>
+    {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => mobile ? activate(entry) : selectEntry(entry, index, event)} onDoubleClick={mobile ? undefined : () => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...(mobile ? {} : dragProps(entry))}>
+      {mobile && <input type="checkbox" aria-label={`Select ${entry.name}`} checked={selected.has(entry.id)} onClick={event => event.stopPropagation()} onChange={() => toggleMobileSelection(entry)} />}
       <button className="card-menu" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>
       {entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : entry.mime.startsWith('image/') || (view !== 'small' && entry.mime.startsWith('video/')) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view, entry.etag)} loading="lazy" />{entry.mime.startsWith('video/') && entry.browserReady && <VideoReadyBadge />}</button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
       <button className="filename" tabIndex={-1} title={entry.name}>{entry.name}</button>
@@ -914,6 +967,7 @@ function FileList({ rows, view, selected, cutIds, setSelected, setPrimary, activ
 }
 
 function PositionedContextMenu({ x, y, children }: { x: number; y: number; children: React.ReactNode }) {
+  const isMobile = useMobileMode()
   const menuRef = useRef<HTMLDivElement>(null)
   const [position, setPosition] = useState({ x, y })
   useLayoutEffect(() => {
@@ -932,7 +986,8 @@ function PositionedContextMenu({ x, y, children }: { x: number; y: number; child
     addEventListener('resize', place)
     return () => removeEventListener('resize', place)
   }, [x, y])
-  return <div ref={menuRef} className="context-menu" style={{ left: position.x, top: position.y }} role="menu" onPointerDown={event => event.stopPropagation()}>{children}</div>
+  const menu = <div ref={menuRef} className="context-menu" style={{ left: position.x, top: position.y }} role="menu" onPointerDown={event => event.stopPropagation()}>{children}</div>
+  return isMobile ? <div className="mobile-menu-backdrop" role="presentation">{menu}</div> : menu
 }
 
 function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, deleteEntry, stageClipboard, pasteInto, hasClipboard, showProperties, concatenateVideos, setError }: { entry: Entry; selectedEntries: Entry[]; x: number; y: number; close: () => void; open: () => void; renameEntry: (entry: Entry) => Promise<void>; deleteEntry: (entry: Entry) => Promise<void>; stageClipboard: (operation: ClipboardOperation, entry: Entry) => void; pasteInto: (entry: Entry) => Promise<void>; hasClipboard: boolean; showProperties: (entry: Entry) => void; concatenateVideos: (entries: Entry[]) => Promise<void>; setError: (message: string) => void }) {

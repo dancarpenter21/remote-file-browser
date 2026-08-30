@@ -17,6 +17,8 @@ The application owns `.trash` and `.cache/remote-file-browser` inside the mounte
 
 Connected browsers subscribe to live filesystem updates only for directories they have loaded. This keeps changes made by host tools, scripts, and the integrated terminal visible without recursively consuming an inotify watch for every directory beneath the mounted root.
 
+At viewport widths of 800 pixels or less, the frontend automatically switches to a touch-oriented mobile layout. It uses a single-pane file list with one-tap navigation, explicit selection checkboxes, bottom-sheet action menus, and a navigation drawer for Trash, Terminal, media jobs, and account actions. Resizing above the breakpoint restores the existing desktop view without changing its saved view preference.
+
 ## Provenance storage
 
 Provenance URLs are stored by a dedicated Rust API in PostgreSQL. The API and database have no published ports: the backend reaches the API over one internal Docker network, and only the API can reach PostgreSQL over a second internal network. The named `provenance-db-data` volume holds the database across container replacement.
