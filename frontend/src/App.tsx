@@ -12,7 +12,7 @@ import {
   Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal, Pencil, Play,
   ExternalLink, Link2, Minus, Plus, RefreshCw, RotateCw, Save, Scissors, Search, SquareTerminal, Trash2, Undo2, Upload, WrapText, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
-import { api, ApiFailure, CacheCleanupReport, ConcatenationJob, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, ExtractionJob, LiveEvent, liveEventsUrl, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
+import { api, ApiFailure, CacheCleanupReport, ConcatenationJob, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, ExtractionJob, LiveEvent, liveEventsUrl, liveFilesystemWatchMessage, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { deleteConfirmationMessage } from './deleteConfirmation'
 import { updateFinderPathForSelection } from './finderPath'
 import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState'
@@ -146,8 +146,10 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   })
   const inputRef = useRef<HTMLInputElement>(null)
   const documentRequest = useRef(0)
+  const liveEventsSocket = useRef<WebSocket | null>(null)
   const liveState = useRef({ root, expanded })
   liveState.current = { root, expanded }
+  const liveDirectorySubscription = Object.keys(expanded).sort().join(',')
 
   const loadRoot = async () => { try { setRoot(await api.list('', hidden)); setExpanded({}); setSelected(new Set()); setPrimary(null); setColumnPath([]); setCurrentDir('') } catch (e) { setError(messageOf(e)) } }
   useEffect(() => { loadRoot() }, [hidden])
@@ -170,6 +172,12 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     addEventListener('rfb:provenance-changed', changed)
     return () => removeEventListener('rfb:provenance-changed', changed)
   }, [])
+  useEffect(() => {
+    const socket = liveEventsSocket.current
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(liveFilesystemWatchMessage(['', ...Object.keys(liveState.current.expanded)]))
+    }
+  }, [liveDirectorySubscription])
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined
@@ -220,9 +228,14 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       dispatchEvent(new Event('rfb:media-resync'))
     }
     const connect = () => {
-      socket = new WebSocket(liveEventsUrl())
-      socket.onopen = () => { retry = 1000 }
-      socket.onmessage = message => {
+      const connection = new WebSocket(liveEventsUrl())
+      socket = connection
+      liveEventsSocket.current = connection
+      connection.onopen = () => {
+        retry = 1000
+        connection.send(liveFilesystemWatchMessage(['', ...Object.keys(liveState.current.expanded)]))
+      }
+      connection.onmessage = message => {
         try {
           const event = JSON.parse(message.data) as LiveEvent
           if (event.type === 'resync') resync()
@@ -231,7 +244,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
           else dispatchEvent(new CustomEvent<LiveEvent>('rfb:media-live', { detail: event }))
         } catch { resync() }
       }
-      socket.onclose = () => {
+      connection.onclose = () => {
+        if (liveEventsSocket.current === connection) liveEventsSocket.current = null
         if (stopped) return
         reconnectTimer = setTimeout(connect, retry)
         retry = Math.min(30000, retry * 2)
@@ -242,6 +256,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     connect()
     return () => {
       stopped = true; clearTimeout(timer); clearTimeout(reconnectTimer); socket?.close()
+      if (liveEventsSocket.current === socket) liveEventsSocket.current = null
       removeEventListener('rfb:video-ready', videoReady)
     }
   }, [hidden])

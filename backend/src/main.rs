@@ -48,6 +48,7 @@ const TERMINAL_TICKET_TTL: Duration = Duration::from_secs(30);
 const TERMINAL_MAX_INPUT_BYTES: usize = 64 * 1024;
 const TERMINAL_DEFAULT_ROWS: u16 = 24;
 const TERMINAL_DEFAULT_COLS: u16 = 80;
+const LIVE_MAX_WATCH_DIRECTORIES: usize = 1024;
 const VFX_EDITOR_MAX_SOURCE_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -59,8 +60,7 @@ struct AppState {
     direct_playable: Arc<DashMap<String, bool>>,
     extraction_jobs: Arc<DashMap<String, ExtractionJob>>,
     concatenation_jobs: Arc<DashMap<String, ConcatenationJob>>,
-    provenance: Arc<RwLock<HashMap<String, Vec<String>>>>,
-    provenance_write: Arc<Mutex<()>>,
+    provenance: ProvenanceClient,
     cache_index: Arc<RwLock<CacheIndex>>,
     cache_write: Arc<Mutex<()>>,
     cache_cleanup: Arc<Mutex<()>>,
@@ -85,6 +85,7 @@ struct Config {
     terminal_enabled: bool,
     terminal_shell: PathBuf,
     terminal_max_sessions: usize,
+    provenance_api_url: String,
     vfx_editor_api_url: Option<String>,
 }
 
@@ -116,6 +117,7 @@ impl AdminPasswordSource {
 struct TerminalTicket {
     session_token: String,
     directory: PathBuf,
+    directory_id: String,
     expires: SystemTime,
 }
 
@@ -357,7 +359,6 @@ async fn main() {
     fs::create_dir_all(cache.join("hls"))
         .await
         .expect("create media cache");
-    let provenance = load_provenance(&cache).await;
     let cache_index = load_cache_index(&cache).await;
     let provenance_api_token = read_optional_token("RFB_PROVENANCE_API_TOKEN_FILE").await;
     let (live_event_tx, _) = broadcast::channel(512);
@@ -383,12 +384,16 @@ async fn main() {
         terminal_enabled: env_bool("RFB_TERMINAL_ENABLED", true),
         terminal_shell: PathBuf::from(env_string("RFB_TERMINAL_SHELL", "/bin/zsh")),
         terminal_max_sessions: env_usize("RFB_TERMINAL_MAX_SESSIONS", 4).max(1),
+        provenance_api_url: env_string("RFB_PROVENANCE_API_URL", "http://provenance-api:8090")
+            .trim_end_matches('/')
+            .to_string(),
         vfx_editor_api_url: std::env::var("RFB_VFX_EDITOR_API_URL")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(|value| value.trim_end_matches('/').to_string()),
     };
     let terminal_max_sessions = config.terminal_max_sessions;
+    let provenance = ProvenanceClient::http(config.provenance_api_url.clone());
     let body_limit =
         usize::try_from(config.upload_max.min(usize::MAX as u64)).unwrap_or(usize::MAX);
     let state = AppState {
@@ -399,8 +404,7 @@ async fn main() {
         direct_playable: Arc::new(DashMap::new()),
         extraction_jobs: Arc::new(DashMap::new()),
         concatenation_jobs: Arc::new(DashMap::new()),
-        provenance: Arc::new(RwLock::new(provenance)),
-        provenance_write: Arc::new(Mutex::new(())),
+        provenance,
         cache_index: Arc::new(RwLock::new(cache_index)),
         cache_write: Arc::new(Mutex::new(())),
         cache_cleanup: Arc::new(Mutex::new(())),
@@ -410,8 +414,11 @@ async fn main() {
         terminal_slots: Arc::new(Semaphore::new(terminal_max_sessions)),
     };
 
+    migrate_provenance_json(&state)
+        .await
+        .expect("migrate provenance metadata");
+
     spawn_cache_cleanup(state.clone());
-    spawn_filesystem_watcher(state.clone());
 
     let api = Router::new()
         .route("/auth/login", post(login))
@@ -779,7 +786,20 @@ async fn list_entries(
         if !query.hidden && name.as_bytes().starts_with(b".") {
             continue;
         }
-        entries.push(entry_from_path(&state, item.path()).await?);
+        entries.push(entry_from_path_with_provenance(&state, item.path(), false).await?);
+    }
+    let provenance = state
+        .provenance
+        .lookup(
+            entries
+                .iter()
+                .filter(|entry| entry.kind == "file")
+                .map(|entry| entry.id.clone())
+                .collect(),
+        )
+        .await?;
+    for entry in &mut entries {
+        entry.has_provenance = provenance.contains_key(&entry.id);
     }
     let sort = query.sort.as_deref().unwrap_or("name");
     entries.sort_by(|a, b| {
@@ -925,18 +945,300 @@ enum LiveEvent {
     },
 }
 
-async fn load_provenance(cache: &Path) -> HashMap<String, Vec<String>> {
-    match fs::read(cache.join("provenance.json")).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-            error!(%error, "could not parse provenance metadata");
-            HashMap::new()
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-        Err(error) => {
-            error!(%error, "could not read provenance metadata");
-            HashMap::new()
+#[derive(Clone)]
+struct ProvenanceClient {
+    base_url: Option<String>,
+    http: reqwest::Client,
+    memory: Arc<RwLock<HashMap<String, Vec<String>>>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProvenanceLookupRequest {
+    ids: Vec<String>,
+}
+#[derive(Deserialize)]
+struct ProvenanceLookupResponse {
+    records: HashMap<String, Vec<String>>,
+}
+#[derive(Serialize)]
+struct ProvenanceRecordRequest {
+    id: String,
+    urls: Vec<String>,
+}
+#[derive(Serialize)]
+struct ProvenanceAppendRequest {
+    id: String,
+    url: String,
+}
+#[derive(Deserialize)]
+struct ProvenanceRecordResponse {
+    id: String,
+    urls: Vec<String>,
+}
+#[derive(Serialize)]
+#[serde(
+    tag = "operation",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum ProvenanceLifecycleRequest {
+    Move {
+        source_id: String,
+        target_id: String,
+    },
+    Copy {
+        source_id: String,
+        target_id: String,
+    },
+    Trash {
+        source_id: String,
+        trash_id: Uuid,
+    },
+    Restore {
+        trash_id: Uuid,
+        target_id: String,
+    },
+    Purge {
+        trash_id: Uuid,
+    },
+}
+#[derive(Deserialize)]
+struct ProvenanceChanges {
+    changes: Vec<ProvenanceRecordResponse>,
+}
+#[derive(Serialize)]
+struct ProvenanceImportRequest {
+    records: HashMap<String, Vec<String>>,
+}
+#[derive(Deserialize)]
+struct ProvenanceImportResponse {
+    imported: usize,
+    skipped: bool,
+}
+#[derive(Deserialize)]
+struct InternalProblem {
+    code: String,
+    message: String,
+}
+
+impl ProvenanceClient {
+    fn http(base_url: String) -> Self {
+        Self {
+            base_url: Some(base_url),
+            http: reqwest::Client::new(),
+            memory: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+    #[cfg(test)]
+    fn memory() -> Self {
+        Self {
+            base_url: None,
+            http: reqwest::Client::new(),
+            memory: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+    async fn decode<T: serde::de::DeserializeOwned>(
+        &self,
+        response: reqwest::Response,
+    ) -> ApiResult<T> {
+        let status = response.status();
+        if status.is_success() {
+            return response.json().await.map_err(ApiError::internal);
+        }
+        let problem: InternalProblem = response.json().await.unwrap_or(InternalProblem {
+            code: "provenance_unavailable".into(),
+            message: "The provenance service failed".into(),
+        });
+        let status =
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+        let code = if status.is_server_error() {
+            "provenance_unavailable"
+        } else {
+            match problem.code.as_str() {
+                "invalid_id" => "invalid_id",
+                "invalid_batch" => "invalid_batch",
+                "invalid_url" => "invalid_url",
+                "too_many_urls" => "too_many_urls",
+                "provenance_conflict" => "provenance_conflict",
+                _ if status == StatusCode::CONFLICT => "provenance_conflict",
+                _ => "invalid_provenance",
+            }
+        };
+        Err(ApiError(status, code, problem.message))
+    }
+    fn url(&self, path: &str) -> ApiResult<String> {
+        self.base_url
+            .as_ref()
+            .map(|base| format!("{base}{path}"))
+            .ok_or_else(|| ApiError::internal("HTTP provenance URL unavailable in test store"))
+    }
+    async fn health(&self) -> ApiResult<()> {
+        if self.base_url.is_none() {
+            return Ok(());
+        }
+        let response = self
+            .http
+            .get(self.url("/healthz")?)
+            .send()
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "provenance_unavailable",
+                    "The provenance service is unavailable".into(),
+                )
+            })?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provenance_unavailable",
+                "The provenance service is unavailable".into(),
+            ))
+        }
+    }
+    async fn lookup(&self, ids: Vec<String>) -> ApiResult<HashMap<String, Vec<String>>> {
+        if self.base_url.is_none() {
+            let records = self.memory.read().await;
+            return Ok(ids
+                .into_iter()
+                .filter_map(|id| records.get(&id).cloned().map(|urls| (id, urls)))
+                .collect());
+        }
+        let response = self
+            .http
+            .post(self.url("/internal/v1/provenance/lookup")?)
+            .json(&ProvenanceLookupRequest { ids })
+            .send()
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "provenance_unavailable",
+                    "The provenance service is unavailable".into(),
+                )
+            })?;
+        Ok(self
+            .decode::<ProvenanceLookupResponse>(response)
+            .await?
+            .records)
+    }
+    async fn set(&self, id: String, urls: Vec<String>) -> ApiResult<ProvenanceRecordResponse> {
+        if self.base_url.is_none() {
+            let urls = normalize_provenance_urls(urls)?;
+            let mut records = self.memory.write().await;
+            if urls.is_empty() {
+                records.remove(&id);
+            } else {
+                records.insert(id.clone(), urls.clone());
+            }
+            return Ok(ProvenanceRecordResponse { id, urls });
+        }
+        let response = self
+            .http
+            .put(self.url("/internal/v1/provenance")?)
+            .json(&ProvenanceRecordRequest { id, urls })
+            .send()
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "provenance_unavailable",
+                    "The provenance service is unavailable".into(),
+                )
+            })?;
+        self.decode(response).await
+    }
+    async fn append(&self, id: String, url: String) -> ApiResult<ProvenanceRecordResponse> {
+        if self.base_url.is_none() {
+            let mut current = self
+                .lookup(vec![id.clone()])
+                .await?
+                .remove(&id)
+                .unwrap_or_default();
+            current.push(url);
+            return self.set(id, current).await;
+        }
+        let response = self
+            .http
+            .post(self.url("/internal/v1/provenance/append")?)
+            .json(&ProvenanceAppendRequest { id, url })
+            .send()
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "provenance_unavailable",
+                    "The provenance service is unavailable".into(),
+                )
+            })?;
+        self.decode(response).await
+    }
+    async fn lifecycle(
+        &self,
+        input: ProvenanceLifecycleRequest,
+    ) -> ApiResult<Vec<ProvenanceRecordResponse>> {
+        if self.base_url.is_none() {
+            return Ok(Vec::new());
+        }
+        let response = self
+            .http
+            .post(self.url("/internal/v1/provenance/lifecycle")?)
+            .json(&input)
+            .send()
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "provenance_unavailable",
+                    "The provenance service is unavailable".into(),
+                )
+            })?;
+        Ok(self.decode::<ProvenanceChanges>(response).await?.changes)
+    }
+    async fn import(
+        &self,
+        records: HashMap<String, Vec<String>>,
+    ) -> ApiResult<ProvenanceImportResponse> {
+        let response = self
+            .http
+            .post(self.url("/internal/v1/provenance/import")?)
+            .json(&ProvenanceImportRequest { records })
+            .send()
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "provenance_unavailable",
+                    "The provenance service is unavailable".into(),
+                )
+            })?;
+        self.decode(response).await
+    }
+}
+
+async fn migrate_provenance_json(state: &AppState) -> ApiResult<()> {
+    let source = state.config.cache.join("provenance.json");
+    let bytes = match fs::read(&source).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let records: HashMap<String, Vec<String>> =
+        serde_json::from_slice(&bytes).map_err(ApiError::internal)?;
+    let result = state.provenance.import(records).await?;
+    if !result.skipped {
+        fs::rename(&source, state.config.cache.join("provenance.json.migrated")).await?;
+        info!(
+            imported = result.imported,
+            "migrated provenance metadata to PostgreSQL"
+        );
+    } else {
+        warn!("PostgreSQL already contains provenance; legacy JSON was left untouched");
+    }
+    Ok(())
 }
 
 async fn load_cache_index(cache: &Path) -> CacheIndex {
@@ -1030,18 +1332,6 @@ async fn register_cache_record(state: &AppState, record: CacheRecord) -> ApiResu
     Ok(())
 }
 
-async fn persist_provenance_records(
-    cache: &Path,
-    records: &HashMap<String, Vec<String>>,
-) -> ApiResult<()> {
-    let bytes = serde_json::to_vec_pretty(records).map_err(ApiError::internal)?;
-    let target = cache.join("provenance.json");
-    let temporary = cache.join(".provenance.json.tmp");
-    fs::write(&temporary, bytes).await?;
-    fs::rename(temporary, target).await?;
-    Ok(())
-}
-
 fn normalize_provenance_urls(input: Vec<String>) -> ApiResult<Vec<String>> {
     if input.len() > 50 {
         return Err(ApiError::bad(
@@ -1077,21 +1367,8 @@ async fn commit_provenance(
     path: String,
     urls: Vec<String>,
 ) -> ApiResult<Provenance> {
-    let urls = normalize_provenance_urls(urls)?;
-    let _write = state.provenance_write.lock().await;
-    let mut records = state.provenance.read().await.clone();
-    let previous = records.get(&id).cloned().unwrap_or_default();
-    if previous == urls {
-        return Ok(Provenance { urls });
-    }
-    if urls.is_empty() {
-        records.remove(&id);
-    } else {
-        records.insert(id.clone(), urls.clone());
-    }
-    persist_provenance_records(&state.config.cache, &records).await?;
-    *state.provenance.write().await = records;
-    drop(_write);
+    let result = state.provenance.set(id.clone(), urls).await?;
+    let urls = result.urls;
     let _ = state.live_events.send(LiveEvent::Provenance {
         change: ProvenanceEvent {
             id,
@@ -1108,27 +1385,7 @@ async fn append_provenance(
     path: String,
     url: String,
 ) -> ApiResult<Provenance> {
-    let url = normalize_provenance_urls(vec![url])?
-        .into_iter()
-        .next()
-        .expect("one validated provenance URL");
-    let _write = state.provenance_write.lock().await;
-    let mut records = state.provenance.read().await.clone();
-    let urls = records.entry(id.clone()).or_default();
-    if urls.contains(&url) {
-        return Ok(Provenance { urls: urls.clone() });
-    }
-    if urls.len() >= 50 {
-        return Err(ApiError::bad(
-            "too_many_urls",
-            "A file can have at most 50 provenance URLs",
-        ));
-    }
-    urls.push(url);
-    let urls = urls.clone();
-    persist_provenance_records(&state.config.cache, &records).await?;
-    *state.provenance.write().await = records;
-    drop(_write);
+    let urls = state.provenance.append(id.clone(), url).await?.urls;
     let _ = state.live_events.send(LiveEvent::Provenance {
         change: ProvenanceEvent {
             id,
@@ -1153,9 +1410,9 @@ async fn get_provenance(
             "Provenance can only be attached to files",
         ));
     }
-    let records = state.provenance.read().await;
+    let mut records = state.provenance.lookup(vec![query.id.clone()]).await?;
     Ok(Json(Provenance {
-        urls: records.get(&query.id).cloned().unwrap_or_default(),
+        urls: records.remove(&query.id).unwrap_or_default(),
     }))
 }
 
@@ -1302,8 +1559,131 @@ async fn send_live_event(socket: &mut WebSocket, event: &LiveEvent) -> bool {
     socket.send(Message::Text(json.into())).await.is_ok()
 }
 
+#[derive(Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum LiveClientMessage {
+    WatchFilesystem { directory_ids: Vec<String> },
+}
+
+fn parse_live_client_message(text: &str) -> Result<LiveClientMessage, serde_json::Error> {
+    serde_json::from_str(text)
+}
+
+async fn update_live_directory_watches(
+    watcher: &mut notify::RecommendedWatcher,
+    watched: &mut HashMap<PathBuf, String>,
+    config: &Config,
+    directory_ids: Vec<String>,
+) {
+    if directory_ids.len() > LIVE_MAX_WATCH_DIRECTORIES {
+        warn!(
+            requested = directory_ids.len(),
+            maximum = LIVE_MAX_WATCH_DIRECTORIES,
+            "live filesystem watch subscription exceeded the directory limit"
+        );
+    }
+    let mut desired = HashMap::new();
+    let mut unique = HashSet::new();
+    for directory_id in directory_ids.into_iter().take(LIVE_MAX_WATCH_DIRECTORIES) {
+        if !unique.insert(directory_id.clone()) {
+            continue;
+        }
+        let Ok(directory) = resolve_existing(config, &directory_id).await else {
+            continue;
+        };
+        if !fs::metadata(&directory)
+            .await
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
+            continue;
+        }
+        desired.insert(directory, directory_id);
+    }
+
+    let removed = watched
+        .keys()
+        .filter(|path| !desired.contains_key(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in removed {
+        let _ = watcher.unwatch(&path);
+        watched.remove(&path);
+    }
+    for (path, directory_id) in desired {
+        match watched.entry(path) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(directory_id);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                match watcher.watch(entry.key(), RecursiveMode::NonRecursive) {
+                    Ok(()) => {
+                        entry.insert(directory_id);
+                    }
+                    Err(error) => {
+                        warn!(%error, path = %entry.key().display(), "could not watch loaded directory for live UI updates");
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn live_filesystem_event(
+    watched: &HashMap<PathBuf, String>,
+    event: &notify::Event,
+) -> Option<LiveEvent> {
+    if matches!(event.kind, EventKind::Access(_)) {
+        return None;
+    }
+    let mut directory_ids = event
+        .paths
+        .iter()
+        .flat_map(|path| {
+            [
+                watched.get(path),
+                path.parent().and_then(|parent| watched.get(parent)),
+            ]
+            .into_iter()
+            .flatten()
+            .cloned()
+        })
+        .collect::<Vec<_>>();
+    directory_ids.sort();
+    directory_ids.dedup();
+    (!directory_ids.is_empty()).then_some(LiveEvent::Filesystem { directory_ids })
+}
+
+#[derive(Clone)]
+enum LiveFilesystemChange {
+    Event(notify::Event),
+    Resync,
+}
+
 async fn live_socket(mut socket: WebSocket, state: AppState) {
     let mut events = state.live_events.subscribe();
+    let (filesystem_tx, mut filesystem_events) = broadcast::channel(512);
+    let mut filesystem_watcher =
+        match notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+            let change = match result {
+                Ok(event) => LiveFilesystemChange::Event(event),
+                Err(error) => {
+                    warn!(%error, "live filesystem watcher reported an error");
+                    LiveFilesystemChange::Resync
+                }
+            };
+            let _ = filesystem_tx.send(change);
+        }) {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                warn!(%error, "could not create live filesystem watcher");
+                None
+            }
+        };
+    let mut watched_directories = HashMap::new();
     if !send_live_event(&mut socket, &LiveEvent::Resync).await
         || !send_live_event(&mut socket, &media_snapshot(&state)).await
     {
@@ -1312,6 +1692,19 @@ async fn live_socket(mut socket: WebSocket, state: AppState) {
     loop {
         tokio::select! {
             incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(LiveClientMessage::WatchFilesystem { directory_ids }) =
+                        parse_live_client_message(text.as_str())
+                        && let Some(watcher) = filesystem_watcher.as_mut()
+                    {
+                        update_live_directory_watches(
+                            watcher,
+                            &mut watched_directories,
+                            &state.config,
+                            directory_ids,
+                        ).await;
+                    }
+                }
                 Some(Ok(Message::Ping(payload))) => {
                     if socket.send(Message::Pong(payload)).await.is_err() { return; }
                 }
@@ -1326,6 +1719,19 @@ async fn live_socket(mut socket: WebSocket, state: AppState) {
                     { return; }
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
+            },
+            event = filesystem_events.recv(), if filesystem_watcher.is_some() => match event {
+                Ok(LiveFilesystemChange::Event(event)) => {
+                    if let Some(event) = live_filesystem_event(&watched_directories, &event)
+                        && !send_live_event(&mut socket, &event).await
+                    {
+                        return;
+                    }
+                }
+                Ok(LiveFilesystemChange::Resync) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                    if !send_live_event(&mut socket, &LiveEvent::Resync).await { return; }
+                }
+                Err(broadcast::error::RecvError::Closed) => filesystem_watcher = None,
             }
         }
     }
@@ -1442,6 +1848,7 @@ async fn create_terminal_ticket(
         TerminalTicket {
             session_token,
             directory,
+            directory_id: input.directory_id,
             expires: now + TERMINAL_TICKET_TTL,
         },
     );
@@ -1473,7 +1880,14 @@ async fn terminal_websocket(
         .max_message_size(TERMINAL_MAX_INPUT_BYTES)
         .max_frame_size(TERMINAL_MAX_INPUT_BYTES)
         .on_upgrade(move |socket| {
-            terminal_socket(socket, state, session_token, ticket.directory, permit)
+            terminal_socket(
+                socket,
+                state,
+                session_token,
+                ticket.directory,
+                ticket.directory_id,
+                permit,
+            )
         })
         .into_response())
 }
@@ -1551,13 +1965,50 @@ fn start_terminal_process(
     Ok((pty, child))
 }
 
+fn terminal_directory_event(directory_id: &str, event: &notify::Event) -> Option<LiveEvent> {
+    (!matches!(event.kind, EventKind::Access(_))).then(|| LiveEvent::Filesystem {
+        directory_ids: vec![directory_id.to_string()],
+    })
+}
+
+fn start_terminal_directory_watcher(
+    state: &AppState,
+    directory: &Path,
+    directory_id: String,
+) -> notify::Result<notify::RecommendedWatcher> {
+    let live_events = state.live_events.clone();
+    let mut watcher =
+        notify::recommended_watcher(move |result: notify::Result<notify::Event>| match result {
+            Ok(event) => {
+                if let Some(event) = terminal_directory_event(&directory_id, &event) {
+                    let _ = live_events.send(event);
+                }
+            }
+            Err(error) => warn!(%error, "terminal directory watcher reported an error"),
+        })?;
+    watcher.watch(directory, RecursiveMode::NonRecursive)?;
+    Ok(watcher)
+}
+
 async fn terminal_socket(
     mut socket: WebSocket,
     state: AppState,
     session_token: String,
     directory: PathBuf,
+    directory_id: String,
     _permit: OwnedSemaphorePermit,
 ) {
+    let _directory_watcher = match start_terminal_directory_watcher(
+        &state,
+        &directory,
+        directory_id,
+    ) {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            warn!(%error, path = %directory.display(), "could not watch terminal directory for live UI updates");
+            None
+        }
+    };
     let shell = state.config.terminal_shell.clone();
     let (pty, mut child) = match start_terminal_process(&state.config, &directory) {
         Ok(process) => process,
@@ -1634,74 +2085,6 @@ async fn terminal_socket(
     let _ = socket.send(Message::Close(None)).await;
 }
 
-fn spawn_filesystem_watcher(state: AppState) {
-    std::thread::spawn(move || {
-        let root = state.config.root_canonical.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher = match notify::recommended_watcher(move |event| {
-            let _ = tx.send(event);
-        }) {
-            Ok(watcher) => watcher,
-            Err(error) => {
-                error!(%error, "could not create filesystem watcher");
-                return;
-            }
-        };
-        if let Err(error) = watcher.watch(&root, RecursiveMode::Recursive) {
-            error!(%error, path = %root.display(), "could not watch filesystem root");
-            return;
-        }
-        info!(path = %root.display(), "watching filesystem root for live UI updates");
-
-        loop {
-            let first = match rx.recv() {
-                Ok(event) => event,
-                Err(_) => return,
-            };
-            let mut batch = vec![first];
-            while let Ok(event) = rx.recv_timeout(Duration::from_millis(150)) {
-                batch.push(event);
-            }
-            let mut directory_ids = HashSet::new();
-            let mut resync = false;
-            for result in batch {
-                match result {
-                    Ok(event) if matches!(event.kind, EventKind::Access(_)) => {}
-                    Ok(event) => {
-                        for path in event.paths {
-                            let Ok(relative) = path.strip_prefix(&root) else {
-                                resync = true;
-                                continue;
-                            };
-                            if relative.starts_with(".cache/remote-file-browser")
-                                || relative.starts_with(".trash")
-                            {
-                                continue;
-                            }
-                            let parent = relative.parent().unwrap_or(Path::new(""));
-                            directory_ids.insert(encode_path(parent.as_os_str()));
-                        }
-                    }
-                    Err(error) => {
-                        warn!(%error, "filesystem watcher reported an error");
-                        resync = true;
-                    }
-                }
-            }
-            if resync {
-                directory_ids.insert(String::new());
-            }
-            if !directory_ids.is_empty() {
-                let mut directory_ids = directory_ids.into_iter().collect::<Vec<_>>();
-                directory_ids.sort();
-                let _ = state
-                    .live_events
-                    .send(LiveEvent::Filesystem { directory_ids });
-            }
-        }
-    });
-}
-
 async fn remap_provenance(
     state: &AppState,
     source: &Path,
@@ -1714,51 +2097,24 @@ async fn remap_provenance(
     let target_relative = target
         .strip_prefix(&state.config.root)
         .map_err(ApiError::internal)?;
-    let _write = state.provenance_write.lock().await;
-    let mut records = state.provenance.read().await.clone();
-    let changes = records
-        .iter()
-        .filter_map(|(id, urls)| {
-            let path = decode_path(id).ok()?;
-            let suffix = path.strip_prefix(source_relative).ok()?;
-            let new_path = if suffix.as_os_str().is_empty() {
-                target_relative.to_path_buf()
-            } else {
-                target_relative.join(suffix)
-            };
-            Some((
-                id.clone(),
-                path,
-                encode_path(new_path.as_os_str()),
-                new_path,
-                urls.clone(),
-            ))
-        })
-        .collect::<Vec<_>>();
-    if changes.is_empty() {
-        return Ok(());
-    }
-    let mut events = Vec::new();
-    for (old, old_path, new, new_path, urls) in changes {
-        if !copy {
-            records.remove(&old);
-            events.push(ProvenanceEvent {
-                id: old,
-                path: format!("/fs-root/{}", old_path.to_string_lossy()),
-                urls: Vec::new(),
-            });
+    let request = if copy {
+        ProvenanceLifecycleRequest::Copy {
+            source_id: encode_path(source_relative.as_os_str()),
+            target_id: encode_path(target_relative.as_os_str()),
         }
-        records.insert(new.clone(), urls.clone());
-        events.push(ProvenanceEvent {
-            id: new,
-            path: format!("/fs-root/{}", new_path.to_string_lossy()),
-            urls,
-        });
-    }
-    persist_provenance_records(&state.config.cache, &records).await?;
-    *state.provenance.write().await = records;
-    drop(_write);
-    for event in events {
+    } else {
+        ProvenanceLifecycleRequest::Move {
+            source_id: encode_path(source_relative.as_os_str()),
+            target_id: encode_path(target_relative.as_os_str()),
+        }
+    };
+    for change in state.provenance.lifecycle(request).await? {
+        let path = decode_path(&change.id)?;
+        let event = ProvenanceEvent {
+            id: change.id,
+            path: format!("/fs-root/{}", path.to_string_lossy()),
+            urls: change.urls,
+        };
         let _ = state
             .live_events
             .send(LiveEvent::Provenance { change: event });
@@ -1875,6 +2231,14 @@ async fn remap_cache(state: &AppState, source: &Path, target: &Path) -> ApiResul
 }
 
 async fn entry_from_path(state: &AppState, path: PathBuf) -> ApiResult<Entry> {
+    entry_from_path_with_provenance(state, path, true).await
+}
+
+async fn entry_from_path_with_provenance(
+    state: &AppState,
+    path: PathBuf,
+    query_provenance: bool,
+) -> ApiResult<Entry> {
     let config = &state.config;
     let meta = fs::symlink_metadata(&path).await?;
     let relative = path
@@ -1909,12 +2273,12 @@ async fn entry_from_path(state: &AppState, path: PathBuf) -> ApiResult<Entry> {
     let etag = metadata_etag(&meta);
     let id = encode_path(relative.as_os_str());
     let has_provenance = kind == "file"
+        && query_provenance
         && state
             .provenance
-            .read()
-            .await
-            .get(&id)
-            .is_some_and(|urls| !urls.is_empty());
+            .lookup(vec![id.clone()])
+            .await?
+            .contains_key(&id);
     let browser_ready = if kind == "file" && mime.starts_with("video/") {
         let key = find_cache_key(state, "hls", &id, &meta, None)
             .await
@@ -2172,6 +2536,7 @@ async fn create_item(
     Json(input): Json<CreateRequest>,
 ) -> ApiResult<(StatusCode, Json<Entry>)> {
     require_csrf(&state, &jar, &headers)?;
+    state.provenance.health().await?;
     validate_name(&input.name)?;
     let parent = resolve_parent(&state.config, &input.parent_id).await?;
     let path = parent.join(&input.name);
@@ -2182,7 +2547,7 @@ async fn create_item(
                 "An item with that name already exists",
             ));
         }
-        move_to_trash(&state.config, &path).await?;
+        move_to_trash(&state, &path).await?;
     }
     match input.kind.as_str() {
         "directory" => fs::create_dir(&path).await?,
@@ -2229,6 +2594,7 @@ async fn upload(
     mut multipart: Multipart,
 ) -> ApiResult<Json<Vec<Entry>>> {
     require_csrf(&state, &jar, &headers)?;
+    state.provenance.health().await?;
     let parent = resolve_parent(&state.config, &query.id).await?;
     let mut uploaded = Vec::new();
     while let Some(mut field) = multipart.next_field().await.map_err(ApiError::internal)? {
@@ -2245,7 +2611,7 @@ async fn upload(
                     format!("{name} already exists"),
                 ));
             }
-            move_to_trash(&state.config, &target).await?;
+            move_to_trash(&state, &target).await?;
             if let Err(error) = invalidate_cache_prefix(&state, &target).await {
                 warn!(?error, path = %target.display(), "could not invalidate replaced cache");
             }
@@ -2297,6 +2663,7 @@ async fn operation(
     Json(input): Json<OperationRequest>,
 ) -> ApiResult<Json<Vec<Entry>>> {
     require_csrf(&state, &jar, &headers)?;
+    state.provenance.health().await?;
     if input.sources.is_empty() || input.sources.len() > 100 {
         return Err(ApiError::bad(
             "invalid_batch",
@@ -2355,7 +2722,7 @@ async fn operation(
                     ),
                 ));
             }
-            move_to_trash(&state.config, &target).await?;
+            move_to_trash(&state, &target).await?;
         }
         match input.operation.as_str() {
             "move" | "rename" => {
@@ -2420,7 +2787,7 @@ async fn merge_directory_trees(state: &AppState, source: &Path, target: &Path) -
                             if source_meta.is_dir() && target_meta.is_dir() {
                                 tasks.push(MergeTask::Merge(source_item, target_item));
                             } else {
-                                move_to_trash(&state.config, &target_item).await?;
+                                move_to_trash(state, &target_item).await?;
                                 if let Err(error) =
                                     invalidate_cache_prefix(state, &target_item).await
                                 {
@@ -2502,6 +2869,7 @@ async fn soft_delete(
     Json(input): Json<DeleteRequest>,
 ) -> ApiResult<StatusCode> {
     require_csrf(&state, &jar, &headers)?;
+    state.provenance.health().await?;
     if input.ids.is_empty() || input.ids.len() > 100 {
         return Err(ApiError::bad(
             "invalid_batch",
@@ -2516,7 +2884,7 @@ async fn soft_delete(
                 "The root cannot be deleted",
             ));
         }
-        move_to_trash(&state.config, &path).await?;
+        move_to_trash(&state, &path).await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2530,7 +2898,8 @@ struct TrashInfo {
     deleted_at: DateTime<Utc>,
 }
 
-async fn move_to_trash(config: &Config, path: &Path) -> ApiResult<TrashInfo> {
+async fn move_to_trash(state: &AppState, path: &Path) -> ApiResult<TrashInfo> {
+    let config = &state.config;
     let relative = path
         .strip_prefix(&config.root)
         .map_err(ApiError::internal)?;
@@ -2552,6 +2921,23 @@ async fn move_to_trash(config: &Config, path: &Path) -> ApiResult<TrashInfo> {
         serde_json::to_vec_pretty(&info).map_err(ApiError::internal)?,
     )
     .await?;
+    for change in state
+        .provenance
+        .lifecycle(ProvenanceLifecycleRequest::Trash {
+            source_id: info.original_id.clone(),
+            trash_id: info.id,
+        })
+        .await?
+    {
+        let path = decode_path(&change.id)?;
+        let _ = state.live_events.send(LiveEvent::Provenance {
+            change: ProvenanceEvent {
+                id: change.id,
+                path: format!("/fs-root/{}", path.to_string_lossy()),
+                urls: change.urls,
+            },
+        });
+    }
     Ok(info)
 }
 
@@ -2610,6 +2996,7 @@ async fn restore_trash(
     Json(input): Json<RestoreRequest>,
 ) -> ApiResult<Json<Entry>> {
     require_csrf(&state, &jar, &headers)?;
+    state.provenance.health().await?;
     let item = state.config.trash.join("items").join(id.to_string());
     let info: TrashInfo = serde_json::from_slice(&fs::read(item.join("info.json")).await?)
         .map_err(ApiError::internal)?;
@@ -2638,12 +3025,32 @@ async fn restore_trash(
                 "The restore destination exists",
             ));
         }
-        move_to_trash(&state.config, &target).await?;
+        move_to_trash(&state, &target).await?;
     }
     let payload = item.join("payload");
     if fs::rename(&payload, &target).await.is_err() {
         copy_recursively(&payload, &target).await?;
         remove_recursively(&payload).await?;
+    }
+    let relative = target
+        .strip_prefix(&state.config.root)
+        .map_err(ApiError::internal)?;
+    for change in state
+        .provenance
+        .lifecycle(ProvenanceLifecycleRequest::Restore {
+            trash_id: id,
+            target_id: encode_path(relative.as_os_str()),
+        })
+        .await?
+    {
+        let path = decode_path(&change.id)?;
+        let _ = state.live_events.send(LiveEvent::Provenance {
+            change: ProvenanceEvent {
+                id: change.id,
+                path: format!("/fs-root/{}", path.to_string_lossy()),
+                urls: change.urls,
+            },
+        });
     }
     fs::remove_dir_all(item).await?;
     Ok(Json(entry_from_path(&state, target).await?))
@@ -2657,11 +3064,16 @@ async fn purge_trash(
     AxumPath(id): AxumPath<Uuid>,
 ) -> ApiResult<StatusCode> {
     require_csrf(&state, &jar, &headers)?;
+    state.provenance.health().await?;
     let item = state.config.trash.join("items").join(id.to_string());
     if fs::metadata(&item).await.is_err() {
         return Err(ApiError::not_found("Trash item not found"));
     }
     fs::remove_dir_all(item).await?;
+    state
+        .provenance
+        .lifecycle(ProvenanceLifecycleRequest::Purge { trash_id: id })
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2672,10 +3084,18 @@ async fn empty_trash(
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
     require_csrf(&state, &jar, &headers)?;
+    state.provenance.health().await?;
     let items = state.config.trash.join("items");
     let mut reader = fs::read_dir(&items).await?;
     while let Some(item) = reader.next_entry().await? {
+        let id = Uuid::parse_str(&item.file_name().to_string_lossy()).ok();
         fs::remove_dir_all(item.path()).await?;
+        if let Some(trash_id) = id {
+            state
+                .provenance
+                .lifecycle(ProvenanceLifecycleRequest::Purge { trash_id })
+                .await?;
+        }
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -5084,6 +5504,7 @@ mod tests {
                 terminal_enabled: true,
                 terminal_shell: PathBuf::from("/bin/sh"),
                 terminal_max_sessions: 2,
+                provenance_api_url: "http://provenance-api.invalid".into(),
                 vfx_editor_api_url: None,
             }),
             sessions: Arc::new(DashMap::new()),
@@ -5092,8 +5513,7 @@ mod tests {
             direct_playable: Arc::new(DashMap::new()),
             extraction_jobs: Arc::new(DashMap::new()),
             concatenation_jobs: Arc::new(DashMap::new()),
-            provenance: Arc::new(RwLock::new(HashMap::new())),
-            provenance_write: Arc::new(Mutex::new(())),
+            provenance: ProvenanceClient::memory(),
             cache_index: Arc::new(RwLock::new(CacheIndex::default())),
             cache_write: Arc::new(Mutex::new(())),
             cache_cleanup: Arc::new(Mutex::new(())),
@@ -5378,6 +5798,37 @@ mod tests {
         );
         assert!(parse_terminal_client_message(&oversized).is_err());
     }
+    #[test]
+    fn terminal_directory_events_refresh_the_starting_directory() {
+        let event = terminal_directory_event("work-id", &notify::Event::new(EventKind::Any));
+        assert_eq!(
+            serde_json::to_value(event.unwrap()).unwrap(),
+            serde_json::json!({ "type": "filesystem", "directoryIds": ["work-id"] })
+        );
+
+        let access = notify::Event::new(EventKind::Access(notify::event::AccessKind::Any));
+        assert!(terminal_directory_event("work-id", &access).is_none());
+    }
+    #[tokio::test]
+    async fn terminal_directory_watcher_publishes_filesystem_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        let mut events = state.live_events.subscribe();
+        let _watcher =
+            start_terminal_directory_watcher(&state, root.path(), "work-id".into()).unwrap();
+
+        std::fs::write(root.path().join("created.txt"), b"created").unwrap();
+        let directory_ids = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(LiveEvent::Filesystem { directory_ids }) = events.recv().await {
+                    break directory_ids;
+                }
+            }
+        })
+        .await
+        .expect("terminal directory watcher did not publish a filesystem event");
+        assert_eq!(directory_ids, vec!["work-id"]);
+    }
     #[tokio::test]
     async fn terminal_tickets_are_root_confined_session_bound_and_single_use() {
         let root = tempfile::tempdir().unwrap();
@@ -5407,6 +5858,7 @@ mod tests {
             take_terminal_ticket(&state, &response.ticket, "session-token", SystemTime::now())
                 .unwrap();
         assert_eq!(ticket.directory, root.path().join("work"));
+        assert_eq!(ticket.directory_id, encode_path(OsStr::new("work")));
         assert!(
             take_terminal_ticket(&state, &response.ticket, "session-token", SystemTime::now())
                 .is_err()
@@ -5417,6 +5869,7 @@ mod tests {
             TerminalTicket {
                 session_token: "another-session".into(),
                 directory: root.path().to_path_buf(),
+                directory_id: String::new(),
                 expires: SystemTime::now() + Duration::from_secs(60),
             },
         );
@@ -5578,16 +6031,10 @@ mod tests {
         );
         let (first, second) = tokio::join!(first, second);
         assert!(first.is_ok() && second.is_ok());
-        let records = state.provenance.read().await;
+        let records = state.provenance.lookup(vec!["file".into()]).await.unwrap();
         assert_eq!(records["file"].len(), 2);
-        drop(records);
         assert!(events.recv().await.is_ok());
         assert!(events.recv().await.is_ok());
-        let persisted: HashMap<String, Vec<String>> = serde_json::from_slice(
-            &std::fs::read(state.config.cache.join("provenance.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(persisted["file"].len(), 2);
     }
     #[test]
     fn openapi_documents_registered_routes_and_security() {
@@ -5821,6 +6268,75 @@ mod tests {
             .unwrap(),
             serde_json::json!({ "type": "filesystem", "directoryIds": ["folder"] })
         );
+    }
+    #[test]
+    fn live_watch_messages_and_events_target_loaded_directories() {
+        assert!(matches!(
+            parse_live_client_message(
+                r#"{"type":"watchFilesystem","directoryIds":["","folder"]}"#
+            ),
+            Ok(LiveClientMessage::WatchFilesystem { directory_ids })
+                if directory_ids == ["", "folder"]
+        ));
+        assert!(parse_live_client_message(r#"{"type":"unknown"}"#).is_err());
+
+        let root = PathBuf::from("/fs-root");
+        let folder = root.join("folder");
+        let watched = HashMap::from([(root, String::new()), (folder.clone(), "folder-id".into())]);
+        let event = notify::Event::new(EventKind::Any).add_path(folder);
+        assert_eq!(
+            serde_json::to_value(live_filesystem_event(&watched, &event).unwrap()).unwrap(),
+            serde_json::json!({
+                "type": "filesystem",
+                "directoryIds": ["", "folder-id"]
+            })
+        );
+        let access = notify::Event::new(EventKind::Access(notify::event::AccessKind::Any))
+            .add_path(PathBuf::from("/fs-root/folder/file.txt"));
+        assert!(live_filesystem_event(&watched, &access).is_none());
+    }
+    #[tokio::test]
+    async fn live_directory_subscriptions_watch_only_valid_directories() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("work")).unwrap();
+        std::fs::write(root.path().join("file.txt"), b"file").unwrap();
+        let state = test_state(root.path(), None);
+        let (filesystem_tx, mut filesystem_events) = tokio::sync::mpsc::unbounded_channel();
+        let mut watcher =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                let _ = filesystem_tx.send(event);
+            })
+            .unwrap();
+        let mut watched = HashMap::new();
+        let work_id = encode_path(OsStr::new("work"));
+        update_live_directory_watches(
+            &mut watcher,
+            &mut watched,
+            &state.config,
+            vec![
+                String::new(),
+                work_id.clone(),
+                encode_path(OsStr::new("file.txt")),
+                encode_path(OsStr::new("missing")),
+            ],
+        )
+        .await;
+        assert_eq!(watched.len(), 2);
+
+        std::fs::write(root.path().join("work/created.txt"), b"created").unwrap();
+        let directory_ids = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(Ok(event)) = filesystem_events.recv().await
+                    && let Some(LiveEvent::Filesystem { directory_ids }) =
+                        live_filesystem_event(&watched, &event)
+                {
+                    break directory_ids;
+                }
+            }
+        })
+        .await
+        .expect("loaded-directory watcher did not publish a filesystem event");
+        assert_eq!(directory_ids, vec![work_id]);
     }
     #[test]
     fn cache_records_include_inode_identity_and_load_legacy_indexes() {

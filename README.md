@@ -5,7 +5,7 @@ A Dockerized, single-administrator file manager for a remote Linux server. It us
 ## Quick start
 
 1. Copy `.env.example` to `.env` and set `RFB_ROOT_PATH`, `RFB_UID`, and `RFB_GID` to the existing directory and numeric identity that should own file operations.
-2. Create `secrets/admin_password` containing the administrator password.
+2. Create `secrets/admin_password` containing the administrator password and generate `secrets/provenance_db_password` with `openssl rand -base64 32 > secrets/provenance_db_password`.
 3. Place a certificate and key at `secrets/tls.crt` and `secrets/tls.key`.
 4. Run `docker compose --profile prod up --build -d`, then open the server over HTTPS.
 
@@ -15,13 +15,25 @@ Only the frontend is published. The backend is reachable solely on the Compose n
 
 The application owns `.trash` and `.cache/remote-file-browser` inside the mounted root. Files deleted from ordinary folders are moved into `.trash`; permanent deletion is available only from the Trash view.
 
+Connected browsers subscribe to live filesystem updates only for directories they have loaded. This keeps changes made by host tools, scripts, and the integrated terminal visible without recursively consuming an inotify watch for every directory beneath the mounted root.
+
+## Provenance storage
+
+Provenance URLs are stored by a dedicated Rust API in PostgreSQL. The API and database have no published ports: the backend reaches the API over one internal Docker network, and only the API can reach PostgreSQL over a second internal network. The named `provenance-db-data` volume holds the database across container replacement.
+
+On the first database-backed startup, legacy `.cache/remote-file-browser/provenance.json` data is imported transactionally when the database is empty. A successful import renames the file to `provenance.json.migrated`; restore that filename to `provenance.json` before rolling back to an older build. If PostgreSQL already contains records, the legacy file is left untouched.
+
+The browser-facing provenance API remains `/api/v1/fs/provenance`. To enable bearer-token automation, generate `secrets/provenance_api_token` and add `-f compose.automation.yaml` to the Compose command. The internal provenance API is never published by that overlay.
+
+Back up provenance with `docker compose exec -T provenance-db pg_dump -U rfb_provenance -d rfb_provenance > provenance.sql`. Restore into an empty database with `docker compose exec -T provenance-db psql -U rfb_provenance -d rfb_provenance < provenance.sql`.
+
 Media conversions and clip extractions report live FFmpeg progress over an authenticated WebSocket. The media-jobs panel also provides a cache reconciliation action that removes stale derived artifacts while preserving active work. Cache associations follow files moved or renamed through the UI, including moves performed as part of folder merges.
 
 ## Integrated terminal
 
 The Terminal control opens a resizable panel beneath the file browser. A new shell starts in the directory currently shown by the browser, remains alive when the panel is hidden, and stops when the panel is closed, the browser disconnects, or the login session ends. The frontend bundles MesloLGS Nerd Font faces so prompts and tools can display Nerd Font glyphs even when the browser machine has no Nerd Font installed; attribution and source hashes are recorded in `frontend/THIRD_PARTY_NOTICES.md`.
 
-The terminal runs inside the backend container as `RFB_UID:RFB_GID`. It can modify the `/fs-root` bind mount and use programs installed in that container, but it is not a shell on the Docker host. The container supplies zsh and launches it as a login shell with `HOME=/fs-root`, allowing a mounted home directory's zsh configuration to load. The existing read-only container filesystem, dropped capabilities, and `no-new-privileges` setting still apply.
+The terminal runs inside the backend container as `RFB_UID:RFB_GID`. It can modify the `/fs-root` bind mount and use programs installed in that container, but it is not a shell on the Docker host. The container supplies zsh and Vim and launches zsh as a login shell with `HOME=/fs-root`, allowing a mounted home directory's zsh configuration to load. The existing read-only container filesystem, dropped capabilities, and `no-new-privileges` setting still apply.
 
 Terminal access is enabled by default for the authenticated administrator because this is a single-administrator application. Configure it with:
 

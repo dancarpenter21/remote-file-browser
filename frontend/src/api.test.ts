@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { api, mediaUrl, setCsrf, thumbnailUrl } from './api'
+import { api, liveFilesystemWatchMessage, mediaUrl, setCsrf, thumbnailUrl } from './api'
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -7,6 +7,13 @@ afterEach(() => {
 })
 
 describe('preview URLs', () => {
+  it('builds a deduplicated live filesystem watch subscription', () => {
+    expect(JSON.parse(liveFilesystemWatchMessage(['', 'folder', 'folder']))).toEqual({
+      type: 'watchFilesystem',
+      directoryIds: ['', 'folder'],
+    })
+  })
+
   it('remain stable for the same file version and change with its etag', () => {
     expect(mediaUrl('folder/image.png', 'etag-one')).toBe(mediaUrl('folder/image.png', 'etag-one'))
     expect(mediaUrl('folder/image.png', 'etag-one')).not.toBe(mediaUrl('folder/image.png', 'etag-two'))
