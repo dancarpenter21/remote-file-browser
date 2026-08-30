@@ -1,0 +1,13 @@
+tls:
+  certificates:
+    - certFile: /run/tls/tls.crt
+      keyFile: /run/tls/tls.key
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /run/tls/tls.crt
+        keyFile: /run/tls/tls.key
+  options:
+    default:
+      minVersion: VersionTLS12
+      sniStrict: true

@@ -1,0 +1,32 @@
+{
+  "name": "remote-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/files/web",
+    "apps/text-editor",
+    "apps/video-studio/server",
+    "apps/video-studio/web",
+    "apps/video-studio/shared"
+  ],
+  "scripts": {
+    "dev:files": "npm run dev -w @remote-workspace/files-web",
+    "dev:text": "npm run dev -w @remote-workspace/text-editor",
+    "dev:video": "concurrently -n server,web -c cyan,magenta \"npm run dev -w @remote-workspace/video-server\" \"npm run dev -w @remote-workspace/video-web\"",
+    "build": "npm run build -w @remote-workspace/files-web && npm run build -w @remote-workspace/text-editor && npm run build -w @remote-workspace/video-web && npm run typecheck",
+    "typecheck": "tsc --noEmit -p apps/video-studio/tsconfig.json",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "engines": { "node": ">=24" },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "ffmpeg-static@5.3.0": true,
+    "@derhuerst/ffprobe-static@5.3.0": true
+  }
+}

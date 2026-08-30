@@ -1,4 +1,4 @@
-# VFX Editor
+# Video Studio
 
 A local-first browser editor for frame-accurate slow-motion sections and stadium ambience. Source files are copied into an application-owned project before processing; the selected original is never opened for writing.
 
@@ -45,7 +45,9 @@ Development projects are persisted in the `vfx-editor-dev-data` volume. Dependen
 
 ## Remote Files integration
 
-VFX Editor can be exposed at `/vfx/` through Remote Files and opened from a video's **Edit with VFX Editor** context-menu action. Remote Files streams the source directly to this service; VFX Editor keeps its own read-only copy and reuses the project while the Remote Files ID and version remain unchanged.
+Video Studio can be exposed at `/vfx/` through Remote Files and opened from a video's **Edit with Video Studio** context-menu action. Remote Files streams the source directly to this service; Video Studio keeps its own read-only copy and reuses the project while the Remote Files ID and version remain unchanged.
+
+When an integrated export finishes, the Remote Files backend copies it directly beside the original source as `name-edited.mp4`. Existing files are preserved with numeric suffixes, and the browser never downloads or navigates to the exported video. The revisioned export also remains in Video Studio's isolated project volume.
 
 Start this Compose project first so its external `vfx-editor` network exists, then start Remote Files with its `compose.vfx.yaml` overlay. For development:
 

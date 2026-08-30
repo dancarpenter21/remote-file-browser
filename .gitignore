@@ -11,15 +11,16 @@ secrets/*
 
 # Rust build output.
 target/
-backend/target/
+apps/**/target/
 
 # Frontend dependencies, build output, test coverage, and TypeScript caches.
-frontend/node_modules/
-frontend/dist/
-frontend/coverage/
-frontend/*.tsbuildinfo
-frontend/vite.config.js
-frontend/vite.config.d.ts
+node_modules/
+apps/**/node_modules/
+apps/**/dist/
+apps/**/coverage/
+apps/**/*.tsbuildinfo
+apps/**/vite.config.js
+apps/**/vite.config.d.ts
 
 # Local tool and editor artifacts.
 .cache/

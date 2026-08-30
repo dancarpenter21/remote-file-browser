@@ -2,23 +2,86 @@
 
 A Dockerized, single-administrator file manager for a remote Linux server. It uses a Rust backend and a React frontend, keeps filesystem operations rooted beneath `/fs-root`, provides recoverable deletion, and bundles FFmpeg for previews and browser-compatible playback.
 
-## Quick start
+## Launch
 
-1. Deploy the sibling `../traefik-ingress` Compose project and create its external `traefik-ingress` Docker network as described in that project's README.
-2. Copy `.env.example` to `.env` and set `RFB_ROOT_PATH`, `RFB_UID`, `RFB_GID`, and `RFB_HOSTNAME`. Private DNS must resolve that hostname to the ingress server, and the Traefik certificate must cover it.
-3. Create `secrets/admin_password` containing the administrator password and generate `secrets/provenance_db_password` with `openssl rand -base64 32 > secrets/provenance_db_password`.
-4. Run `docker compose -f compose.yaml -f compose.traefik.yaml --profile prod up --build -d`, then open the configured HTTPS hostname.
+### First-time setup
 
-To rotate the administrator password, replace the contents of `secrets/admin_password`. The new value is used for subsequent login attempts without restarting the stack; existing authenticated sessions remain valid.
+1. Copy the environment template and set `RFB_ROOT_PATH`, `RFB_UID`, `RFB_GID`, and `RFB_HOSTNAME`:
 
-Only the frontend joins the shared ingress network. It serves plain HTTP on that private Docker network while Traefik supplies the HTTPS boundary. The backend, provenance API, and database remain reachable solely on application networks. HTTP mode is available through the isolated `dev` profile with `RFB_SECURE_COOKIES=false`; never publish it across an untrusted network.
+   ```sh
+   cp .env.example .env
+   ```
+
+2. Create the required secrets:
+
+   ```sh
+   mkdir -p secrets
+   openssl rand -base64 24 > secrets/admin_password
+   openssl rand -base64 32 > secrets/provenance_db_password
+   ```
+
+3. For production, start the sibling `../traefik-ingress` project first. Its external `traefik-ingress` Docker network must exist, private DNS must resolve `RFB_HOSTNAME` to the ingress server, and the Traefik certificate must cover that hostname.
+
+### Production launch
+
+Launch the core file browser behind Traefik:
+
+```sh
+docker compose -f compose.yaml -f compose.traefik.yaml --profile prod up -d --build
+```
+
+To include the standalone Video Player app, add its overlay before the ingress overlay:
+
+```sh
+docker compose -f compose.yaml -f compose.apps.yaml -f compose.traefik.yaml --profile prod up -d --build
+```
+
+Open `https://$RFB_HOSTNAME`. Stop the selected stack with the same files and profile, replacing `up -d --build` with `down`.
+
+### Development launch
+
+Launch the core browser with Vite hot reload at `http://localhost:5173`:
+
+```sh
+RFB_SECURE_COOKIES=false docker compose --profile dev up -d --build frontend-dev
+```
+
+Launch it with the standalone Video Player app enabled:
+
+```sh
+RFB_SECURE_COOKIES=false docker compose -f compose.yaml -f compose.apps.yaml --profile dev up -d --build frontend-dev
+```
+
+Stop development with the matching Compose files, for example:
+
+```sh
+docker compose -f compose.yaml -f compose.apps.yaml --profile dev down
+```
+
+Set `RFB_DEV_PORT` to change port 5173. Set `RFB_DEV_POLLING=true` if bind-mounted source changes are not detected; the WSL template enables polling by default.
+
+### VFX Editor launch
+
+Start the sibling VFX Editor first, then launch Remote Files with its overlay:
+
+```sh
+cd ../vfx-editor
+docker compose --profile dev up -d --build
+cd ../remote-file-browser
+RFB_SECURE_COOKIES=false docker compose -f compose.yaml -f compose.vfx.yaml --profile dev up -d --build frontend-dev
+```
+
+Remote Files remains at `http://localhost:5173`; the integrated editor is under `/vfx/`. For production, start the VFX `prod` profile, set `VFX_EDITOR_ALLOWED_ORIGINS` to the exact Remote Files HTTPS origin, and run:
+
+```sh
+docker compose -f compose.yaml -f compose.vfx.yaml -f compose.traefik.yaml --profile prod up -d --build
+```
+
+The `compose.apps.yaml` and `compose.vfx.yaml` overlays can be included together when both integrations are needed; keep `compose.traefik.yaml` last in production.
 
 ### Direct TLS recovery
 
-If the shared ingress is unavailable, stop Traefik first and start the explicit
-direct-TLS overlay. Both deployments bind ports 80 and 443 and cannot run at the
-same time. Point the certificate variables at the centralized files used by
-Traefik rather than maintaining another copy of the private key.
+Use direct TLS only while the shared ingress is stopped because both deployments bind ports 80 and 443. Point the certificate variables at the centralized Traefik certificate files:
 
 ```sh
 cd ../traefik-ingress
@@ -27,8 +90,11 @@ cd ../remote-file-browser
 docker compose -f compose.yaml -f compose.direct.yaml --profile prod up -d --build
 ```
 
-Return to normal operation by stopping the direct deployment, starting Traefik,
-and recreating Remote Files with `compose.traefik.yaml`.
+To return to normal operation, stop the direct deployment, restart Traefik, and relaunch Remote Files using the production command above.
+
+To rotate the administrator password, replace the contents of `secrets/admin_password`. The new value is used for subsequent login attempts without restarting the stack; existing authenticated sessions remain valid.
+
+Only the frontend joins the shared ingress network. It serves plain HTTP on that private Docker network while Traefik supplies the HTTPS boundary. The backend, provenance API, and database remain reachable solely on application networks. HTTP mode is available through the isolated `dev` profile with `RFB_SECURE_COOKIES=false`; never publish it across an untrusted network.
 
 The application owns `.trash` and `.cache/remote-file-browser` inside the mounted root. Files deleted from ordinary folders are moved into `.trash`; permanent deletion is available only from the Trash view.
 
@@ -84,58 +150,23 @@ cp .env.wsl.example .env.wsl
 docker compose --env-file .env.wsl --profile dev up --build
 ```
 
-For a Linux home directory, use `cp .env.linux.example .env` and run the Traefik-backed production command from Quick start. WSL-mounted Windows filesystems do not reproduce every POSIX permission and ownership behavior, so permission testing should also be run against a native Linux directory.
+For a Linux home directory, use `cp .env.linux.example .env` and run the Traefik-backed production command from Launch. WSL-mounted Windows filesystems do not reproduce every POSIX permission and ownership behavior, so permission testing should also be run against a native Linux directory.
 
 ## Development
 
-For a containerized frontend with Vite hot reload, start the `dev` profile:
+Use the development command in [Launch](#development-launch). The frontend source directory is bind-mounted, dependencies are kept in a named Docker volume, the production frontend is excluded, and Vite proxies `/api` to the backend.
 
-```sh
-RFB_SECURE_COOKIES=false docker compose --profile dev up
-```
+### File app platform
 
-Open `http://localhost:5173` (or replace `localhost` with the server hostname).
-The frontend source directory is bind-mounted, while dependencies are kept in a
-named Docker volume. The production frontend is excluded, the existing backend
-image is reused, and Vite proxies `/api` to it. Stop the profile with:
+Remote Files can dispatch selected files to independently built applications through short-lived, scoped handoffs. The Files backend remains the only service with the `/fs-root` mount: an app receives opaque references for the selected files, ranged read access, and only the write or create-sibling permissions declared for its action. Handoffs are bound to the file etag and the administrator session, are single-use, and are revoked on logout.
 
-```sh
-docker compose --profile dev down
-```
-
-Set `RFB_DEV_PORT` to change the published port. If file changes are not
-detected, set `RFB_DEV_POLLING=true`; the WSL template enables this by default.
+The first extracted application is Video Player. It preserves direct playback, automatic HLS fallback, frame stepping, In/Out marks, and frame or segment extraction while running as its own workspace and container. Use the app-enabled command in [Launch](#production-launch) or [Launch](#development-launch). The gateway exposes it at `/apps/video/`; the service has no published host port. Omit `compose.apps.yaml` to retain the embedded player only.
 
 ### VFX Editor integration
 
 When the sibling `~/vfx-editor` application is running, Remote Files can expose it at the authenticated `/vfx/` path and add **Edit with VFX Editor** to video context menus. The selected source is streamed between the two backends and copied into VFX-owned storage; unchanged files reopen their existing project. Completed exports are streamed back between the servers and written beside the original as `name-edited.mp4`, using a numeric suffix rather than overwriting an existing export.
 
-Start VFX Editor first so its external Docker network exists:
-
-```sh
-cd ~/vfx-editor
-docker compose --profile dev up -d --build
-```
-
-Then start integrated Remote Files development from this repository:
-
-```sh
-docker compose -f compose.yaml -f compose.vfx.yaml --profile dev up -d --build frontend-dev
-```
-
-Remote Files remains on port 5173. Direct VFX development access uses port 5174, while integrated access uses `http://localhost:5173/vfx/`.
-
-For production, set `VFX_EDITOR_ALLOWED_ORIGINS` to the exact HTTPS Remote Files
-origin, start the VFX `prod` profile, then run:
-
-```sh
-docker compose -f compose.yaml -f compose.vfx.yaml -f compose.traefik.yaml \
-  --profile prod up -d --build
-```
-
-VFX remains available only at `/vfx/` under the Remote Files hostname and is
-protected by the Remote Files login. It has no Traefik labels or independent
-hostname. Omit `compose.vfx.yaml` to run without VFX Editor.
+Use the VFX commands in [Launch](#vfx-editor-launch). Direct VFX development access uses port 5174, while integrated access uses `http://localhost:5173/vfx/`. In production, VFX remains available only at `/vfx/` under the Remote Files hostname and is protected by the Remote Files login. It has no Traefik labels or independent hostname. Omit `compose.vfx.yaml` to run without VFX Editor.
 
 To run both processes directly on the host instead, use the following commands.
 
