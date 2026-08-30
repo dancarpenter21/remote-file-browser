@@ -1,0 +1,13 @@
+{
+  "title": "College Football Game.wav",
+  "author": "timmyg62",
+  "freesoundSoundId": 328623,
+  "sourcePage": "https://freesound.org/people/timmyg62/sounds/328623/",
+  "downloadedPreview": "https://cdn.freesound.org/previews/328/328623_5649321-hq.mp3",
+  "license": "CC0-1.0",
+  "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
+  "sourceSha256": "532ddcf3a26904a772bd724a94305365ffadea63c48b99dc811500ee4f32340b",
+  "derivativeSha256": "47c83d23da391297c58ffd1918fef4afeb68eabc3cc2f3c3300a98f9336463da",
+  "transformation": "Trimmed a 1.5 second head and tail, crossfaded tail into head, concatenated the middle and seam, resampled to 48 kHz stereo, and encoded MP3 at 192 kb/s.",
+  "generatedWith": "ffmpeg version 7.0.2-static (bundled Linux x64 executable)"
+}
