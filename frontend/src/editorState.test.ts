@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { editorSaveShortcut, proportionalScrollTop, shouldApplyDocumentResponse, wheelDeltaPixels } from './editorState'
+import { activeTabAfterClose, appendDocumentTab, editorSaveShortcut, proportionalScrollTop, shouldApplyDocumentResponse, wheelDeltaPixels } from './editorState'
 
 describe('editor preview scrolling', () => {
   it('maps editor progress into the preview scroll range', () => {
@@ -40,5 +40,23 @@ describe('editor request safety', () => {
     expect(shouldApplyDocumentResponse(3, 3, 'second', 'second')).toBe(true)
     expect(shouldApplyDocumentResponse(2, 3, 'first', 'first')).toBe(false)
     expect(shouldApplyDocumentResponse(3, 3, 'second', 'first')).toBe(false)
+  })
+
+  it('chooses the neighboring tab after the active tab closes', () => {
+    expect(activeTabAfterClose(['first', 'second', 'third'], 'second', 'second')).toBe('third')
+    expect(activeTabAfterClose(['first', 'second'], 'second', 'second')).toBe('first')
+    expect(activeTabAfterClose(['only'], 'only', 'only')).toBeNull()
+  })
+
+  it('keeps the active tab when a background tab closes', () => {
+    expect(activeTabAfterClose(['first', 'second', 'third'], 'second', 'first')).toBe('second')
+    expect(activeTabAfterClose(['first'], null, 'first')).toBeNull()
+  })
+
+  it('appends a document only once', () => {
+    const first = { document: { id: 'first' }, name: 'First' }
+    const second = { document: { id: 'second' }, name: 'Second' }
+    expect(appendDocumentTab([first], second)).toEqual([first, second])
+    expect(appendDocumentTab([first], { ...first, name: 'Duplicate' })).toEqual([first])
   })
 })

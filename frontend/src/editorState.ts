@@ -39,3 +39,14 @@ export function editorSaveShortcut(event: SaveShortcutEvent) {
 export function shouldApplyDocumentResponse(requestGeneration: number, currentGeneration: number, requestedId: string, responseId: string) {
   return requestGeneration === currentGeneration && requestedId === responseId
 }
+
+export function activeTabAfterClose(tabIds: string[], activeId: string | null, closingId: string) {
+  if (activeId !== closingId) return activeId
+  const closingIndex = tabIds.indexOf(closingId)
+  if (closingIndex < 0) return activeId
+  return tabIds[closingIndex + 1] ?? tabIds[closingIndex - 1] ?? null
+}
+
+export function appendDocumentTab<T extends { document: { id: string } }>(tabs: T[], tab: T) {
+  return tabs.some(current => current.document.id === tab.document.id) ? tabs : [...tabs, tab]
+}

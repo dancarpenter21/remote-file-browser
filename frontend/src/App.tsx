@@ -10,7 +10,7 @@ import Hls from 'hls.js'
 import {
   Camera, Check, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Download, Edit3, Eraser, Eye, File, FileImage, FileText,
   Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal, Pencil, Play,
-  ExternalLink, Link2, Minus, Plus, RefreshCw, RotateCw, Save, Scissors, Search, SquareTerminal, Trash2, Undo2, Upload, WrapText, X, ZoomIn, ZoomOut,
+  ExternalLink, Link2, Minus, Plus, RefreshCw, RotateCw, Ruler, Save, Scissors, Search, SquareTerminal, Trash2, Undo2, Upload, WrapText, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import { api, ApiFailure, CacheCleanupReport, ConcatenationJob, contentUrl, ConversionJob, DocumentFile, Entry, EntryPage, ExtractionJob, LiveEvent, liveEventsUrl, liveFilesystemWatchMessage, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { deleteConfirmationMessage } from './deleteConfirmation'
@@ -26,7 +26,8 @@ import { ClipboardOperation, RemoteClipboard, clipboardIdsForEntry, clipboardSho
 import { isMarkdownLocalTarget, isMarkdownMp4Source, markdownSanitizeSchema, markdownUrlTransform, resolveMarkdownFileId, resolveMarkdownMediaSource } from './markdownPreview'
 import { launchVfxEditor } from './vfxLaunch'
 import { canvasPng, drawMarkupStroke, MarkupStroke, markupPoint, markupStrokeWidth } from './imageMarkup'
-import { editorSaveShortcut, proportionalScrollTop, shouldApplyDocumentResponse, wheelDeltaPixels } from './editorState'
+import { measurementMetrics, measurementPoint, MeasurementPoint, PixelMeasurement } from './imageMeasurement'
+import { activeTabAfterClose, appendDocumentTab, editorSaveShortcut, proportionalScrollTop, shouldApplyDocumentResponse, wheelDeltaPixels } from './editorState'
 import { MOBILE_MEDIA_QUERY, observeMobileMode } from './mobileMode'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
@@ -133,8 +134,10 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [hidden, setHidden] = useState(() => localStorage.getItem('rfb-hidden') === 'true')
   const [filter, setFilter] = useState('')
   const [clipboard, setClipboard] = useState<RemoteClipboard>(null)
-  const [editor, setEditor] = useState<OpenEditor | null>(null)
-  const [editorDirty, setEditorDirty] = useState(false)
+  const [editorTabs, setEditorTabs] = useState<OpenEditor[]>([])
+  const editorTabsRef = useRef<OpenEditor[]>([])
+  const [activeEditorId, setActiveEditorId] = useState<string | null>(null)
+  const [editorRestoreKey, setEditorRestoreKey] = useState(0)
   const [viewer, setViewer] = useState<{ entry: Entry; type: 'image' | 'video' } | null>(null)
   const [trash, setTrash] = useState<TrashEntry[] | null>(null)
   const [error, setError] = useState('')
@@ -156,7 +159,10 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     catch { return {} }
   })
   const inputRef = useRef<HTMLInputElement>(null)
-  const documentRequest = useRef(0)
+  const documentRequestGeneration = useRef(0)
+  const documentRequests = useRef(new Map<string, number>())
+  const desiredEditorId = useRef<string | null>(null)
+  editorTabsRef.current = editorTabs
   const liveEventsSocket = useRef<WebSocket | null>(null)
   const liveState = useRef({ root, expanded })
   liveState.current = { root, expanded }
@@ -316,21 +322,46 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     setSelected(new Set([parent.id])); setPrimary(parent); setColumnPath(previous => previous.slice(0, columnIndex)); setCurrentDir(parent.id)
   }
   const activate = async (entry: Entry) => {
-    if (entry.kind === 'directory') { documentRequest.current++; return navigateGrid(entry) }
-    if (entry.mime.startsWith('image/')) { documentRequest.current++; return setViewer({ entry, type: 'image' }) }
-    if (entry.mime.startsWith('video/')) { documentRequest.current++; return setViewer({ entry, type: 'video' }) }
-    if (editor?.document.id === entry.id) { documentRequest.current++; return }
-    if (editor && editorDirty && !await confirmAction('Your unsaved edits will be lost.', { title: 'Discard unsaved changes?', confirmLabel: 'Discard', danger: true })) return
-    const requestGeneration = ++documentRequest.current
+    if (entry.kind === 'directory') { desiredEditorId.current = null; return navigateGrid(entry) }
+    if (entry.mime.startsWith('image/')) { desiredEditorId.current = null; return setViewer({ entry, type: 'image' }) }
+    if (entry.mime.startsWith('video/')) { desiredEditorId.current = null; return setViewer({ entry, type: 'video' }) }
+    desiredEditorId.current = entry.id
+    if (editorTabs.some(tab => tab.document.id === entry.id)) {
+      setActiveEditorId(entry.id); setEditorRestoreKey(value => value + 1); return
+    }
+    if (documentRequests.current.has(entry.id)) return
+    const requestGeneration = ++documentRequestGeneration.current
+    documentRequests.current.set(entry.id, requestGeneration)
     try {
       const document = await api.readDocument(entry.id)
-      if (!shouldApplyDocumentResponse(requestGeneration, documentRequest.current, entry.id, document.id)) return
-      setEditor({ document, entry: { id: entry.id, name: entry.name, path: entry.path } }); setEditorDirty(false)
+      const currentGeneration = documentRequests.current.get(entry.id)
+      if (!shouldApplyDocumentResponse(requestGeneration, currentGeneration ?? -1, entry.id, document.id)) return
+      documentRequests.current.delete(entry.id)
+      if (desiredEditorId.current === null) return
+      setEditorTabs(current => {
+        const next = appendDocumentTab(current, { document, entry: { id: entry.id, name: entry.name, path: entry.path } })
+        editorTabsRef.current = next; return next
+      })
+      setActiveEditorId(current => desiredEditorId.current === entry.id || current === null ? entry.id : current)
+      if (desiredEditorId.current === entry.id) setEditorRestoreKey(value => value + 1)
     } catch {
-      if (requestGeneration === documentRequest.current) window.location.href = contentUrl(entry.id)
+      if (documentRequests.current.get(entry.id) !== requestGeneration) return
+      documentRequests.current.delete(entry.id)
+      if (desiredEditorId.current === entry.id) window.location.href = contentUrl(entry.id)
     }
   }
   const activateMarkdownLink = async (id: string) => activate(await api.metadata(id))
+  const closeEditor = () => {
+    documentRequests.current.clear(); desiredEditorId.current = null
+    editorTabsRef.current = []; setEditorTabs([]); setActiveEditorId(null)
+  }
+  const closeEditorTab = (id: string) => {
+    const currentTabs = editorTabsRef.current
+    const remaining = currentTabs.filter(tab => tab.document.id !== id)
+    if (!remaining.length) { closeEditor(); return }
+    editorTabsRef.current = remaining; setEditorTabs(current => current.filter(tab => tab.document.id !== id))
+    setActiveEditorId(current => activeTabAfterClose(currentTabs.map(tab => tab.document.id), current, id))
+  }
   const mutate = async (action: () => Promise<unknown>, dir = currentDir, replace?: () => Promise<unknown>) => {
     setError(''); try { await action(); await refresh(dir) } catch (e) {
       if (replace && e instanceof ApiFailure && e.code === 'already_exists' && await confirmAction(`${e.message}. Replace it and move the old item to Trash?`, { title: 'Replace existing item?', confirmLabel: 'Replace', danger: true })) { try { await replace(); await refresh(dir); return } catch (retryError) { setError(messageOf(retryError)); return } }
@@ -425,7 +456,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   useEffect(() => {
     const keyboard = (event: KeyboardEvent) => {
       const action = clipboardShortcut(event)
-      if (!action || ignoresFileClipboardShortcut(event.target) || editor || viewer || trash || properties) return
+      if (!action || ignoresFileClipboardShortcut(event.target) || editorTabs.length > 0 || viewer || trash || properties) return
       if (action === 'paste') {
         if (!clipboard) return
         event.preventDefault(); void paste()
@@ -436,7 +467,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     }
     addEventListener('keydown', keyboard)
     return () => removeEventListener('keydown', keyboard)
-  }, [clipboard, currentDir, editor, expanded, properties, root, selected, trash, viewer])
+  }, [clipboard, currentDir, editorTabs.length, expanded, properties, root, selected, trash, viewer])
   const moveByDrag = async (ids: string[], destinationId: string, requireConfirmation = false) => {
     const movableIds = ids.filter(id => findEntry(id, root, expanded)?.parentId !== destinationId)
     if (!movableIds.length) return false
@@ -575,7 +606,10 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         {terminal && <TerminalDock directoryId={terminal.directoryId} hidden={terminal.hidden} onHide={() => setTerminal(current => current && ({ ...current, hidden: true }))} onClose={() => setTerminal(null)} />}
       </div>
     </div>
-    {editor && <EditorWindow key={editor.document.id} document={editor.document} entry={editor.entry} onOpenFile={activateMarkdownLink} onDirtyChange={setEditorDirty} onClose={() => { documentRequest.current++; setEditor(null); setEditorDirty(false) }} onSaved={saved => setEditor(current => current?.document.id === saved.id ? { ...current, document: saved } : current)} />}
+    {editorTabs.length > 0 && <EditorWindow tabs={editorTabs} activeId={activeEditorId} restoreKey={editorRestoreKey} onActivate={setActiveEditorId} onOpenFile={activateMarkdownLink} onCloseTab={closeEditorTab} onClose={closeEditor} onSaved={saved => setEditorTabs(current => {
+      const next = current.map(tab => tab.document.id === saved.id ? { ...tab, document: saved } : tab)
+      editorTabsRef.current = next; return next
+    })} />}
     {viewer && <ViewerWindow {...viewer} images={viewerImages} onNavigate={entry => {
       setViewer({ entry, type: 'image' }); setSelected(new Set([entry.id])); setPrimary(entry)
     }} onMarkupSaved={async entry => {
@@ -1159,30 +1193,116 @@ function ViewSelector({ view, setView }: { view: ViewMode; setView: (view: ViewM
   </div>
 }
 
-function EditorWindow({ document, entry, onClose, onSaved, onDirtyChange, onOpenFile }: { document: DocumentFile; entry: Pick<Entry, 'name' | 'path'>; onClose: () => void; onSaved: (doc: DocumentFile) => void; onDirtyChange: (dirty: boolean) => void; onOpenFile: (id: string) => Promise<void> }) {
+function EditorWindow({ tabs, activeId, restoreKey, onActivate, onCloseTab, onClose, onSaved, onOpenFile }: { tabs: OpenEditor[]; activeId: string | null; restoreKey: number; onActivate: (id: string) => void; onCloseTab: (id: string) => void; onClose: () => void; onSaved: (doc: DocumentFile) => void; onOpenFile: (id: string) => Promise<void> }) {
   const confirmAction = useConfirm()
+  const [wordWrap, setWordWrap] = useState(() => localStorage.getItem('rfb-editor-word-wrap') === 'true')
+  const [dirtyIds, setDirtyIds] = useState<Set<string>>(new Set())
+  const [savingIds, setSavingIds] = useState<Set<string>>(new Set())
+  const [windowMessage, setWindowMessage] = useState('')
+  const activeTab = tabs.find(tab => tab.document.id === activeId) ?? tabs[0]
+  useEffect(() => { localStorage.setItem('rfb-editor-word-wrap', String(wordWrap)) }, [wordWrap])
+  useEffect(() => {
+    if (activeTab && activeTab.document.id !== activeId) onActivate(activeTab.document.id)
+  }, [activeId, activeTab, onActivate])
+  useEffect(() => {
+    const openIds = new Set(tabs.map(tab => tab.document.id))
+    setDirtyIds(current => {
+      const next = new Set(Array.from(current).filter(id => openIds.has(id)))
+      return next.size === current.size ? current : next
+    })
+    setSavingIds(current => {
+      const next = new Set(Array.from(current).filter(id => openIds.has(id)))
+      return next.size === current.size ? current : next
+    })
+  }, [tabs])
+  useEffect(() => {
+    if (!dirtyIds.size) return
+    const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = '' }
+    addEventListener('beforeunload', warn)
+    return () => removeEventListener('beforeunload', warn)
+  }, [dirtyIds.size])
+  const reportDirty = useCallback((id: string, dirty: boolean) => setDirtyIds(current => {
+    if (current.has(id) === dirty) return current
+    const next = new Set(current); if (dirty) next.add(id); else next.delete(id); return next
+  }), [])
+  const reportSaving = useCallback((id: string, saving: boolean) => setSavingIds(current => {
+    if (current.has(id) === saving) return current
+    const next = new Set(current); if (saving) next.add(id); else next.delete(id); return next
+  }), [])
+  const closeTab = async (tab: OpenEditor) => {
+    const id = tab.document.id
+    setWindowMessage('')
+    if (savingIds.has(id)) { setWindowMessage(`Wait for ${tab.entry.name} to finish saving.`); return }
+    if (dirtyIds.has(id) && !await confirmAction(`Your unsaved edits to ${tab.entry.name} will be lost.`, { title: 'Discard unsaved changes?', confirmLabel: 'Discard', danger: true })) return
+    reportDirty(id, false); reportSaving(id, false); onCloseTab(id)
+  }
+  const closeWindow = async () => {
+    setWindowMessage('')
+    if (savingIds.size) { setWindowMessage('Wait for all files to finish saving.'); return }
+    if (dirtyIds.size && !await confirmAction(`Your unsaved edits in ${dirtyIds.size} ${dirtyIds.size === 1 ? 'tab' : 'tabs'} will be lost.`, { title: 'Discard unsaved changes?', confirmLabel: 'Discard all', danger: true })) return
+    onClose()
+  }
+  const switchTabFromKeyboard = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
+    let nextIndex = index
+    if (event.key === 'ArrowLeft') nextIndex = (index - 1 + tabs.length) % tabs.length
+    else if (event.key === 'ArrowRight') nextIndex = (index + 1) % tabs.length
+    else if (event.key === 'Home') nextIndex = 0
+    else if (event.key === 'End') nextIndex = tabs.length - 1
+    else return
+    event.preventDefault()
+    onActivate(tabs[nextIndex].document.id)
+    requestAnimationFrame(() => document.getElementById(`editor-tab-${nextIndex}`)?.focus())
+  }
+  return <FloatingWindow title={`${activeTab?.entry.name ?? 'Text editor'} — Text editor`} onClose={() => void closeWindow()} className="editor-window" restoreKey={restoreKey}>
+    <div className="editor-tabs" role="tablist" aria-label="Open files">
+      {tabs.map((tab, index) => {
+        const id = tab.document.id
+        const active = id === activeTab?.document.id
+        const dirty = dirtyIds.has(id)
+        const saving = savingIds.has(id)
+        return <div className={`editor-tab ${active ? 'active' : ''}`} key={id} role="presentation">
+          <button id={`editor-tab-${index}`} className="editor-tab-select" role="tab" aria-selected={active} aria-controls={`editor-panel-${index}`} tabIndex={active ? 0 : -1} title={tab.entry.path} aria-label={`${tab.entry.name}${saving ? ', saving' : dirty ? ', unsaved changes' : ''}`} onClick={() => { setWindowMessage(''); onActivate(id) }} onKeyDown={event => switchTabFromKeyboard(event, index)}>
+            <span>{tab.entry.name}</span>{(dirty || saving) && <span className={`editor-tab-state ${saving ? 'saving' : 'dirty'}`} aria-hidden="true">{saving ? '…' : '●'}</span>}
+          </button>
+          <button className="editor-tab-close" disabled={saving} aria-label={`Close ${tab.entry.name}`} title={saving ? 'Wait for the file to finish saving' : `Close ${tab.entry.name}`} onClick={() => void closeTab(tab)}><X /></button>
+        </div>
+      })}
+    </div>
+    {windowMessage && <div className="banner error editor-window-message" role="status"><span>{windowMessage}</span><button onClick={() => setWindowMessage('')}><X size={15} /></button></div>}
+    <div className="editor-tab-panels">
+      {tabs.map((tab, index) => <EditorTabPane key={tab.document.id} tab={tab} tabIndex={index} active={tab.document.id === activeTab?.document.id} wordWrap={wordWrap} onToggleWordWrap={() => setWordWrap(value => !value)} onSaved={onSaved} onDirtyChange={reportDirty} onSavingChange={reportSaving} onOpenFile={onOpenFile} />)}
+    </div>
+  </FloatingWindow>
+}
+
+function EditorTabPane({ tab, tabIndex, active, wordWrap, onToggleWordWrap, onSaved, onDirtyChange, onSavingChange, onOpenFile }: { tab: OpenEditor; tabIndex: number; active: boolean; wordWrap: boolean; onToggleWordWrap: () => void; onSaved: (doc: DocumentFile) => void; onDirtyChange: (id: string, dirty: boolean) => void; onSavingChange: (id: string, saving: boolean) => void; onOpenFile: (id: string) => Promise<void> }) {
+  const { document, entry } = tab
   const [content, setContent] = useState(document.content)
   const isMarkdown = document.mime.includes('markdown') || document.id.endsWith('bWQ')
   const [mode, setMode] = useState<EditorMode>(isMarkdown ? 'split' : 'edit')
-  const [wordWrap, setWordWrap] = useState(() => localStorage.getItem('rfb-editor-word-wrap') === 'true')
   const [saving, setSaving] = useState(false)
   const [saveMessage, setSaveMessage] = useState('')
   const [error, setError] = useState('')
   const [editorScroll, setEditorScroll] = useState<HTMLElement | null>(null)
+  const editorView = useRef<EditorView | null>(null)
   const preview = useRef<HTMLElement>(null)
   const previewContent = useRef<HTMLDivElement>(null)
   const latestContent = useRef(content)
   const savingRef = useRef(false)
   latestContent.current = content
   const dirty = content !== document.content
-  useEffect(() => { localStorage.setItem('rfb-editor-word-wrap', String(wordWrap)) }, [wordWrap])
-  useEffect(() => { onDirtyChange(dirty) }, [dirty, onDirtyChange])
-  const syncPreview = useCallback(() => {
-    if (mode !== 'split' || !editorScroll || !preview.current) return
-    preview.current.scrollTop = proportionalScrollTop(editorScroll, preview.current)
-  }, [editorScroll, mode])
+  useEffect(() => { onDirtyChange(document.id, dirty) }, [dirty, document.id, onDirtyChange])
   useLayoutEffect(() => {
-    if (mode !== 'split' || !editorScroll || !preview.current) return
+    if (!active) return
+    const frame = requestAnimationFrame(() => editorView.current?.requestMeasure())
+    return () => cancelAnimationFrame(frame)
+  }, [active])
+  const syncPreview = useCallback(() => {
+    if (!active || mode !== 'split' || !editorScroll || !preview.current) return
+    preview.current.scrollTop = proportionalScrollTop(editorScroll, preview.current)
+  }, [active, editorScroll, mode])
+  useLayoutEffect(() => {
+    if (!active || mode !== 'split' || !editorScroll || !preview.current) return
     let frame = 0
     const scheduleSync = () => {
       cancelAnimationFrame(frame)
@@ -1196,37 +1316,35 @@ function EditorWindow({ document, entry, onClose, onSaved, onDirtyChange, onOpen
     if (previewContent.current) observer?.observe(previewContent.current)
     scheduleSync()
     return () => { cancelAnimationFrame(frame); editorScroll.removeEventListener('scroll', scheduleSync); observer?.disconnect() }
-  }, [editorScroll, mode, syncPreview])
+  }, [active, editorScroll, mode, syncPreview])
   useLayoutEffect(() => {
+    if (!active) return
     const frame = requestAnimationFrame(syncPreview)
     return () => cancelAnimationFrame(frame)
-  }, [content, mode, syncPreview, wordWrap])
+  }, [active, content, mode, syncPreview, wordWrap])
   const save = useCallback(async () => {
     if (savingRef.current || content === document.content) return
     const snapshot = { ...document, content }
-    savingRef.current = true; setSaving(true); setSaveMessage(''); setError('')
+    savingRef.current = true; setSaving(true); onSavingChange(document.id, true); setSaveMessage(''); setError('')
     try {
       const saved = await api.saveDocument(snapshot)
       if (saved.id !== document.id) throw new Error('The server returned a different file after saving.')
       onSaved(saved)
       setSaveMessage(latestContent.current === snapshot.content ? `Saved ${entry.name}` : `Saved ${entry.name}; newer changes are unsaved.`)
     } catch (reason) { setError(messageOf(reason)) }
-    finally { savingRef.current = false; setSaving(false) }
-  }, [content, document, entry.name, onSaved])
+    finally { savingRef.current = false; setSaving(false); onSavingChange(document.id, false) }
+  }, [content, document, entry.name, onSaved, onSavingChange])
   useEffect(() => {
+    if (!active) return
     const shortcut = (event: KeyboardEvent) => {
       if (!editorSaveShortcut(event)) return
       event.preventDefault(); void save()
     }
     addEventListener('keydown', shortcut)
     return () => removeEventListener('keydown', shortcut)
-  }, [save])
+  }, [active, save])
   const changeContent = (value: string) => {
-    latestContent.current = value; setContent(value); onDirtyChange(value !== document.content); setSaveMessage(''); setError('')
-  }
-  const close = async () => {
-    if (savingRef.current) { setSaveMessage('Wait for the file to finish saving.'); return }
-    if (!dirty || await confirmAction('Your unsaved edits will be lost.', { title: 'Discard unsaved changes?', confirmLabel: 'Discard', danger: true })) onClose()
+    latestContent.current = value; setContent(value); onDirtyChange(document.id, value !== document.content); setSaveMessage(''); setError('')
   }
   const scrollFromPreview = (event: React.WheelEvent<HTMLElement>) => {
     if (mode !== 'split' || !editorScroll || event.deltaY === 0) return
@@ -1242,7 +1360,7 @@ function EditorWindow({ document, entry, onClose, onSaved, onDirtyChange, onOpen
     void onOpenFile(id).catch(reason => setError(messageOf(reason)))
   }
   const saveComplete = !dirty && Boolean(saveMessage) && !saving
-  return <FloatingWindow title={`${entry.name} — Text editor`} onClose={() => void close()} className="editor-window">
+  return <section id={`editor-panel-${tabIndex}`} className="editor-tab-panel" role="tabpanel" aria-labelledby={`editor-tab-${tabIndex}`} hidden={!active}>
     <div className="window-toolbar">
       <button className="primary compact editor-save" disabled={!dirty || saving} aria-busy={saving} title="Save (Ctrl/Cmd+S)" onClick={() => void save()}>{saveComplete ? <Check size={15} /> : <Save size={15} />} {saving ? 'Saving…' : saveComplete ? 'Saved' : 'Save'}</button>
       {isMarkdown && <div className="editor-mode-selector" role="group" aria-label="Markdown view">
@@ -1250,13 +1368,13 @@ function EditorWindow({ document, entry, onClose, onSaved, onDirtyChange, onOpen
         <button className={mode === 'split' ? 'active' : ''} aria-pressed={mode === 'split'} onClick={() => setMode('split')}><Columns3 size={15} /> Split</button>
         <button className={mode === 'preview' ? 'active' : ''} aria-pressed={mode === 'preview'} onClick={() => setMode('preview')}><Eye size={15} /> Preview</button>
       </div>}
-      <button className={wordWrap ? 'active' : ''} aria-pressed={wordWrap} disabled={mode === 'preview'} title={mode === 'preview' ? 'Word wrap applies to the editor' : 'Toggle editor word wrap'} onClick={() => setWordWrap(value => !value)}><WrapText size={15} /> Word wrap</button>
+      <button className={wordWrap ? 'active' : ''} aria-pressed={wordWrap} disabled={mode === 'preview'} title={mode === 'preview' ? 'Word wrap applies to the editor' : 'Toggle editor word wrap'} onClick={onToggleWordWrap}><WrapText size={15} /> Word wrap</button>
       {saveMessage && <span className="editor-save-status" role="status" aria-live="polite">{saveMessage}</span>}
       <span className="toolbar-spacer" /><code title={entry.path}>{entry.path}</code>
     </div>
     {error && <div className="banner error" role="alert">{error}</div>}
     <div className={`editor-body mode-${mode}`}>
-      <CodeMirror className="editor-pane" value={content} height="100%" theme="dark" extensions={[...(isMarkdown ? [markdown()] : []), ...(wordWrap ? [EditorView.lineWrapping] : [])]} onCreateEditor={view => setEditorScroll(view.scrollDOM)} onUpdate={update => { if (update.docChanged) changeContent(update.state.doc.toString()) }} />
+      <CodeMirror className="editor-pane" value={content} height="100%" theme="dark" extensions={[...(isMarkdown ? [markdown()] : []), ...(wordWrap ? [EditorView.lineWrapping] : [])]} onCreateEditor={view => { editorView.current = view; setEditorScroll(view.scrollDOM) }} onUpdate={update => { if (update.docChanged) changeContent(update.state.doc.toString()) }} />
       {mode !== 'edit' && <article ref={preview} className="markdown" onWheel={scrollFromPreview}><div ref={previewContent} className="markdown-content"><ReactMarkdown
           remarkPlugins={[remarkGfm]}
           rehypePlugins={[[rehypeSanitize, markdownSanitizeSchema]]}
@@ -1269,7 +1387,7 @@ function EditorWindow({ document, entry, onClose, onSaved, onDirtyChange, onOpen
           }}
         >{content}</ReactMarkdown></div></article>}
     </div>
-  </FloatingWindow>
+  </section>
 }
 
 function ViewerWindow({ entry, type, images, onNavigate, onMarkupSaved, onClose }: { entry: Entry; type: 'image' | 'video'; images: Entry[]; onNavigate: (entry: Entry) => void; onMarkupSaved: (entry: Entry) => Promise<void>; onClose: () => void }) {
@@ -1279,6 +1397,8 @@ function ViewerWindow({ entry, type, images, onNavigate, onMarkupSaved, onClose 
   const [mediaDimensions, setMediaDimensions] = useState<{ width: number; height: number }>()
   const [viewport, setViewport] = useState(() => ({ width: innerWidth, height: innerHeight }))
   const [marking, setMarking] = useState(false)
+  const [measuring, setMeasuring] = useState(false)
+  const [measurement, setMeasurement] = useState<PixelMeasurement | null>(null)
   const [strokes, setStrokes] = useState<MarkupStroke[]>([])
   const [markupReady, setMarkupReady] = useState(false)
   const [savingMarkup, setSavingMarkup] = useState(false)
@@ -1295,10 +1415,11 @@ function ViewerWindow({ entry, type, images, onNavigate, onMarkupSaved, onClose 
     if (images.length < 2) return
     if (!await discardMarkup()) return
     const current = imageIndex >= 0 ? imageIndex : 0
+    setMeasuring(false); setMeasurement(null)
     onNavigate(images[(current + direction + images.length) % images.length])
   }, [discardMarkup, imageIndex, images, onNavigate])
   useEffect(() => {
-    setZoom(1); setRotate(0); setMediaDimensions(undefined); setMarking(false); setStrokes([]); setMarkupReady(false); setSavingMarkup(false); setMarkupMessage('')
+    setZoom(1); setRotate(0); setMediaDimensions(undefined); setMarking(false); setMeasuring(false); setMeasurement(null); setStrokes([]); setMarkupReady(false); setSavingMarkup(false); setMarkupMessage('')
   }, [entry.etag, entry.id])
   useEffect(() => {
     const resized = () => setViewport({ width: innerWidth, height: innerHeight })
@@ -1314,16 +1435,24 @@ function ViewerWindow({ entry, type, images, onNavigate, onMarkupSaved, onClose 
         }
         return
       }
+      if (measuring && event.key === 'Escape') {
+        event.preventDefault(); event.stopPropagation(); setMeasuring(false); setMeasurement(null); return
+      }
       if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
       event.preventDefault(); event.stopPropagation()
       void navigate(event.key === 'ArrowLeft' ? -1 : 1)
     }
     addEventListener('keydown', keyboard, { capture: true })
     return () => removeEventListener('keydown', keyboard, { capture: true })
-  }, [marking, navigate, type])
+  }, [marking, measuring, navigate, type])
   const toggleMarkup = async () => {
     if (marking) { await discardMarkup(); return }
-    setRotate(0); setStrokes([]); setMarkupMessage(''); setMarking(true)
+    setRotate(0); setMeasuring(false); setMeasurement(null); setStrokes([]); setMarkupMessage(''); setMarking(true)
+  }
+  const toggleMeasurement = async () => {
+    if (measuring) { setMeasuring(false); setMeasurement(null); setMarkupMessage(''); return }
+    if (marking && !await discardMarkup()) return
+    setRotate(0); setMeasurement(null); setMarkupMessage(''); setMeasuring(true)
   }
   const saveMarkup = async () => {
     if (!markupCanvas.current || !strokes.length) return
@@ -1335,22 +1464,24 @@ function ViewerWindow({ entry, type, images, onNavigate, onMarkupSaved, onClose 
     } catch (error) { setMarkupMessage(messageOf(error)) } finally { setSavingMarkup(false) }
   }
   const requestClose = async () => { if (await discardMarkup()) onClose() }
+  const metrics = measurement ? measurementMetrics(measurement) : null
   const compact = viewport.width <= 800
   const windowSize = mediaDimensions && fitMediaWindow(
     mediaDimensions.width,
     mediaDimensions.height,
     Math.max(320, viewport.width - (compact ? 20 : 48)),
     Math.max(260, viewport.height - (compact ? 80 : 48)),
-    type === 'image' ? (marking ? 123 : 81) : 110,
+    type === 'image' ? (marking || measuring ? 123 : 81) : 110,
   )
-  return <FloatingWindow title={entry.name} onClose={() => void requestClose()} className={`viewer-window ${marking ? 'marking' : ''}`} size={windowSize}>
+  return <FloatingWindow title={entry.name} onClose={() => void requestClose()} className={`viewer-window ${marking ? 'marking' : measuring ? 'measuring' : ''}`} size={windowSize}>
     {type === 'image' ? <>
-      <div className="window-toolbar image-toolbar"><button onClick={() => setZoom(z => Math.max(.25, z - .25))}><ZoomOut /></button><span>{Math.round(zoom * 100)}%</span><button onClick={() => setZoom(z => Math.min(5, z + .25))}><ZoomIn /></button><button disabled={marking} title={marking ? 'Rotation is unavailable while marking up' : 'Rotate clockwise'} onClick={() => setRotate(r => r + 90)}><RotateCw /></button><button className={marking ? 'active' : ''} aria-pressed={marking} disabled={!mediaDimensions} title={marking ? 'Leave markup mode' : 'Mark up image'} onClick={() => void toggleMarkup()}><Pencil /> Mark up</button>
+      <div className="window-toolbar image-toolbar"><button onClick={() => setZoom(z => Math.max(.25, z - .25))}><ZoomOut /></button><span>{Math.round(zoom * 100)}%</span><button onClick={() => setZoom(z => Math.min(5, z + .25))}><ZoomIn /></button><button disabled={marking || measuring} title={marking ? 'Rotation is unavailable while marking up' : measuring ? 'Rotation is unavailable while measuring' : 'Rotate clockwise'} onClick={() => setRotate(r => r + 90)}><RotateCw /></button><button className={marking ? 'active' : ''} aria-pressed={marking} disabled={!mediaDimensions} title={marking ? 'Leave markup mode' : 'Mark up image'} onClick={() => void toggleMarkup()}><Pencil /> Mark up</button><button className={measuring ? 'active' : ''} aria-pressed={measuring} disabled={!mediaDimensions} title={measuring ? 'Leave measurement mode (Escape)' : 'Measure pixel distance'} onClick={() => void toggleMeasurement()}><Ruler /> Measure</button>
         {marking && <><button disabled={!strokes.length || savingMarkup} title="Undo last stroke (Ctrl/Cmd+Z)" onClick={() => setStrokes(current => current.slice(0, -1))}><Undo2 /> Undo</button><button disabled={!strokes.length || savingMarkup} onClick={() => setStrokes([])}><Eraser /> Clear</button><button className="primary compact" disabled={!strokes.length || !markupReady || savingMarkup} onClick={() => void saveMarkup()}><Save /> {savingMarkup ? 'Saving…' : 'Save'}</button></>}
+        {measuring && <><button disabled={!measurement} onClick={() => setMeasurement(null)}><Eraser /> Clear</button><span className="measurement-readout" role="status" aria-live="polite">{metrics ? <><strong>{metrics.distance.toFixed(2)} px</strong><span>Δx {metrics.deltaX} px · Δy {metrics.deltaY} px</span></> : measurement ? <><strong>Start: {measurement.start.x}, {measurement.start.y}</strong><span>Select the end point</span></> : <span>Select the start point</span>}</span></>}
         {markupMessage && <span className="markup-message" role="status">{markupMessage}</span>}<span className="toolbar-spacer" /><a className="button" href={contentUrl(entry.id)}><Download /> Download</a></div>
-      <div className={`image-stage ${marking ? 'marking' : ''}`}>
+      <div className={`image-stage ${marking ? 'marking' : measuring ? 'measuring' : ''}`}>
         <button className="image-nav previous" disabled={marking || images.length < 2} aria-label="Previous image" title="Previous image (Left Arrow)" onClick={() => void navigate(-1)}><ChevronLeft /></button>
-        {marking ? <ImageMarkupCanvas ref={markupCanvas} entry={entry} zoom={zoom} strokes={strokes} setStrokes={setStrokes} onDimensions={(width, height) => setMediaDimensions({ width, height })} onReady={setMarkupReady} onError={setMarkupMessage} /> :
+        {marking ? <ImageMarkupCanvas ref={markupCanvas} entry={entry} zoom={zoom} strokes={strokes} setStrokes={setStrokes} onDimensions={(width, height) => setMediaDimensions({ width, height })} onReady={setMarkupReady} onError={setMarkupMessage} /> : measuring ? <ImageMeasurementCanvas entry={entry} zoom={zoom} measurement={measurement} setMeasurement={setMeasurement} onDimensions={(width, height) => setMediaDimensions({ width, height })} onError={setMarkupMessage} /> :
           <img src={mediaUrl(entry.id, entry.etag)} alt={entry.name} style={{ transform: `scale(${zoom}) rotate(${rotate}deg)` }} onLoad={event => setMediaDimensions({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} />}
         <button className="image-nav next" disabled={marking || images.length < 2} aria-label="Next image" title="Next image (Right Arrow)" onClick={() => void navigate(1)}><ChevronRight /></button>
       </div>
@@ -1425,6 +1556,68 @@ const ImageMarkupCanvas = forwardRef<HTMLCanvasElement, { entry: Entry; zoom: nu
   }
   return <canvas ref={assignCanvas} className="markup-canvas" aria-label={`Mark up ${entry.name}`} style={{ transform: `scale(${zoom})` }} onPointerDown={start} onPointerMove={move} onPointerUp={finish} onPointerCancel={finish} />
 })
+
+function ImageMeasurementCanvas({ entry, zoom, measurement, setMeasurement, onDimensions, onError }: { entry: Entry; zoom: number; measurement: PixelMeasurement | null; setMeasurement: React.Dispatch<React.SetStateAction<PixelMeasurement | null>>; onDimensions: (width: number, height: number) => void; onError: (message: string) => void }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const sourceImage = useRef<HTMLImageElement | null>(null)
+  const paint = useCallback((current: PixelMeasurement | null) => {
+    const canvas = canvasRef.current
+    const image = sourceImage.current
+    const context = canvas?.getContext('2d')
+    if (!canvas || !image || !context) return
+    context.clearRect(0, 0, canvas.width, canvas.height)
+    context.drawImage(image, 0, 0, canvas.width, canvas.height)
+    if (!current) return
+    const end = current.end
+    const lineWidth = Math.max(2, Math.min(12, Math.min(canvas.width, canvas.height) * .004))
+    const radius = lineWidth * 1.8
+    context.save()
+    context.strokeStyle = '#50d7ff'
+    context.fillStyle = '#50d7ff'
+    context.lineWidth = lineWidth
+    context.lineCap = 'round'
+    context.shadowColor = '#000'
+    context.shadowBlur = lineWidth
+    if (end) {
+      context.beginPath(); context.moveTo(current.start.x, current.start.y); context.lineTo(end.x, end.y); context.stroke()
+    }
+    const drawPoint = (value: MeasurementPoint) => {
+      context.beginPath(); context.arc(value.x, value.y, radius, 0, Math.PI * 2); context.fill()
+      context.strokeStyle = '#fff'; context.lineWidth = Math.max(1, lineWidth * .35); context.stroke(); context.strokeStyle = '#50d7ff'; context.lineWidth = lineWidth
+    }
+    drawPoint(current.start)
+    if (end) drawPoint(end)
+    context.restore()
+  }, [])
+  useEffect(() => {
+    let cancelled = false
+    onError('')
+    const image = new Image()
+    image.onload = () => {
+      if (cancelled || !canvasRef.current) return
+      const canvas = canvasRef.current
+      canvas.width = image.naturalWidth; canvas.height = image.naturalHeight
+      sourceImage.current = image
+      onDimensions(image.naturalWidth, image.naturalHeight)
+      paint(measurement)
+    }
+    image.onerror = () => { if (!cancelled) onError('The source image could not be loaded for measurement.') }
+    image.src = mediaUrl(entry.id, entry.etag)
+    return () => { cancelled = true; sourceImage.current = null }
+  }, [entry.etag, entry.id])
+  useEffect(() => { paint(measurement) }, [measurement, paint])
+  const pointFor = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    const canvas = event.currentTarget
+    return measurementPoint(event.clientX, event.clientY, canvas.getBoundingClientRect(), canvas.width, canvas.height)
+  }
+  const choosePoint = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (event.button !== 0 || !sourceImage.current) return
+    event.preventDefault()
+    const point = pointFor(event)
+    setMeasurement(current => !current || current.end ? { start: point } : { ...current, end: point })
+  }
+  return <canvas ref={canvasRef} className="measurement-canvas" aria-label={`Measure pixels on ${entry.name}`} style={{ transform: `scale(${zoom})` }} onPointerDown={choosePoint} />
+}
 
 function VideoPlayer({ entry, autoPlay = true, editing = false, onMediaSize }: { entry: Entry; autoPlay?: boolean; editing?: boolean; onMediaSize?: (width: number, height: number) => void }) {
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -1617,7 +1810,7 @@ function TrashWindow({ items, onClose, onChanged, onRestored, setError }: { item
   </FloatingWindow>
 }
 
-function FloatingWindow({ title, onClose, className = '', size, children }: { title: string; onClose: () => void; className?: string; size?: { width: number; height: number }; children: React.ReactNode }) {
+function FloatingWindow({ title, onClose, className = '', size, restoreKey, children }: { title: string; onClose: () => void; className?: string; size?: { width: number; height: number }; restoreKey?: number; children: React.ReactNode }) {
   const [position, setPosition] = useState(() => ({ x: Math.max(20, innerWidth * .12), y: 90 }))
   const [minimized, setMinimized] = useState(false)
   const drag = useRef<{ x: number; y: number } | null>(null)
@@ -1626,6 +1819,7 @@ function FloatingWindow({ title, onClose, className = '', size, children }: { ti
     if (!size || moved.current) return
     setPosition({ x: Math.max(10, (innerWidth - size.width) / 2), y: Math.max(10, (innerHeight - size.height) / 2) })
   }, [size?.height, size?.width])
+  useEffect(() => { if (restoreKey !== undefined) setMinimized(false) }, [restoreKey])
   const toggleMinimized = (event?: React.MouseEvent) => {
     event?.preventDefault(); event?.stopPropagation()
     setMinimized(value => !value)
