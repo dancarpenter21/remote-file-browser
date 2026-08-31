@@ -1,5 +1,23 @@
 import { describe, expect, it, vi } from 'vitest'
-import { launchInstalledApp, launchReusableImageTools } from './appLaunch'
+import { createRequestId, launchInstalledApp, launchReusableImageTools } from './appLaunch'
+
+describe('createRequestId', () => {
+  it('uses randomUUID when it is available', () => {
+    expect(createRequestId({
+      randomUUID: () => 'uuid-from-secure-context',
+      getRandomValues: bytes => bytes,
+    })).toBe('uuid-from-secure-context')
+  })
+
+  it('falls back to getRandomValues when randomUUID is unavailable', () => {
+    expect(createRequestId({
+      getRandomValues: bytes => {
+        bytes.fill(0xab)
+        return bytes
+      },
+    })).toBe('abababababababababababababababab')
+  })
+})
 
 describe('launchInstalledApp', () => {
   it('opens synchronously and replaces the placeholder with the scoped launch URL', async () => {

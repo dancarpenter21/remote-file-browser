@@ -2,9 +2,20 @@ import type { AppLaunch } from './api'
 
 type LaunchWindow = { close: () => void; location: { replace: (url: string) => void } }
 
+type RandomSource = {
+  randomUUID?: () => string
+  getRandomValues: (bytes: Uint8Array) => Uint8Array
+}
+
+export function createRequestId(random: RandomSource = globalThis.crypto) {
+  if (typeof random.randomUUID === 'function') return random.randomUUID()
+  const bytes = random.getRandomValues(new Uint8Array(16))
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
+}
+
 async function relayLaunchTicket(channelName: string, ticket: string, timeoutMessage: string) {
   const channel = new BroadcastChannel(channelName)
-  const requestId = crypto.randomUUID()
+  const requestId = createRequestId()
   try {
     await new Promise<void>((resolve, reject) => {
       const finish = (error?: Error) => {
