@@ -1,11 +1,10 @@
 services:
-  backend:
+  files-server:
     environment:
-      RFB_PROVENANCE_API_TOKEN_FILE: /run/secrets/provenance_api_token
+      FILES_PROVENANCE_API_TOKEN_FILE: /run/secrets/provenance_api_token
     secrets:
       - provenance_api_token
 
 secrets:
   provenance_api_token:
-    file: "${RFB_PROVENANCE_API_TOKEN_PATH:-./secrets/provenance_api_token}"
-
+    file: "${FILES_PROVENANCE_API_TOKEN_PATH:-${RFB_PROVENANCE_API_TOKEN_PATH:-./secrets/provenance_api_token}}"

@@ -1,24 +1,20 @@
-import { createContext, forwardRef, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import Hls from 'hls.js'
 import {
-  Check, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Download, Edit3, Eraser, Eye, File, FileImage, FileText,
-  Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal, Pencil,
-  ExternalLink, Link2, Minus, Plus, RefreshCw, RotateCw, Ruler, Save, Scissors, Search, SquareTerminal, Trash2, Undo2, Upload, WrapText, X, ZoomIn, ZoomOut,
+  Check, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Edit3, Eye, File, FileImage, FileText,
+  Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal,
+  ExternalLink, Link2, Minus, Plus, RefreshCw, Scissors, Search, SquareTerminal, Trash2, Upload, X,
 } from 'lucide-react'
 import { api, ApiFailure, contentUrl, Entry, EntryPage, InstalledApp, LiveEvent, liveEventsUrl, liveFilesystemWatchMessage, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { deleteConfirmationMessage } from './deleteConfirmation'
 import { updateFinderPathForSelection } from './finderPath'
 import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState'
-import { fitMediaWindow } from './videoPlayerState'
 import { fitContextMenuToViewport } from './contextMenuPosition'
 import { isAdjacentColumnMove, moveConfirmationMessage, springLoadedPath } from './columnDrag'
 import { directoryContentsLabel, propertyTypeLabel } from './propertiesState'
 import { TerminalDock } from './TerminalDock'
 import { ClipboardOperation, RemoteClipboard, clipboardIdsForEntry, clipboardShortcut, movableClipboardIds, pasteProblem, shouldHandleClipboardShortcut } from './fileClipboard'
-import { launchInstalledApp, launchTabbedTextEditor } from './appLaunch'
-import { canvasPng, drawMarkupStroke, MarkupStroke, markupPoint, markupStrokeWidth } from './imageMarkup'
-import { measurementMetrics, measurementPoint, MeasurementPoint, PixelMeasurement } from './imageMeasurement'
+import { launchInstalledApp, launchReusableImageTools, launchTabbedTextEditor } from './appLaunch'
 import { MOBILE_MEDIA_QUERY, observeMobileMode } from './mobileMode'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
@@ -32,6 +28,10 @@ type PromptOptions = { title: string; label?: string; initialValue?: string; sub
 type PromptRequest = PromptOptions & { resolve: (answer: string | null) => void }
 const PromptContext = createContext<(options: PromptOptions) => Promise<string | null>>(async () => null)
 const VideoStudioContext = createContext(false)
+
+function appSupports(app: InstalledApp, actionId: string, mime: string) {
+  return app.actions.some(action => action.id === actionId && action.accepts.some(accepted => accepted === mime || accepted.endsWith('/*') && mime.startsWith(accepted.slice(0, -1))))
+}
 
 function useMobileMode() {
   const [mobile, setMobile] = useState(() => matchMedia(MOBILE_MEDIA_QUERY).matches)
@@ -123,7 +123,6 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [hidden, setHidden] = useState(() => localStorage.getItem('rfb-hidden') === 'true')
   const [filter, setFilter] = useState('')
   const [clipboard, setClipboard] = useState<RemoteClipboard>(null)
-  const [viewer, setViewer] = useState<{ entry: Entry; type: 'image' } | null>(null)
   const [installedApps, setInstalledApps] = useState<InstalledApp[]>([])
   const [trash, setTrash] = useState<TrashEntry[] | null>(null)
   const [error, setError] = useState('')
@@ -206,7 +205,6 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
             }
             setPrimary(entry => entry && updatedEntry(entry))
             setColumnPath(path => path.map(updatedEntry))
-            setViewer(open => open && ({ ...open, entry: updatedEntry(open.entry) }))
             setSelected(ids => new Set([...ids].map(selectedId => {
               const oldEntry = previousPage.entries.find(entry => entry.id === selectedId)
               return oldEntry ? updatedEntry(oldEntry).id : selectedId
@@ -305,16 +303,26 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   }
   const activate = async (entry: Entry) => {
     if (entry.kind === 'directory') return navigateGrid(entry)
-    if (entry.mime.startsWith('image/')) return setViewer({ entry, type: 'image' })
+    if (entry.mime.startsWith('image/')) {
+      const imageApp = installedApps.find(app => app.id === 'image-tools' && appSupports(app, 'open', entry.mime))
+      if (!imageApp) { setError('Image Tools is not available.'); return }
+      const page = entry.parentId === '' ? root : expanded[entry.parentId]
+      const images = page?.entries.filter(candidate => candidate.mime.startsWith('image/')) ?? [entry]
+      const selectedIndex = images.findIndex(candidate => candidate.id === entry.id)
+      const gallery = selectedIndex < 0 ? [entry] : [...images.slice(selectedIndex), ...images.slice(0, selectedIndex)]
+      try { await launchReusableImageTools(imageApp.launchUrl, () => api.launchApp(imageApp.id, 'open', gallery.map(image => image.id))) }
+      catch (reason) { setError(messageOf(reason)) }
+      return
+    }
     if (entry.mime.startsWith('video/')) {
-      const videoApp = installedApps.find(app => app.id === 'video-studio' && app.actions.some(action => action.id === 'play'))
+      const videoApp = installedApps.find(app => app.id === 'video-studio' && appSupports(app, 'play', entry.mime))
       if (!videoApp) { setError('Video Studio is not available.'); return }
       try {
         await launchInstalledApp(`${videoApp.launchUrl}?handoff=1`, (url, target) => window.open(url, target), () => api.launchApp(videoApp.id, 'play', [entry.id]))
       } catch (reason) { setError(messageOf(reason)) }
       return
     }
-    const textApp = installedApps.find(app => app.id === 'text-editor' && app.actions.some(action => action.id === 'open'))
+    const textApp = installedApps.find(app => app.id === 'text-editor' && appSupports(app, 'open', entry.mime))
     if (textApp) {
       try { await launchTabbedTextEditor(textApp.launchUrl, () => api.launchApp(textApp.id, 'open', [entry.id])) }
       catch (reason) { setError(messageOf(reason)) }
@@ -413,7 +421,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   useEffect(() => {
     const keyboard = (event: KeyboardEvent) => {
       const action = clipboardShortcut(event)
-      if (!action || ignoresFileClipboardShortcut(event.target) || viewer || trash || properties) return
+      if (!action || ignoresFileClipboardShortcut(event.target) || trash || properties) return
       if (action === 'paste') {
         if (!clipboard) return
         event.preventDefault(); void paste()
@@ -424,7 +432,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     }
     addEventListener('keydown', keyboard)
     return () => removeEventListener('keydown', keyboard)
-  }, [clipboard, currentDir, expanded, properties, root, selected, trash, viewer])
+  }, [clipboard, currentDir, expanded, properties, root, selected, trash])
   const moveByDrag = async (ids: string[], destinationId: string, requireConfirmation = false) => {
     const movableIds = ids.filter(id => findEntry(id, root, expanded)?.parentId !== destinationId)
     if (!movableIds.length) return false
@@ -489,9 +497,6 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const visibleCount = gridRows.length
   const cutIds = new Set(clipboard?.operation === 'move' ? clipboard.ids : [])
   const previewEntries = Array.from(selected).map(id => findEntry(id, root, expanded)).filter((entry): entry is Entry => Boolean(entry))
-  const viewerImages = viewer?.type === 'image'
-    ? ((viewer.entry.parentId === '' ? root : expanded[viewer.entry.parentId])?.entries.filter(entry => entry.mime.startsWith('image/')) ?? [viewer.entry])
-    : []
   const toggleTerminal = () => setTerminal(current => current ? { ...current, hidden: !current.hidden } : { directoryId: currentDir, hidden: false })
   const goToRoot = () => { setCurrentDir(''); setSelected(new Set()); setPrimary(null); setColumnPath([]); setMobileSelecting(false) }
   const goToParent = () => {
@@ -562,12 +567,6 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         {terminal && <TerminalDock directoryId={terminal.directoryId} hidden={terminal.hidden} onHide={() => setTerminal(current => current && ({ ...current, hidden: true }))} onClose={() => setTerminal(null)} />}
       </div>
     </div>
-    {viewer && <ViewerWindow {...viewer} images={viewerImages} onNavigate={entry => {
-      setViewer({ entry, type: 'image' }); setSelected(new Set([entry.id])); setPrimary(entry)
-    }} onMarkupSaved={async entry => {
-      await refresh(entry.parentId)
-      setViewer({ entry, type: 'image' }); setSelected(new Set([entry.id])); setPrimary(entry)
-    }} onClose={() => setViewer(null)} />}
     {trash && <TrashWindow items={trash} onClose={() => setTrash(null)} onChanged={async () => setTrash(await api.listTrash())} onRestored={entry => refresh(entry.parentId)} setError={setError} />}
     {folderMenu && <FolderContextMenu {...folderMenu} close={() => setFolderMenu(null)} createItem={createItem} paste={() => paste(folderMenu.directoryId, folderMenu.path)} hasClipboard={Boolean(clipboard)} showProperties={id => showProperties(id)} setError={setError} mobileControls={isMobile ? { hidden, toggleHidden: () => setHidden(value => !value), refresh: () => refresh(folderMenu.directoryId) } : undefined} />}
     {isMobile && mobileSelectionMenu && mobileSelectionEntry && <ContextMenu entry={mobileSelectionEntry} selectedEntries={previewEntries} x={innerWidth - 12} y={80} close={() => setMobileSelectionMenu(false)} open={() => activate(mobileSelectionEntry)} renameEntry={rename} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} />}
@@ -1066,234 +1065,6 @@ function ViewSelector({ view, setView }: { view: ViewMode; setView: (view: ViewM
   </div>
 }
 
-function ViewerWindow({ entry, images, onNavigate, onMarkupSaved, onClose }: { entry: Entry; type: 'image'; images: Entry[]; onNavigate: (entry: Entry) => void; onMarkupSaved: (entry: Entry) => Promise<void>; onClose: () => void }) {
-  const confirmAction = useConfirm()
-  const [zoom, setZoom] = useState(1)
-  const [rotate, setRotate] = useState(0)
-  const [mediaDimensions, setMediaDimensions] = useState<{ width: number; height: number }>()
-  const [viewport, setViewport] = useState(() => ({ width: innerWidth, height: innerHeight }))
-  const [marking, setMarking] = useState(false)
-  const [measuring, setMeasuring] = useState(false)
-  const [measurement, setMeasurement] = useState<PixelMeasurement | null>(null)
-  const [strokes, setStrokes] = useState<MarkupStroke[]>([])
-  const [markupReady, setMarkupReady] = useState(false)
-  const [savingMarkup, setSavingMarkup] = useState(false)
-  const [markupMessage, setMarkupMessage] = useState('')
-  const markupCanvas = useRef<HTMLCanvasElement>(null)
-  const imageIndex = images.findIndex(image => image.id === entry.id)
-  const discardMarkup = useCallback(async () => {
-    if (savingMarkup) { setMarkupMessage('Wait for the markup to finish saving.'); return false }
-    if (marking && strokes.length && !await confirmAction('Your unsaved markup will be lost.', { title: 'Discard markup?', confirmLabel: 'Discard', danger: true })) return false
-    setMarking(false); setStrokes([]); setMarkupReady(false); setMarkupMessage('')
-    return true
-  }, [confirmAction, marking, savingMarkup, strokes.length])
-  const navigate = useCallback(async (direction: -1 | 1) => {
-    if (images.length < 2) return
-    if (!await discardMarkup()) return
-    const current = imageIndex >= 0 ? imageIndex : 0
-    setMeasuring(false); setMeasurement(null)
-    onNavigate(images[(current + direction + images.length) % images.length])
-  }, [discardMarkup, imageIndex, images, onNavigate])
-  useEffect(() => {
-    setZoom(1); setRotate(0); setMediaDimensions(undefined); setMarking(false); setMeasuring(false); setMeasurement(null); setStrokes([]); setMarkupReady(false); setSavingMarkup(false); setMarkupMessage('')
-  }, [entry.etag, entry.id])
-  useEffect(() => {
-    const resized = () => setViewport({ width: innerWidth, height: innerHeight })
-    addEventListener('resize', resized)
-    return () => removeEventListener('resize', resized)
-  }, [])
-  useEffect(() => {
-    const keyboard = (event: KeyboardEvent) => {
-      if (marking) {
-        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
-          event.preventDefault(); event.stopPropagation(); setStrokes(current => current.slice(0, -1))
-        }
-        return
-      }
-      if (measuring && event.key === 'Escape') {
-        event.preventDefault(); event.stopPropagation(); setMeasuring(false); setMeasurement(null); return
-      }
-      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
-      event.preventDefault(); event.stopPropagation()
-      void navigate(event.key === 'ArrowLeft' ? -1 : 1)
-    }
-    addEventListener('keydown', keyboard, { capture: true })
-    return () => removeEventListener('keydown', keyboard, { capture: true })
-  }, [marking, measuring, navigate])
-  const toggleMarkup = async () => {
-    if (marking) { await discardMarkup(); return }
-    setRotate(0); setMeasuring(false); setMeasurement(null); setStrokes([]); setMarkupMessage(''); setMarking(true)
-  }
-  const toggleMeasurement = async () => {
-    if (measuring) { setMeasuring(false); setMeasurement(null); setMarkupMessage(''); return }
-    if (marking && !await discardMarkup()) return
-    setRotate(0); setMeasurement(null); setMarkupMessage(''); setMeasuring(true)
-  }
-  const saveMarkup = async () => {
-    if (!markupCanvas.current || !strokes.length) return
-    setSavingMarkup(true); setMarkupMessage('')
-    try {
-      const saved = await api.saveImageMarkup(entry.id, entry.etag, await canvasPng(markupCanvas.current))
-      setStrokes([]); setMarking(false); setMarkupMessage(`Saved ${saved.name}`)
-      await onMarkupSaved(saved)
-    } catch (error) { setMarkupMessage(messageOf(error)) } finally { setSavingMarkup(false) }
-  }
-  const requestClose = async () => { if (await discardMarkup()) onClose() }
-  const metrics = measurement ? measurementMetrics(measurement) : null
-  const compact = viewport.width <= 800
-  const windowSize = mediaDimensions && fitMediaWindow(
-    mediaDimensions.width,
-    mediaDimensions.height,
-    Math.max(320, viewport.width - (compact ? 20 : 48)),
-    Math.max(260, viewport.height - (compact ? 80 : 48)),
-    marking || measuring ? 123 : 81,
-  )
-  return <FloatingWindow title={entry.name} onClose={() => void requestClose()} className={`viewer-window ${marking ? 'marking' : measuring ? 'measuring' : ''}`} size={windowSize}>
-    <>
-      <div className="window-toolbar image-toolbar"><button onClick={() => setZoom(z => Math.max(.25, z - .25))}><ZoomOut /></button><span>{Math.round(zoom * 100)}%</span><button onClick={() => setZoom(z => Math.min(5, z + .25))}><ZoomIn /></button><button disabled={marking || measuring} title={marking ? 'Rotation is unavailable while marking up' : measuring ? 'Rotation is unavailable while measuring' : 'Rotate clockwise'} onClick={() => setRotate(r => r + 90)}><RotateCw /></button><button className={marking ? 'active' : ''} aria-pressed={marking} disabled={!mediaDimensions} title={marking ? 'Leave markup mode' : 'Mark up image'} onClick={() => void toggleMarkup()}><Pencil /> Mark up</button><button className={measuring ? 'active' : ''} aria-pressed={measuring} disabled={!mediaDimensions} title={measuring ? 'Leave measurement mode (Escape)' : 'Measure pixel distance'} onClick={() => void toggleMeasurement()}><Ruler /> Measure</button>
-        {marking && <><button disabled={!strokes.length || savingMarkup} title="Undo last stroke (Ctrl/Cmd+Z)" onClick={() => setStrokes(current => current.slice(0, -1))}><Undo2 /> Undo</button><button disabled={!strokes.length || savingMarkup} onClick={() => setStrokes([])}><Eraser /> Clear</button><button className="primary compact" disabled={!strokes.length || !markupReady || savingMarkup} onClick={() => void saveMarkup()}><Save /> {savingMarkup ? 'Saving…' : 'Save'}</button></>}
-        {measuring && <><button disabled={!measurement} onClick={() => setMeasurement(null)}><Eraser /> Clear</button><span className="measurement-readout" role="status" aria-live="polite">{metrics ? <><strong>{metrics.distance.toFixed(2)} px</strong><span>Δx {metrics.deltaX} px · Δy {metrics.deltaY} px</span></> : measurement ? <><strong>Start: {measurement.start.x}, {measurement.start.y}</strong><span>Select the end point</span></> : <span>Select the start point</span>}</span></>}
-        {markupMessage && <span className="markup-message" role="status">{markupMessage}</span>}<span className="toolbar-spacer" /><a className="button" href={contentUrl(entry.id)}><Download /> Download</a></div>
-      <div className={`image-stage ${marking ? 'marking' : measuring ? 'measuring' : ''}`}>
-        <button className="image-nav previous" disabled={marking || images.length < 2} aria-label="Previous image" title="Previous image (Left Arrow)" onClick={() => void navigate(-1)}><ChevronLeft /></button>
-        {marking ? <ImageMarkupCanvas ref={markupCanvas} entry={entry} zoom={zoom} strokes={strokes} setStrokes={setStrokes} onDimensions={(width, height) => setMediaDimensions({ width, height })} onReady={setMarkupReady} onError={setMarkupMessage} /> : measuring ? <ImageMeasurementCanvas entry={entry} zoom={zoom} measurement={measurement} setMeasurement={setMeasurement} onDimensions={(width, height) => setMediaDimensions({ width, height })} onError={setMarkupMessage} /> :
-          <img src={mediaUrl(entry.id, entry.etag)} alt={entry.name} style={{ transform: `scale(${zoom}) rotate(${rotate}deg)` }} onLoad={event => setMediaDimensions({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} />}
-        <button className="image-nav next" disabled={marking || images.length < 2} aria-label="Next image" title="Next image (Right Arrow)" onClick={() => void navigate(1)}><ChevronRight /></button>
-      </div>
-    </>
-  </FloatingWindow>
-}
-
-const ImageMarkupCanvas = forwardRef<HTMLCanvasElement, { entry: Entry; zoom: number; strokes: MarkupStroke[]; setStrokes: React.Dispatch<React.SetStateAction<MarkupStroke[]>>; onDimensions: (width: number, height: number) => void; onReady: (ready: boolean) => void; onError: (message: string) => void }>(function ImageMarkupCanvas({ entry, zoom, strokes, setStrokes, onDimensions, onReady, onError }, forwardedRef) {
-  const localCanvas = useRef<HTMLCanvasElement>(null)
-  const sourceImage = useRef<HTMLImageElement | null>(null)
-  const activeStroke = useRef<{ pointerId: number; stroke: MarkupStroke } | null>(null)
-  const assignCanvas = (canvas: HTMLCanvasElement | null) => {
-    localCanvas.current = canvas
-    if (typeof forwardedRef === 'function') forwardedRef(canvas)
-    else if (forwardedRef) forwardedRef.current = canvas
-  }
-  const paint = (nextStrokes: MarkupStroke[]) => {
-    const canvas = localCanvas.current
-    const image = sourceImage.current
-    const context = canvas?.getContext('2d')
-    if (!canvas || !image || !context) return
-    context.clearRect(0, 0, canvas.width, canvas.height)
-    context.drawImage(image, 0, 0, canvas.width, canvas.height)
-    const lineWidth = markupStrokeWidth(canvas.width, canvas.height)
-    nextStrokes.forEach(stroke => drawMarkupStroke(context, stroke, lineWidth))
-  }
-  useEffect(() => {
-    let cancelled = false
-    onReady(false); onError('')
-    const image = new Image()
-    image.onload = () => {
-      if (cancelled || !localCanvas.current) return
-      const canvas = localCanvas.current
-      canvas.width = image.naturalWidth; canvas.height = image.naturalHeight
-      sourceImage.current = image
-      onDimensions(image.naturalWidth, image.naturalHeight)
-      paint(strokes); onReady(true)
-    }
-    image.onerror = () => { if (!cancelled) { onReady(false); onError('The source image could not be loaded for markup.') } }
-    image.src = mediaUrl(entry.id, entry.etag)
-    return () => { cancelled = true; sourceImage.current = null; activeStroke.current = null }
-  }, [entry.etag, entry.id])
-  useEffect(() => { paint(strokes) }, [strokes])
-  const pointFor = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    const canvas = event.currentTarget
-    return markupPoint(event.clientX, event.clientY, canvas.getBoundingClientRect(), canvas.width, canvas.height)
-  }
-  const start = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    if (event.button !== 0 || activeStroke.current || !sourceImage.current) return
-    event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId)
-    const stroke = { points: [pointFor(event)] }
-    activeStroke.current = { pointerId: event.pointerId, stroke }
-    const context = event.currentTarget.getContext('2d')
-    if (context) drawMarkupStroke(context, stroke, markupStrokeWidth(event.currentTarget.width, event.currentTarget.height))
-  }
-  const move = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    const active = activeStroke.current
-    if (!active || active.pointerId !== event.pointerId) return
-    event.preventDefault()
-    const point = pointFor(event)
-    const previous = active.stroke.points.at(-1)!
-    active.stroke.points.push(point)
-    const context = event.currentTarget.getContext('2d')
-    if (context) drawMarkupStroke(context, { points: [previous, point] }, markupStrokeWidth(event.currentTarget.width, event.currentTarget.height))
-  }
-  const finish = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    const active = activeStroke.current
-    if (!active || active.pointerId !== event.pointerId) return
-    activeStroke.current = null
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
-    setStrokes(current => [...current, active.stroke])
-  }
-  return <canvas ref={assignCanvas} className="markup-canvas" aria-label={`Mark up ${entry.name}`} style={{ transform: `scale(${zoom})` }} onPointerDown={start} onPointerMove={move} onPointerUp={finish} onPointerCancel={finish} />
-})
-
-function ImageMeasurementCanvas({ entry, zoom, measurement, setMeasurement, onDimensions, onError }: { entry: Entry; zoom: number; measurement: PixelMeasurement | null; setMeasurement: React.Dispatch<React.SetStateAction<PixelMeasurement | null>>; onDimensions: (width: number, height: number) => void; onError: (message: string) => void }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const sourceImage = useRef<HTMLImageElement | null>(null)
-  const paint = useCallback((current: PixelMeasurement | null) => {
-    const canvas = canvasRef.current
-    const image = sourceImage.current
-    const context = canvas?.getContext('2d')
-    if (!canvas || !image || !context) return
-    context.clearRect(0, 0, canvas.width, canvas.height)
-    context.drawImage(image, 0, 0, canvas.width, canvas.height)
-    if (!current) return
-    const end = current.end
-    const lineWidth = Math.max(2, Math.min(12, Math.min(canvas.width, canvas.height) * .004))
-    const radius = lineWidth * 1.8
-    context.save()
-    context.strokeStyle = '#50d7ff'
-    context.fillStyle = '#50d7ff'
-    context.lineWidth = lineWidth
-    context.lineCap = 'round'
-    context.shadowColor = '#000'
-    context.shadowBlur = lineWidth
-    if (end) {
-      context.beginPath(); context.moveTo(current.start.x, current.start.y); context.lineTo(end.x, end.y); context.stroke()
-    }
-    const drawPoint = (value: MeasurementPoint) => {
-      context.beginPath(); context.arc(value.x, value.y, radius, 0, Math.PI * 2); context.fill()
-      context.strokeStyle = '#fff'; context.lineWidth = Math.max(1, lineWidth * .35); context.stroke(); context.strokeStyle = '#50d7ff'; context.lineWidth = lineWidth
-    }
-    drawPoint(current.start)
-    if (end) drawPoint(end)
-    context.restore()
-  }, [])
-  useEffect(() => {
-    let cancelled = false
-    onError('')
-    const image = new Image()
-    image.onload = () => {
-      if (cancelled || !canvasRef.current) return
-      const canvas = canvasRef.current
-      canvas.width = image.naturalWidth; canvas.height = image.naturalHeight
-      sourceImage.current = image
-      onDimensions(image.naturalWidth, image.naturalHeight)
-      paint(measurement)
-    }
-    image.onerror = () => { if (!cancelled) onError('The source image could not be loaded for measurement.') }
-    image.src = mediaUrl(entry.id, entry.etag)
-    return () => { cancelled = true; sourceImage.current = null }
-  }, [entry.etag, entry.id])
-  useEffect(() => { paint(measurement) }, [measurement, paint])
-  const pointFor = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    const canvas = event.currentTarget
-    return measurementPoint(event.clientX, event.clientY, canvas.getBoundingClientRect(), canvas.width, canvas.height)
-  }
-  const choosePoint = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    if (event.button !== 0 || !sourceImage.current) return
-    event.preventDefault()
-    const point = pointFor(event)
-    setMeasurement(current => !current || current.end ? { start: point } : { ...current, end: point })
-  }
-  return <canvas ref={canvasRef} className="measurement-canvas" aria-label={`Measure pixels on ${entry.name}`} style={{ transform: `scale(${zoom})` }} onPointerDown={choosePoint} />
-}
-
 function TrashWindow({ items, onClose, onChanged, onRestored, setError }: { items: TrashEntry[]; onClose: () => void; onChanged: () => Promise<void>; onRestored: (entry: Entry) => Promise<void>; setError: (s: string) => void }) {
   const confirmAction = useConfirm()
   const act = async (fn: () => Promise<unknown>) => { try { await fn(); await onChanged() } catch (e) { setError(messageOf(e)) } }
@@ -1359,14 +1130,6 @@ function ignoresFileClipboardShortcut(target: EventTarget | null) {
   const element = target instanceof Element ? target : document.activeElement
   const blockedContext = Boolean(element?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), .context-menu, .floating, .modal-backdrop, .terminal-dock'))
   return !shouldHandleClipboardShortcut(Boolean(getSelection()?.toString()), blockedContext)
-}
-function mediaPlaybackError(error: MediaError | null) {
-  if (!error) return 'Video playback failed.'
-  if (error.code === 1) return 'Video playback was aborted.'
-  if (error.code === 2) return 'The browser could not load the video stream.'
-  if (error.code === 3) return 'The browser could not decode the converted video.'
-  if (error.code === 4) return 'The converted video format is not supported by this browser.'
-  return error.message || 'Video playback failed.'
 }
 function clipboardError(text: string) { return `The browser denied clipboard access. Copy manually: ${text}` }
 function Empty({ label = 'This folder is empty' }: { label?: string }) { return <div className="empty"><FolderOpen /><strong>{label}</strong><span>Nothing to show here.</span></div> }

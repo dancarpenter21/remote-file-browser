@@ -14,4 +14,4 @@ COPY apps/files/web/nginx/default.conf.template /etc/nginx/templates/default.con
 COPY apps/files/web/nginx/15-tls-mode.sh /docker-entrypoint.d/15-tls-mode.envsh
 RUN chmod 0755 /docker-entrypoint.d/15-tls-mode.envsh && \
     mkdir -p /var/cache/nginx /var/run && chown -R nginx:nginx /var/cache/nginx /var/run
-EXPOSE 8080 8443
+EXPOSE 8080

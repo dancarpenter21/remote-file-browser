@@ -5,8 +5,8 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { compileHighlightTimeline, defaultRampFrames, type Project } from "@remote-workspace/video-shared";
 
-const testRoot = await mkdtemp(path.join(tmpdir(), "vfx-editor-test-"));
-process.env.VFX_EDITOR_DATA_DIR = path.join(testRoot, "data");
+const testRoot = await mkdtemp(path.join(tmpdir(), "video-studio-test-"));
+process.env.VIDEO_STUDIO_DATA_DIR = path.join(testRoot, "data");
 
 const { ffmpegPath, ffprobePath } = await import("./binaries.js");
 const { runProcess } = await import("./process.js");

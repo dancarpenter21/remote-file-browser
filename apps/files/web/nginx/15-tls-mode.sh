@@ -23,25 +23,10 @@ if [ "${FILES_APPS_ENABLED:-true}" = "true" ]; then
     location ^~ /vfx/ { rewrite ^/vfx/(.*)$ /apps/video/\$1 permanent; }
     location = /apps/text { return 308 /apps/text/; }
     location ^~ /apps/text/ { auth_request /_rfb_app_auth; proxy_pass http://text-editor:8080/; proxy_http_version 1.1; proxy_set_header Host \$host; }
+    location = /apps/images { return 308 /apps/images/; }
+    location ^~ /apps/images/ { auth_request /_rfb_app_auth; proxy_pass http://image-tools:8080/; proxy_http_version 1.1; proxy_set_header Host \$host; }
     location = /apps/video { return 308 /apps/video/; }
     location ^~ /apps/video/ { auth_request /_rfb_app_auth; client_max_body_size 40g; proxy_pass http://video-studio:4317/; proxy_http_version 1.1; proxy_set_header Host \$host; proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto \$scheme; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection \$connection_upgrade; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; }"
 fi
 
-if [ "${RFB_TLS_MODE:-https}" = "https" ]; then
-  test -s /run/tls/tls.crt || { echo 'TLS certificate is missing' >&2; exit 1; }
-  test -s /run/tls/tls.key || { echo 'TLS private key is missing' >&2; exit 1; }
-  export HTTP_SERVER_BODY="location / { return 308 https://\$host:${RFB_PUBLIC_HTTPS_PORT:-443}\$request_uri; }"
-  export TLS_SERVER="server {
-    listen 8443 ssl;
-    server_name _;
-    ssl_certificate /run/tls/tls.crt;
-    ssl_certificate_key /run/tls/tls.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_session_cache shared:TLS:10m;
-    ${common_locations}
-  }"
-else
-  export HTTP_SERVER_BODY="${common_locations}"
-  export TLS_SERVER=''
-  echo 'WARNING: serving Remote File Browser without TLS' >&2
-fi
+export HTTP_SERVER_BODY="${common_locations}"

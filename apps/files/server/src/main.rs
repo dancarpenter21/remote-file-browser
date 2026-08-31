@@ -277,7 +277,6 @@ type ApiResult<T> = Result<T, ApiError>;
         upload,
         operation,
         soft_delete,
-        save_image_markup,
         list_trash,
         empty_trash,
         restore_trash,
@@ -373,10 +372,18 @@ async fn main() {
     fs::create_dir_all(cache.join("thumbnails"))
         .await
         .expect("create thumbnail cache");
-    fs::create_dir_all(cache.join("hls"))
+    if let Err(error) = fs::remove_dir_all(cache.join("hls")).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(%error, "could not remove obsolete Files HLS cache");
+    }
+    let mut cache_index = load_cache_index(&cache).await;
+    cache_index
+        .records
+        .retain(|_, record| record.kind == "thumbnail");
+    persist_cache_index(&cache, &cache_index)
         .await
-        .expect("create media cache");
-    let cache_index = load_cache_index(&cache).await;
+        .expect("remove obsolete media cache records");
     let provenance_api_token = read_optional_token_alias(
         "FILES_PROVENANCE_API_TOKEN_FILE",
         "RFB_PROVENANCE_API_TOKEN_FILE",
@@ -519,7 +526,6 @@ async fn main() {
         .route("/fs/uploads", post(upload))
         .route("/fs/operations", post(operation))
         .route("/fs/trash", post(soft_delete))
-        .route("/editor/image-markup", post(save_image_markup))
         .route("/trash", get(list_trash).delete(empty_trash))
         .route("/trash/{id}/restore", post(restore_trash))
         .route("/trash/{id}", delete(purge_trash))
@@ -2815,13 +2821,9 @@ fn remapped_source_id(config: &Config, id: &str, source: &Path, target: &Path) -
 }
 
 fn cache_artifact_path(cache: &Path, record: &CacheRecord) -> PathBuf {
-    if record.kind == "hls" {
-        cache.join("hls").join(&record.key)
-    } else {
-        cache
-            .join("thumbnails")
-            .join(format!("{}.webp", record.key))
-    }
+    cache
+        .join("thumbnails")
+        .join(format!("{}.webp", record.key))
 }
 
 async fn invalidate_cache_prefix(state: &AppState, path: &Path) -> ApiResult<()> {
@@ -2844,12 +2846,7 @@ async fn invalidate_cache_prefix(state: &AppState, path: &Path) -> ApiResult<()>
     *state.cache_index.write().await = index;
     drop(_write);
     for (_, record) in removed {
-        let artifact = cache_artifact_path(&state.config.cache, &record);
-        if record.kind == "hls" {
-            let _ = fs::remove_dir_all(artifact).await;
-        } else {
-            let _ = fs::remove_file(artifact).await;
-        }
+        let _ = fs::remove_file(cache_artifact_path(&state.config.cache, &record)).await;
     }
     Ok(())
 }
@@ -3729,15 +3726,6 @@ async fn empty_trash(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ImageMarkupQuery {
-    id: String,
-    expected_etag: String,
-}
-
-const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-
 fn metadata_etag(metadata: &std::fs::Metadata) -> String {
     format!(
         "\"{:x}-{:x}-{:x}\"",
@@ -3745,143 +3733,6 @@ fn metadata_etag(metadata: &std::fs::Metadata) -> String {
         metadata.len(),
         metadata.mtime_nsec() ^ metadata.mtime()
     )
-}
-
-fn has_png_signature(signature: &[u8]) -> bool {
-    signature.starts_with(PNG_SIGNATURE)
-}
-
-async fn publish_image_markup_file(temporary: &Path, source: &Path) -> ApiResult<PathBuf> {
-    let directory = source
-        .parent()
-        .ok_or_else(|| ApiError::bad("invalid_path", "The source has no parent directory"))?;
-    let mut base = source
-        .file_stem()
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or_else(|| OsStr::new("image"))
-        .to_os_string();
-    base.push("-markup");
-    for suffix in 1..=10_000 {
-        let mut name = base.clone();
-        if suffix > 1 {
-            name.push(format!("-{suffix}"));
-        }
-        name.push(".png");
-        let target = directory.join(name);
-        match fs::hard_link(temporary, &target).await {
-            Ok(()) => {
-                fs::remove_file(temporary).await?;
-                return Ok(target);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Err(ApiError::conflict(
-        "too_many_collisions",
-        "Could not choose a unique markup filename",
-    ))
-}
-
-#[utoipa::path(post, path = "/api/v1/editor/image-markup", tag = "editor", params(("id" = String, Query), ("expectedEtag" = String, Query), ("x-csrf-token" = String, Header)), request_body(content = String, content_type = "multipart/form-data", description = "PNG markup file field"), security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 201, body = Entry), (status = 400, body = Problem), (status = 409, body = Problem), (status = 413, body = Problem)))]
-async fn save_image_markup(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    headers: HeaderMap,
-    Query(query): Query<ImageMarkupQuery>,
-    mut multipart: Multipart,
-) -> ApiResult<(StatusCode, Json<Entry>)> {
-    require_csrf(&state, &jar, &headers)?;
-    let source = resolve_existing(&state.config, &query.id).await?;
-    let metadata = fs::symlink_metadata(&source).await?;
-    let mime = mime_guess::from_path(&source).first_or_octet_stream();
-    if !metadata.is_file() || mime.type_() != mime_guess::mime::IMAGE {
-        return Err(ApiError::bad(
-            "not_image",
-            "The markup source is no longer a regular image",
-        ));
-    }
-    if metadata_etag(&metadata) != query.expected_etag {
-        return Err(ApiError::conflict(
-            "image_changed",
-            "The source image changed after markup began",
-        ));
-    }
-    let directory = source
-        .parent()
-        .ok_or_else(|| ApiError::bad("invalid_path", "The source has no parent directory"))?;
-    let temporary = directory.join(format!(".rfb-image-markup-{}.png", Uuid::new_v4()));
-    let mut output = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .await?;
-
-    let write_result: ApiResult<()> = async {
-        let mut field = multipart
-            .next_field()
-            .await
-            .map_err(ApiError::internal)?
-            .ok_or_else(|| ApiError::bad("missing_markup", "No markup PNG was supplied"))?;
-        if field.name() != Some("file") {
-            return Err(ApiError::bad(
-                "missing_markup",
-                "The markup upload must use the file field",
-            ));
-        }
-        let mut written = 0u64;
-        let mut signature = Vec::with_capacity(PNG_SIGNATURE.len());
-        while let Some(chunk) = field.chunk().await.map_err(ApiError::internal)? {
-            written += chunk.len() as u64;
-            if written > state.config.upload_max {
-                return Err(ApiError(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "markup_too_large",
-                    "Markup exceeds the configured upload limit".into(),
-                ));
-            }
-            if signature.len() < PNG_SIGNATURE.len() {
-                let needed = PNG_SIGNATURE.len() - signature.len();
-                signature.extend_from_slice(&chunk[..chunk.len().min(needed)]);
-            }
-            output.write_all(&chunk).await?;
-        }
-        if !has_png_signature(&signature) {
-            return Err(ApiError::bad(
-                "invalid_markup",
-                "The markup upload is not a PNG image",
-            ));
-        }
-        output.flush().await?;
-        output.sync_all().await?;
-        Ok(())
-    }
-    .await;
-    drop(output);
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&temporary).await;
-        return Err(error);
-    }
-    if let Err(error) = fs::set_permissions(
-        &temporary,
-        std::fs::Permissions::from_mode(metadata.mode() & 0o777),
-    )
-    .await
-    {
-        let _ = fs::remove_file(&temporary).await;
-        return Err(error.into());
-    }
-    let target = match publish_image_markup_file(&temporary, &source).await {
-        Ok(target) => target,
-        Err(error) => {
-            let _ = fs::remove_file(&temporary).await;
-            return Err(error);
-        }
-    };
-    Ok((
-        StatusCode::CREATED,
-        Json(entry_from_path(&state, target).await?),
-    ))
 }
 
 #[derive(Deserialize)]
@@ -3995,7 +3846,10 @@ async fn media_file(
     require_session(&state, &jar)?;
     let path = resolve_existing(&state.config, &query.id).await?;
     let mime = mime_guess::from_path(&path).first_or_octet_stream();
-    if mime.type_() != mime_guess::mime::IMAGE && mime.type_() != mime_guess::mime::AUDIO {
+    if mime.type_() != mime_guess::mime::IMAGE
+        && mime.type_() != mime_guess::mime::AUDIO
+        && mime.type_() != mime_guess::mime::VIDEO
+    {
         return Err(ApiError::bad(
             "unsafe_inline_type",
             "This file type is available only as a download",
@@ -4034,42 +3888,10 @@ fn spawn_cache_cleanup(state: AppState) {
     });
 }
 
-fn directory_stats(path: &Path) -> (u64, SystemTime) {
-    let mut size = 0;
-    let mut access = SystemTime::UNIX_EPOCH;
-    if let Ok(read) = std::fs::read_dir(path) {
-        for item in read.flatten() {
-            if let Ok(meta) = item.metadata() {
-                if meta.is_dir() {
-                    let (child_size, child_access) = directory_stats(&item.path());
-                    size += child_size;
-                    access = access.max(child_access);
-                } else {
-                    size += meta.len();
-                    access = access.max(meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH));
-                }
-            }
-        }
-    }
-    (size, access)
-}
-
-fn remove_artifact(path: &Path, directory: bool) -> std::io::Result<()> {
-    if directory {
-        std::fs::remove_dir_all(path)
-    } else {
-        std::fs::remove_file(path)
-    }
-}
-
-async fn reconcile_cache(
-    state: &AppState,
-    active: &HashSet<String>,
-) -> ApiResult<CacheCleanupReport> {
+async fn reconcile_cache(state: &AppState) -> ApiResult<CacheCleanupReport> {
     let root = state.config.root.clone();
     let cache = state.config.cache.clone();
     let index = state.cache_index.read().await.clone();
-    let active = active.clone();
     let (index, report) = tokio::task::spawn_blocking(move || {
         let mut index = index;
         let mut report = CacheCleanupReport::default();
@@ -4077,10 +3899,6 @@ async fn reconcile_cache(
             .records
             .iter()
             .filter_map(|(record_id, record)| {
-                let active_record = record.kind == "hls" && active.contains(&record.key);
-                if active_record {
-                    return None;
-                }
                 let artifact = cache_artifact_path(&cache, record);
                 let source = decode_path(&record.source_id)
                     .ok()
@@ -4100,14 +3918,10 @@ async fn reconcile_cache(
         for (record_id, record) in stale {
             let artifact = cache_artifact_path(&cache, &record);
             if artifact.exists() {
-                let bytes = if record.kind == "hls" {
-                    directory_stats(&artifact).0
-                } else {
-                    std::fs::metadata(&artifact)
-                        .map(|meta| meta.len())
-                        .unwrap_or(0)
-                };
-                if remove_artifact(&artifact, record.kind == "hls").is_ok() {
+                let bytes = std::fs::metadata(&artifact)
+                    .map(|meta| meta.len())
+                    .unwrap_or(0);
+                if std::fs::remove_file(&artifact).is_ok() {
                     report.artifacts_removed += 1;
                     report.bytes_reclaimed += bytes;
                 }
@@ -4115,31 +3929,12 @@ async fn reconcile_cache(
             index.records.remove(&record_id);
             report.records_removed += 1;
         }
-        let referenced_hls = index
-            .records
-            .values()
-            .filter(|record| record.kind == "hls")
-            .map(|record| record.key.clone())
-            .collect::<HashSet<_>>();
         let referenced_thumbnails = index
             .records
             .values()
             .filter(|record| record.kind == "thumbnail")
             .map(|record| format!("{}.webp", record.key))
             .collect::<HashSet<_>>();
-        if let Ok(read) = std::fs::read_dir(cache.join("hls")) {
-            for item in read.flatten() {
-                let key = item.file_name().to_string_lossy().into_owned();
-                if referenced_hls.contains(&key) || active.contains(&key) {
-                    continue;
-                }
-                let bytes = directory_stats(&item.path()).0;
-                if remove_artifact(&item.path(), true).is_ok() {
-                    report.artifacts_removed += 1;
-                    report.bytes_reclaimed += bytes;
-                }
-            }
-        }
         if let Ok(read) = std::fs::read_dir(cache.join("thumbnails")) {
             for item in read.flatten() {
                 let name = item.file_name().to_string_lossy().into_owned();
@@ -4147,7 +3942,7 @@ async fn reconcile_cache(
                     continue;
                 }
                 let bytes = item.metadata().map(|meta| meta.len()).unwrap_or(0);
-                if remove_artifact(&item.path(), false).is_ok() {
+                if std::fs::remove_file(item.path()).is_ok() {
                     report.artifacts_removed += 1;
                     report.bytes_reclaimed += bytes;
                 }
@@ -4162,12 +3957,12 @@ async fn reconcile_cache(
     Ok(report)
 }
 
-async fn evict_cache(state: &AppState, active: HashSet<String>) -> ApiResult<(u64, u64)> {
+async fn evict_cache(state: &AppState) -> ApiResult<(u64, u64)> {
     let max_age = Duration::from_secs(state.config.cache_age_days * 24 * 60 * 60);
     let cache = state.config.cache.clone();
     let max_bytes = state.config.cache_max;
     tokio::task::spawn_blocking(move || {
-        let mut units = Vec::<(PathBuf, u64, SystemTime, bool)>::new();
+        let mut units = Vec::<(PathBuf, u64, SystemTime)>::new();
         if let Ok(read) = std::fs::read_dir(cache.join("thumbnails")) {
             for item in read.flatten() {
                 if let Ok(meta) = item.metadata()
@@ -4177,49 +3972,34 @@ async fn evict_cache(state: &AppState, active: HashSet<String>) -> ApiResult<(u6
                         item.path(),
                         meta.len(),
                         meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH),
-                        false,
                     ));
-                }
-            }
-        }
-        if let Ok(read) = std::fs::read_dir(cache.join("hls")) {
-            for item in read.flatten() {
-                if item.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
-                    && !active.contains(&item.file_name().to_string_lossy().into_owned())
-                {
-                    let (size, access) = directory_stats(&item.path());
-                    units.push((item.path(), size, access, true));
                 }
             }
         }
         let now = SystemTime::now();
         let mut removed_count = 0;
         let mut reclaimed = 0;
-        for (path, _, access, directory) in &units {
+        for (path, _, access) in &units {
             if now.duration_since(*access).unwrap_or_default() > max_age {
                 let bytes = units
                     .iter()
-                    .find(|(candidate, _, _, _)| candidate == path)
-                    .map(|(_, size, _, _)| *size)
+                    .find(|(candidate, _, _)| candidate == path)
+                    .map(|(_, size, _)| *size)
                     .unwrap_or(0);
-                if remove_artifact(path, *directory).is_ok() {
+                if std::fs::remove_file(path).is_ok() {
                     removed_count += 1;
                     reclaimed += bytes;
                 }
             }
         }
-        units.retain(|(path, _, _, _)| path.exists());
-        let mut total: u64 = units.iter().map(|(_, size, _, _)| *size).sum();
-        units.sort_by_key(|(_, _, access, _)| *access);
-        for (path, size, _, directory) in units {
+        units.retain(|(path, _, _)| path.exists());
+        let mut total: u64 = units.iter().map(|(_, size, _)| *size).sum();
+        units.sort_by_key(|(_, _, access)| *access);
+        for (path, size, _) in units {
             if total <= max_bytes.saturating_mul(9) / 10 {
                 break;
             }
-            let removed = if directory {
-                std::fs::remove_dir_all(path)
-            } else {
-                std::fs::remove_file(path)
-            };
+            let removed = std::fs::remove_file(path);
             if removed.is_ok() {
                 total = total.saturating_sub(size);
                 removed_count += 1;
@@ -4236,9 +4016,8 @@ async fn evict_cache(state: &AppState, active: HashSet<String>) -> ApiResult<(u6
 async fn cleanup_cache(state: &AppState) -> ApiResult<CacheCleanupReport> {
     let _cleanup = state.cache_cleanup.lock().await;
     let _write = state.cache_write.lock().await;
-    let active = HashSet::new();
-    let mut report = reconcile_cache(state, &active).await?;
-    let (evicted, reclaimed) = evict_cache(state, active).await?;
+    let mut report = reconcile_cache(state).await?;
+    let (evicted, reclaimed) = evict_cache(state).await?;
     report.artifacts_removed += evicted;
     report.bytes_reclaimed += reclaimed;
     let mut index = state.cache_index.read().await.clone();
@@ -4255,35 +4034,9 @@ async fn cleanup_cache(state: &AppState) -> ApiResult<CacheCleanupReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower::ServiceExt;
-
-    fn markup_request(id: &str, etag: &str, bytes: &[u8]) -> axum::http::Request<Body> {
-        let boundary = "rfb-markup-test-boundary";
-        let mut body = format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"markup.png\"\r\nContent-Type: image/png\r\n\r\n"
-        )
-        .into_bytes();
-        body.extend_from_slice(bytes);
-        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-        let encoded_etag = format!("%22{}%22", etag.trim_matches('"'));
-        axum::http::Request::builder()
-            .method("POST")
-            .uri(format!(
-                "/api/v1/editor/image-markup?id={id}&expectedEtag={encoded_etag}"
-            ))
-            .header(header::COOKIE, "rfb_session=session-token")
-            .header("x-csrf-token", "csrf-token")
-            .header(
-                header::CONTENT_TYPE,
-                format!("multipart/form-data; boundary={boundary}"),
-            )
-            .body(Body::from(body))
-            .unwrap()
-    }
 
     fn test_state(root: &Path, token: Option<&str>) -> AppState {
         let cache = root.join(".cache/remote-file-browser");
-        std::fs::create_dir_all(cache.join("hls")).unwrap();
         std::fs::create_dir_all(cache.join("thumbnails")).unwrap();
         let trash = root.join(".trash");
         std::fs::create_dir_all(trash.join("items")).unwrap();
@@ -4329,7 +4082,7 @@ mod tests {
         Arc::get_mut(&mut state.config)
             .unwrap()
             .app_urls
-            .insert("video-player".into(), "/apps/video/".into());
+            .insert("video-studio".into(), "/apps/video/".into());
         state.sessions.insert(
             "session-token".into(),
             Session {
@@ -4346,8 +4099,8 @@ mod tests {
             jar,
             headers,
             Json(AppLaunchRequest {
-                app_id: "video-player".into(),
-                action: "open".into(),
+                app_id: "video-studio".into(),
+                action: "play".into(),
                 file_ids: vec![id],
             }),
         )
@@ -4368,7 +4121,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(capability.app_id, "video-player");
+        assert_eq!(capability.app_id, "video-studio");
         assert_eq!(capability.files.len(), 1);
         assert!(!capability.can_write_original);
         let reused = exchange_app_launch(
@@ -4415,60 +4168,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn document_editor_reads_and_writes_only_the_requested_file() {
+    async fn app_outputs_are_published_without_overwriting_existing_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("photo-markup.png"), b"existing").unwrap();
+        let temporary = root.path().join(".temporary-output");
+        std::fs::write(&temporary, b"new markup").unwrap();
+
+        let published = publish_app_output(&temporary, root.path(), "photo-markup.png")
+            .await
+            .unwrap();
+
+        assert_eq!(published, root.path().join("photo-markup-2.png"));
+        assert_eq!(
+            std::fs::read(root.path().join("photo-markup.png")).unwrap(),
+            b"existing"
+        );
+        assert_eq!(std::fs::read(published).unwrap(), b"new markup");
+        assert!(!temporary.exists());
+    }
+
+    #[tokio::test]
+    async fn delegated_text_write_is_scoped_and_version_bound() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("first.md"), b"first content").unwrap();
         std::fs::write(root.path().join("second.md"), b"second content").unwrap();
         let state = test_state(root.path(), None);
         state.sessions.insert(
-            "session-token".into(),
+            "parent-session".into(),
             Session {
-                csrf: "csrf-token".into(),
-                expires: SystemTime::now() + Duration::from_secs(60),
+                csrf: "parent-csrf".into(),
+                expires: SystemTime::now() + SESSION_TTL,
             },
         );
-        let jar = CookieJar::new().add(Cookie::new(SESSION_COOKIE, "session-token"));
-        let mut headers = HeaderMap::new();
-        headers.insert("x-csrf-token", "csrf-token".parse().unwrap());
         let first_id = encode_path(OsStr::new("first.md"));
-        let second_id = encode_path(OsStr::new("second.md"));
-
-        let Json(first) = read_document(
-            State(state.clone()),
-            jar.clone(),
-            Query(IdQuery {
-                id: first_id.clone(),
-            }),
-        )
-        .await
-        .unwrap();
-        let Json(second) = read_document(
-            State(state.clone()),
-            jar.clone(),
-            Query(IdQuery {
-                id: second_id.clone(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(first.id, first_id);
-        assert_eq!(first.content, "first content");
-        assert_eq!(second.id, second_id);
-        assert_eq!(second.content, "second content");
-
-        let Json(saved) = write_document(
+        let metadata = std::fs::metadata(root.path().join("first.md")).unwrap();
+        let reference = "first-reference".to_string();
+        state.app_capabilities.insert(
+            "app-session".into(),
+            AppCapability {
+                token: "app-token".into(),
+                parent_session: "parent-session".into(),
+                csrf: "app-csrf".into(),
+                app_id: "text-editor".into(),
+                action: "open".into(),
+                files: vec![DelegatedFile {
+                    reference: reference.clone(),
+                    id: first_id,
+                    name: "first.md".into(),
+                    mime: "text/markdown".into(),
+                    size: metadata.len(),
+                    etag: metadata_etag(&metadata),
+                }],
+                can_write_original: true,
+                can_create_sibling: false,
+                expires: SystemTime::now() + APP_CAPABILITY_TTL,
+            },
+        );
+        let jar = CookieJar::new().add(Cookie::new("rfb_cap_app-session", "app-token"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-app-csrf-token", "app-csrf".parse().unwrap());
+        let _ = delegated_write_content(
             State(state.clone()),
             jar.clone(),
             headers.clone(),
-            Json(WriteDocument {
-                id: first.id.clone(),
-                content: "updated first".into(),
-                expected_etag: first.etag.clone(),
-            }),
+            AxumPath(("app-session".into(), reference.clone())),
+            Bytes::from_static(b"updated first"),
         )
         .await
         .unwrap();
-        assert_eq!(saved.id, first.id);
         assert_eq!(
             std::fs::read(root.path().join("first.md")).unwrap(),
             b"updated first"
@@ -4478,29 +4245,17 @@ mod tests {
             b"second content"
         );
 
-        let stale = write_document(
+        std::fs::write(root.path().join("first.md"), b"changed externally").unwrap();
+        let stale = delegated_write_content(
             State(state),
             jar,
             headers,
-            Json(WriteDocument {
-                id: first.id,
-                content: "stale overwrite".into(),
-                expected_etag: first.etag,
-            }),
+            AxumPath(("app-session".into(), reference)),
+            Bytes::from_static(b"stale overwrite"),
         )
-        .await;
-        assert!(matches!(
-            stale,
-            Err(ApiError(StatusCode::CONFLICT, "edit_conflict", _))
-        ));
-        assert_eq!(
-            std::fs::read(root.path().join("first.md")).unwrap(),
-            b"updated first"
-        );
-        assert_eq!(
-            std::fs::read(root.path().join("second.md")).unwrap(),
-            b"second content"
-        );
+        .await
+        .unwrap_err();
+        assert_eq!(stale.0, StatusCode::CONFLICT);
     }
     #[tokio::test]
     async fn login_reloads_rotated_password_file_and_handles_unreadable_secrets() {
@@ -4703,42 +4458,6 @@ mod tests {
             String::from_utf8_lossy(&collected)
         );
     }
-    fn probe(video: (&str, &str), audio: Option<&str>) -> ProbeOutput {
-        let mut streams = vec![ProbeStream {
-            codec_type: Some("video".into()),
-            codec_name: Some(video.0.into()),
-            profile: None,
-            pix_fmt: Some(video.1.into()),
-            width: None,
-            height: None,
-            r_frame_rate: None,
-            time_base: None,
-            sample_rate: None,
-            channels: None,
-            channel_layout: None,
-        }];
-        if let Some(codec) = audio {
-            streams.push(ProbeStream {
-                codec_type: Some("audio".into()),
-                codec_name: Some(codec.into()),
-                profile: None,
-                pix_fmt: None,
-                width: None,
-                height: None,
-                r_frame_rate: None,
-                time_base: None,
-                sample_rate: None,
-                channels: None,
-                channel_layout: None,
-            });
-        }
-        ProbeOutput {
-            streams,
-            format: Some(ProbeFormat {
-                format_name: Some("mov,mp4,m4a,3gp,3g2,mj2".into()),
-            }),
-        }
-    }
     #[test]
     fn path_ids_round_trip_non_utf8() {
         let raw = OsStr::from_bytes(b"folder/\xff-name");
@@ -4852,26 +4571,6 @@ mod tests {
                 "/api/v1/delegated/sessions/{session_id}/outputs",
                 &["post"][..],
             ),
-            (
-                "/api/v1/delegated/sessions/{session_id}/files/{reference}/hls",
-                &["post"][..],
-            ),
-            (
-                "/api/v1/delegated/sessions/{session_id}/hls/{key}",
-                &["get"][..],
-            ),
-            (
-                "/api/v1/delegated/sessions/{session_id}/files/{reference}/media-info",
-                &["get"][..],
-            ),
-            (
-                "/api/v1/delegated/sessions/{session_id}/files/{reference}/extractions",
-                &["post"][..],
-            ),
-            (
-                "/api/v1/delegated/sessions/{session_id}/extractions/{key}",
-                &["get"][..],
-            ),
             ("/api/v1/fs/entries", &["get"][..]),
             ("/api/v1/fs/metadata", &["get"][..]),
             ("/api/v1/fs/provenance", &["get", "put", "post"][..]),
@@ -4881,24 +4580,13 @@ mod tests {
             ("/api/v1/fs/uploads", &["post"][..]),
             ("/api/v1/fs/operations", &["post"][..]),
             ("/api/v1/fs/trash", &["post"][..]),
-            ("/api/v1/editor/document", &["get", "put"][..]),
-            ("/api/v1/editor/image-markup", &["post"][..]),
             ("/api/v1/trash", &["get", "delete"][..]),
             ("/api/v1/trash/{id}/restore", &["post"][..]),
             ("/api/v1/trash/{id}", &["delete"][..]),
             ("/api/v1/previews/thumbnail", &["get"][..]),
             ("/api/v1/media/file", &["get"][..]),
-            ("/api/v1/media/info", &["get"][..]),
-            ("/api/v1/media/extractions", &["get", "post"][..]),
-            ("/api/v1/media/extractions/{key}", &["get"][..]),
-            ("/api/v1/media/concatenations", &["get", "post"][..]),
-            ("/api/v1/media/hls", &["post"][..]),
-            ("/api/v1/media/jobs", &["get"][..]),
-            ("/api/v1/media/cache/cleanup", &["post"][..]),
             ("/api/v1/terminal/tickets", &["post"][..]),
             ("/api/v1/terminal/ws", &["get"][..]),
-            ("/api/v1/media/hls/{key}/status", &["get"][..]),
-            ("/api/v1/media/hls/{key}/{file}", &["get"][..]),
         ] {
             let operations = paths
                 .get(path)
@@ -4915,6 +4603,7 @@ mod tests {
             assert!(schemes.contains_key(scheme));
         }
     }
+
     #[test]
     fn permissions_are_symbolic() {
         assert_eq!(permission_string(0o754, "file"), "-rwxr-xr--");
@@ -4960,127 +4649,6 @@ mod tests {
         let properties = serde_json::to_value(entry).unwrap();
         assert_eq!(properties["childFileCount"], 2);
         assert_eq!(properties["childDirectoryCount"], 1);
-    }
-    #[test]
-    fn compatible_h264_is_remuxed() {
-        assert_eq!(
-            conversion_mode(&probe(("h264", "yuv420p"), Some("aac"))),
-            ConversionMode::Remux
-        );
-        assert_eq!(
-            conversion_mode(&probe(("h264", "yuv420p"), None)),
-            ConversionMode::Remux
-        );
-    }
-    #[test]
-    fn mp4_h264_aac_source_is_browser_compatible() {
-        assert!(browser_compatible_source(&probe(
-            ("h264", "yuv420p"),
-            Some("aac")
-        )));
-        let mut mislabeled_container = probe(("h264", "yuv420p"), Some("aac"));
-        mislabeled_container.format = Some(ProbeFormat {
-            format_name: Some("asf".into()),
-        });
-        assert!(!browser_compatible_source(&mislabeled_container));
-        assert!(!browser_compatible_source(&probe(
-            ("hevc", "yuv420p"),
-            Some("aac")
-        )));
-    }
-    #[test]
-    fn compatible_video_with_other_audio_only_converts_audio() {
-        assert_eq!(
-            conversion_mode(&probe(("h264", "yuv420p"), Some("dts"))),
-            ConversionMode::Audio
-        );
-    }
-    #[test]
-    fn incompatible_video_is_fully_converted() {
-        assert_eq!(
-            conversion_mode(&probe(("hevc", "yuv420p"), Some("aac"))),
-            ConversionMode::Full
-        );
-        assert_eq!(
-            conversion_mode(&probe(("h264", "yuv420p10le"), Some("aac"))),
-            ConversionMode::Full
-        );
-    }
-    #[test]
-    fn frame_rates_are_parsed_safely() {
-        assert_eq!(parse_frame_rate("30000/1001").unwrap(), 30000.0 / 1001.0);
-        assert_eq!(parse_frame_rate("25/1"), Some(25.0));
-        assert_eq!(parse_frame_rate("0/0"), None);
-        assert_eq!(parse_frame_rate("invalid"), None);
-    }
-    #[test]
-    fn extraction_times_and_names_are_stable() {
-        assert!(valid_media_time(0.0, 10.0));
-        assert!(valid_media_time(9.999, 10.0));
-        assert!(!valid_media_time(10.0, 10.0));
-        assert!(!valid_media_time(f64::NAN, 10.0));
-        assert_eq!(timestamp_label(3661.234), "01-01-01.234");
-    }
-    #[test]
-    fn concat_requests_require_safe_mp4_names_and_escape_list_paths() {
-        assert!(valid_concat_output_name("combined.mp4"));
-        assert!(valid_concat_output_name("COMBINED.MP4"));
-        assert!(!valid_concat_output_name("combined.mov"));
-        assert!(!valid_concat_output_name("folder/combined.mp4"));
-        assert_eq!(
-            concat_list_line(Path::new("/videos/one's clip.mp4")),
-            "file '/videos/one'\\\\''s clip.mp4'\\n"
-        );
-    }
-    #[test]
-    fn concat_requires_matching_stream_layouts() {
-        let first = probe(("h264", "yuv420p"), Some("aac"));
-        let same = probe(("h264", "yuv420p"), Some("aac"));
-        let different_audio = probe(("h264", "yuv420p"), Some("opus"));
-        assert!(concat_compatible(&first, &same));
-        assert!(!concat_compatible(&first, &different_audio));
-    }
-    #[test]
-    fn frame_extraction_seeks_accurately_before_opening_the_input() {
-        let command = frame_extraction_command(
-            Path::new("/videos/source.mp4"),
-            Path::new("/videos/frame.png"),
-            12.3456789,
-        );
-        let arguments = command
-            .as_std()
-            .get_args()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            arguments,
-            [
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-progress",
-                "pipe:1",
-                "-nostats",
-                "-ss",
-                "12.345679",
-                "-accurate_seek",
-                "-i",
-                "/videos/source.mp4",
-                "-map",
-                "0:v:0",
-                "-frames:v",
-                "1",
-                "-y",
-                "/videos/frame.png",
-            ]
-        );
-    }
-    #[test]
-    fn ffmpeg_progress_is_parsed_in_seconds() {
-        assert_eq!(ffmpeg_progress_seconds("out_time_us=1250000"), Some(1.25));
-        assert_eq!(ffmpeg_progress_seconds("progress=continue"), None);
-        assert_eq!(ffmpeg_progress_seconds("out_time_us=-1"), None);
     }
     #[test]
     fn live_events_use_tagged_camel_case_messages() {
@@ -5210,235 +4778,5 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy.records["thumbnail:legacy"].source_inode, 0);
-    }
-    #[tokio::test]
-    async fn cache_association_and_active_job_follow_a_ui_move() {
-        let root = tempfile::tempdir().unwrap();
-        let state = test_state(root.path(), None);
-        let source = root.path().join("source.mp4");
-        let target = root.path().join("renamed.mp4");
-        std::fs::write(&source, b"video").unwrap();
-        let source_id = encode_path(OsStr::new("source.mp4"));
-        let target_id = encode_path(OsStr::new("renamed.mp4"));
-        let meta = std::fs::metadata(&source).unwrap();
-        let key = "abc123".to_string();
-        let directory = state.config.cache.join("hls").join(&key);
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("segment-00000.ts"), b"segment").unwrap();
-        std::fs::write(
-            directory.join("index.m3u8"),
-            "#EXTM3U\n#EXTINF:4,\nsegment-00000.ts\n#EXT-X-ENDLIST\n",
-        )
-        .unwrap();
-        register_cache_record(
-            &state,
-            CacheRecord {
-                kind: "hls".into(),
-                key: key.clone(),
-                source_id: source_id.clone(),
-                source_inode: meta.ino(),
-                source_size: meta.len(),
-                source_modified_ns: source_modified_ns(&meta),
-                dimension: None,
-            },
-        )
-        .await
-        .unwrap();
-        state.media_jobs.insert(
-            key.clone(),
-            MediaJob {
-                key: key.clone(),
-                file_name: "source.mp4".into(),
-                status: "working".into(),
-                playable: true,
-                mode: "full".into(),
-                started_at: Utc::now(),
-                progress: Some(0.5),
-                source_id,
-            },
-        );
-        std::fs::rename(&source, &target).unwrap();
-        remap_cache(&state, &source, &target).await.unwrap();
-        let target_meta = std::fs::metadata(&target).unwrap();
-        assert_eq!(
-            find_cache_key(&state, "hls", &target_id, &target_meta, None)
-                .await
-                .as_deref(),
-            Some("abc123")
-        );
-        let job = state.media_jobs.get(&key).unwrap();
-        assert_eq!(job.source_id, target_id);
-        assert_eq!(job.file_name, "renamed.mp4");
-        assert!(directory.exists());
-    }
-    #[tokio::test]
-    async fn cache_cleanup_removes_orphans_but_preserves_valid_artifacts() {
-        let root = tempfile::tempdir().unwrap();
-        let state = test_state(root.path(), None);
-        let source = root.path().join("video.mp4");
-        std::fs::write(&source, b"video").unwrap();
-        let meta = std::fs::metadata(&source).unwrap();
-        let valid = state.config.cache.join("hls/abc123");
-        std::fs::create_dir_all(&valid).unwrap();
-        std::fs::write(valid.join("segment-00000.ts"), b"segment").unwrap();
-        std::fs::write(
-            valid.join("index.m3u8"),
-            "#EXTM3U\n#EXTINF:4,\nsegment-00000.ts\n#EXT-X-ENDLIST\n",
-        )
-        .unwrap();
-        register_cache_record(
-            &state,
-            CacheRecord {
-                kind: "hls".into(),
-                key: "abc123".into(),
-                source_id: encode_path(OsStr::new("video.mp4")),
-                source_inode: meta.ino(),
-                source_size: meta.len(),
-                source_modified_ns: source_modified_ns(&meta),
-                dimension: None,
-            },
-        )
-        .await
-        .unwrap();
-        let orphan = state.config.cache.join("hls/def456");
-        std::fs::create_dir_all(&orphan).unwrap();
-        std::fs::write(orphan.join("junk"), b"junk").unwrap();
-        let report = cleanup_cache(&state).await.unwrap();
-        assert!(!orphan.exists());
-        assert!(valid.exists());
-        assert_eq!(report.artifacts_removed, 1);
-        assert_eq!(state.cache_index.read().await.records.len(), 1);
-    }
-    #[tokio::test]
-    async fn extraction_publication_never_overwrites() {
-        let directory = tempfile::tempdir().unwrap();
-        let first_temporary = directory.path().join("first.tmp");
-        std::fs::write(&first_temporary, b"first").unwrap();
-        let first = publish_extraction(&first_temporary, directory.path(), "clip", "mp4")
-            .await
-            .unwrap();
-        let second_temporary = directory.path().join("second.tmp");
-        std::fs::write(&second_temporary, b"second").unwrap();
-        let second = publish_extraction(&second_temporary, directory.path(), "clip", "mp4")
-            .await
-            .unwrap();
-        assert_eq!(first.file_name().unwrap(), "clip.mp4");
-        assert_eq!(second.file_name().unwrap(), "clip-2.mp4");
-        assert_eq!(std::fs::read(first).unwrap(), b"first");
-        assert_eq!(std::fs::read(second).unwrap(), b"second");
-        assert!(!first_temporary.exists() && !second_temporary.exists());
-    }
-    #[tokio::test]
-    async fn image_markup_publication_uses_source_name_and_never_overwrites() {
-        let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("reference.jpg");
-        std::fs::write(&source, b"source").unwrap();
-        let first_temporary = directory.path().join("first.tmp");
-        std::fs::write(&first_temporary, b"first").unwrap();
-        let first = publish_image_markup_file(&first_temporary, &source)
-            .await
-            .unwrap();
-        let second_temporary = directory.path().join("second.tmp");
-        std::fs::write(&second_temporary, b"second").unwrap();
-        let second = publish_image_markup_file(&second_temporary, &source)
-            .await
-            .unwrap();
-        assert_eq!(first.file_name().unwrap(), "reference-markup.png");
-        assert_eq!(second.file_name().unwrap(), "reference-markup-2.png");
-        assert_eq!(std::fs::read(first).unwrap(), b"first");
-        assert_eq!(std::fs::read(second).unwrap(), b"second");
-        assert!(!first_temporary.exists() && !second_temporary.exists());
-    }
-    #[test]
-    fn image_markup_requires_a_png_signature() {
-        assert!(has_png_signature(PNG_SIGNATURE));
-        assert!(has_png_signature(b"\x89PNG\r\n\x1a\nmore bytes"));
-        assert!(!has_png_signature(b"not a png"));
-        assert!(!has_png_signature(&PNG_SIGNATURE[..7]));
-    }
-    #[tokio::test]
-    async fn image_markup_endpoint_rejects_stale_or_invalid_uploads_and_saves_png() {
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("reference.jpg");
-        std::fs::write(&source, b"source image").unwrap();
-        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
-        let state = test_state(root.path(), None);
-        state.sessions.insert(
-            "session-token".into(),
-            Session {
-                csrf: "csrf-token".into(),
-                expires: SystemTime::now() + Duration::from_secs(60),
-            },
-        );
-        let app = Router::new()
-            .route("/api/v1/editor/image-markup", post(save_image_markup))
-            .with_state(state);
-        let etag = metadata_etag(&std::fs::metadata(&source).unwrap());
-        let source_id = encode_path(OsStr::new("reference.jpg"));
-
-        let stale = app
-            .clone()
-            .oneshot(markup_request(&source_id, "stale", PNG_SIGNATURE))
-            .await
-            .unwrap();
-        let stale_status = stale.status();
-        let stale_body = axum::body::to_bytes(stale.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(
-            stale_status,
-            StatusCode::CONFLICT,
-            "{}",
-            String::from_utf8_lossy(&stale_body)
-        );
-        let invalid = app
-            .clone()
-            .oneshot(markup_request(&source_id, &etag, b"not a png"))
-            .await
-            .unwrap();
-        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            !std::fs::read_dir(root.path())
-                .unwrap()
-                .flatten()
-                .any(|item| item
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".rfb-image-markup-"))
-        );
-
-        let mut png = PNG_SIGNATURE.to_vec();
-        png.extend_from_slice(b"markup payload");
-        let saved = app
-            .oneshot(markup_request(&source_id, &etag, &png))
-            .await
-            .unwrap();
-        assert_eq!(saved.status(), StatusCode::CREATED);
-        let target = root.path().join("reference-markup.png");
-        assert_eq!(std::fs::read(&target).unwrap(), png);
-        assert_eq!(
-            std::fs::metadata(target).unwrap().permissions().mode() & 0o777,
-            0o640
-        );
-        assert_eq!(std::fs::read(source).unwrap(), b"source image");
-    }
-    #[test]
-    fn playlist_requires_segments_and_endlist_to_be_ready() {
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("segment-00000.ts"), b"segment").unwrap();
-        std::fs::write(
-            directory.path().join("index.m3u8"),
-            "#EXTM3U\n#EXTINF:4,\nsegment-00000.ts\n",
-        )
-        .unwrap();
-        assert_eq!(playlist_state(directory.path()), (true, false));
-        std::fs::write(
-            directory.path().join("index.m3u8"),
-            "#EXTM3U\n#EXTINF:4,\nsegment-00000.ts\n#EXT-X-ENDLIST\n",
-        )
-        .unwrap();
-        assert_eq!(playlist_state(directory.path()), (true, true));
-        std::fs::remove_file(directory.path().join("segment-00000.ts")).unwrap();
-        assert_eq!(playlist_state(directory.path()), (false, false));
     }
 }

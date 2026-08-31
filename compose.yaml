@@ -13,9 +13,9 @@ x-files-environment: &files-environment
   RFB_TERMINAL_SHELL: "${FILES_TERMINAL_SHELL:-${RFB_TERMINAL_SHELL:-/bin/zsh}}"
   RFB_TERMINAL_MAX_SESSIONS: "${FILES_TERMINAL_MAX_SESSIONS:-${RFB_TERMINAL_MAX_SESSIONS:-4}}"
   RFB_PROVENANCE_API_URL: http://files-provenance:8090
-  RFB_VFX_EDITOR_API_URL: http://video-studio:4317
   FILES_VIDEO_STUDIO_URL: /apps/video/
-  RFB_TEXT_EDITOR_URL: /apps/text/
+  FILES_TEXT_EDITOR_URL: /apps/text/
+  FILES_IMAGE_TOOLS_URL: /apps/images/
   RUST_LOG: "${RUST_LOG:-remote_file_browser=info,tower_http=info}"
 
 services:
@@ -101,11 +101,11 @@ services:
       context: .
       dockerfile: apps/files/web/Dockerfile
     environment:
-      RFB_TLS_MODE: http
       FILES_APPS_ENABLED: "true"
     expose: ["8080"]
     depends_on:
       files-server: { condition: service_healthy }
+      image-tools: { condition: service_healthy }
       text-editor: { condition: service_healthy }
       video-studio: { condition: service_healthy }
     labels:
@@ -125,14 +125,25 @@ services:
       retries: 5
     restart: unless-stopped
 
+  workspace-deps:
+    image: node:24-bookworm-slim
+    profiles: [dev]
+    working_dir: /repo
+    command: [npm, ci]
+    volumes:
+      - .:/repo
+      - workspace-dev-node-modules:/repo/node_modules
+    security_opt: [no-new-privileges:true]
+
   files-web-dev:
     image: node:24-bookworm-slim
     profiles: [dev]
     working_dir: /repo
-    command: [sh, -c, "npm install --ignore-scripts && exec npm run dev:files"]
+    command: [npm, run, dev:files]
     environment:
       VITE_PROXY_TARGET: http://files-server:8080
       VITE_TEXT_EDITOR_TARGET: http://text-editor-dev:5173
+      VITE_IMAGE_TOOLS_TARGET: http://image-tools-dev:5173
       VITE_VIDEO_STUDIO_TARGET: http://video-studio-dev:5173
       CHOKIDAR_USEPOLLING: "${RWS_DEV_POLLING:-${RFB_DEV_POLLING:-false}}"
     volumes:
@@ -141,6 +152,8 @@ services:
     ports: ["${RWS_BIND_ADDRESS:-${RFB_BIND_ADDRESS:-0.0.0.0}}:${RWS_DEV_PORT:-${RFB_DEV_PORT:-5173}}:5173"]
     depends_on:
       files-server: { condition: service_healthy }
+      workspace-deps: { condition: service_completed_successfully }
+      image-tools-dev: { condition: service_started }
       text-editor-dev: { condition: service_started }
       video-studio-dev: { condition: service_started }
     security_opt: [no-new-privileges:true]
@@ -166,12 +179,45 @@ services:
     image: node:24-bookworm-slim
     profiles: [dev]
     working_dir: /repo
-    command: [sh, -c, "npm install --ignore-scripts && exec npm run dev:text"]
+    command: [npm, run, dev:text]
     environment:
       VITE_FILES_TARGET: http://files-server:8080
     volumes:
       - .:/repo
       - workspace-dev-node-modules:/repo/node_modules
+    depends_on:
+      workspace-deps: { condition: service_completed_successfully }
+    security_opt: [no-new-privileges:true]
+
+  image-tools:
+    image: remote-workspace-image-tools
+    profiles: [prod]
+    build:
+      context: .
+      dockerfile: apps/image-tools/Dockerfile
+    expose: ["8080"]
+    read_only: true
+    tmpfs: [/var/cache/nginx:size=16m,mode=0755, /var/run:size=1m,mode=0755]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, wget, -qO-, http://127.0.0.1:8080/healthz]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  image-tools-dev:
+    image: node:24-bookworm-slim
+    profiles: [dev]
+    working_dir: /repo
+    command: [npm, run, dev:images]
+    environment:
+      VITE_FILES_TARGET: http://files-server:8080
+    volumes:
+      - .:/repo
+      - workspace-dev-node-modules:/repo/node_modules
+    depends_on:
+      workspace-deps: { condition: service_completed_successfully }
     security_opt: [no-new-privileges:true]
 
   video-studio:
@@ -186,7 +232,8 @@ services:
       VIDEO_STUDIO_HOST: 0.0.0.0
       VIDEO_STUDIO_PORT: 4317
       VIDEO_STUDIO_DATA_DIR: /data
-      VIDEO_STUDIO_ALLOWED_ORIGINS: "${VIDEO_STUDIO_ALLOWED_ORIGINS:-${VFX_EDITOR_ALLOWED_ORIGINS:-}}"
+      FILES_API_INTERNAL_URL: http://files-server:8080/api/v1
+      VIDEO_STUDIO_ALLOWED_ORIGINS: "${VIDEO_STUDIO_ALLOWED_ORIGINS:-${VFX_EDITOR_ALLOWED_ORIGINS:-https://${RWS_HOSTNAME:-${RFB_HOSTNAME:-files.internal.example}}}}"
     expose: ["4317"]
     networks:
       default: { aliases: [video-studio] }
@@ -221,6 +268,8 @@ services:
       - .:/repo
       - workspace-dev-node-modules:/repo/node_modules
       - video-studio-dev-data:/data
+    depends_on:
+      workspace-deps: { condition: service_completed_successfully }
     security_opt: [no-new-privileges:true]
 
   socket-proxy:
@@ -274,10 +323,12 @@ services:
         source: "${INGRESS_TLS_CERT_PATH:-${TRAEFIK_TLS_CERT_PATH:-/etc/ssl/private/internal-fullchain.pem}}"
         target: /run/tls/tls.crt
         read_only: true
+        bind: { create_host_path: false }
       - type: bind
         source: "${INGRESS_TLS_KEY_PATH:-${TRAEFIK_TLS_KEY_PATH:-/etc/ssl/private/internal-key.pem}}"
         target: /run/tls/tls.key
         read_only: true
+        bind: { create_host_path: false }
     networks: [docker-api, ingress]
     depends_on:
       socket-proxy: { condition: service_healthy }

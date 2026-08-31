@@ -32,7 +32,9 @@ function App() {
       setActive(capability.sessionId)
       history.replaceState(null, '', location.pathname)
     } catch (error) {
-      setTabs(current => [...current, { capability: { sessionId: `error-${Date.now()}`, appId: 'text-editor', action: 'open', csrfToken: '', files: [{ reference: '', name: 'Launch failed', path: '', mime: 'text/plain', size: 0, etag: '' }], canWriteOriginal: false }, content: '', saved: '', saving: false, error: error instanceof Error ? error.message : 'Could not open the document.' }])
+      const sessionId = `error-${Date.now()}`
+      setTabs(current => [...current, { capability: { sessionId, appId: 'text-editor', action: 'open', csrfToken: '', files: [{ reference: '', name: 'Launch failed', path: '', mime: 'text/plain', size: 0, etag: '' }], canWriteOriginal: false }, content: '', saved: '', saving: false, error: error instanceof Error ? error.message : 'Could not open the document.' }])
+      setActive(sessionId)
     } finally { opening.current.delete(ticket) }
   }, [tabs])
 

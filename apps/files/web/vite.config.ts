@@ -4,6 +4,7 @@ import react from '@vitejs/plugin-react'
 export default defineConfig(() => {
   const videoTarget = process.env.VITE_VIDEO_STUDIO_TARGET
   const textTarget = process.env.VITE_TEXT_EDITOR_TARGET
+  const imageTarget = process.env.VITE_IMAGE_TOOLS_TARGET
   return {
   plugins: [react()],
   server: {
@@ -12,6 +13,10 @@ export default defineConfig(() => {
       ...(textTarget ? {
         '/apps/text-hmr': { target: textTarget, ws: true },
         '/apps/text': { target: textTarget, ws: true },
+      } : {}),
+      ...(imageTarget ? {
+        '/apps/images-hmr': { target: imageTarget, ws: true },
+        '/apps/images': { target: imageTarget, ws: true },
       } : {}),
       ...(videoTarget ? {
         '/apps/video-hmr': { target: videoTarget, ws: true },
