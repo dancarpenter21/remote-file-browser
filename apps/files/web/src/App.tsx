@@ -473,6 +473,9 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const visibleCount = gridRows.length
   const cutIds = new Set(clipboard?.operation === 'move' ? clipboard.ids : [])
   const previewEntries = Array.from(selected).map(id => findEntry(id, root, expanded)).filter((entry): entry is Entry => Boolean(entry))
+  const viewerImages = openFile?.kind === 'image'
+    ? ((openFile.entry.parentId === '' ? root : expanded[openFile.entry.parentId])?.entries.filter(entry => entry.mime.startsWith('image/')) ?? [openFile.entry])
+    : []
   const toggleTerminal = () => setTerminal(current => current ? { ...current, hidden: !current.hidden } : { directoryId: currentDir, hidden: false })
   const goToRoot = () => { setCurrentDir(''); setSelected(new Set()); setPrimary(null); setColumnPath([]); setMobileSelecting(false) }
   const goToParent = () => {
@@ -547,7 +550,9 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     {folderMenu && <FolderContextMenu {...folderMenu} close={() => setFolderMenu(null)} createItem={createItem} paste={() => paste(folderMenu.directoryId, folderMenu.path)} hasClipboard={Boolean(clipboard)} showProperties={id => showProperties(id)} setError={setError} mobileControls={isMobile ? { hidden, toggleHidden: () => setHidden(value => !value), refresh: () => refresh(folderMenu.directoryId) } : undefined} />}
     {isMobile && mobileSelectionMenu && mobileSelectionEntry && <ContextMenu entry={mobileSelectionEntry} selectedEntries={previewEntries} x={innerWidth - 12} y={80} close={() => setMobileSelectionMenu(false)} open={() => activate(mobileSelectionEntry)} renameEntry={rename} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} />}
     {properties && <PropertiesDialog {...properties} onClose={() => setProperties(null)} />}
-    {openFile && <BasicFileWindow key={`${openFile.entry.id}:${openFile.entry.etag}`} {...openFile} onClose={() => setOpenFile(null)} onSaved={() => refresh(openFile.entry.parentId)} />}
+    {openFile && <BasicFileWindow key={openFile.kind === 'image' ? 'image-viewer' : `${openFile.entry.id}:${openFile.entry.etag}`} {...openFile} images={viewerImages} onNavigate={entry => {
+      setOpenFile({ entry, kind: 'image' }); setSelected(new Set([entry.id])); setPrimary(entry)
+    }} onClose={() => setOpenFile(null)} onSaved={() => refresh(openFile.entry.parentId)} />}
     <div id="window-tray" className="window-tray" role="region" aria-label="Minimized windows" />
   </div></InstalledAppsContext.Provider>
 }
@@ -1057,9 +1062,9 @@ function ViewSelector({ view, setView }: { view: ViewMode; setView: (view: ViewM
   </div>
 }
 
-function BasicFileWindow({ entry, kind, onClose, onSaved }: { entry: Entry; kind: BasicFileKind; onClose: () => void; onSaved: () => Promise<void> }) {
+function BasicFileWindow({ entry, kind, images, onNavigate, onClose, onSaved }: { entry: Entry; kind: BasicFileKind; images: Entry[]; onNavigate: (entry: Entry) => void; onClose: () => void; onSaved: () => Promise<void> }) {
   if (kind === 'text') return <TextFileWindow entry={entry} onClose={onClose} onSaved={onSaved} />
-  return <MediaFileWindow entry={entry} kind={kind} onClose={onClose} />
+  return <MediaFileWindow entry={entry} kind={kind} images={images} onNavigate={onNavigate} onClose={onClose} />
 }
 
 function TextFileWindow({ entry, onClose, onSaved }: { entry: Entry; onClose: () => void; onSaved: () => Promise<void> }) {
@@ -1130,19 +1135,36 @@ function TextFileWindow({ entry, onClose, onSaved }: { entry: Entry; onClose: ()
   </FloatingWindow>
 }
 
-function MediaFileWindow({ entry, kind, onClose }: { entry: Entry; kind: 'image' | 'video'; onClose: () => void }) {
+function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: Entry; kind: 'image' | 'video'; images: Entry[]; onNavigate: (entry: Entry) => void; onClose: () => void }) {
   const videoStudioEnabled = useContext(VideoStudioContext)
   const [error, setError] = useState('')
   const [openingStudio, setOpeningStudio] = useState(false)
   const fallbackStarted = useRef(false)
   const videoRef = useRef<HTMLVideoElement>(null)
   const source = mediaUrl(entry.id, entry.etag)
+  const imageIndex = images.findIndex(image => image.id === entry.id)
+  const navigate = useCallback((direction: -1 | 1) => {
+    if (images.length < 2) return
+    const current = imageIndex >= 0 ? imageIndex : 0
+    onNavigate(images[(current + direction + images.length) % images.length])
+  }, [imageIndex, images, onNavigate])
+  useEffect(() => { setError('') }, [entry.id])
   useLayoutEffect(() => {
     if (kind !== 'video' || !videoRef.current) return
     videoRef.current.volume = 0
     videoRef.current.muted = true
     videoRef.current.defaultMuted = true
   }, [entry.id, kind])
+  useEffect(() => {
+    if (kind !== 'image') return
+    const keyboard = (event: KeyboardEvent) => {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+      event.preventDefault(); event.stopPropagation()
+      navigate(event.key === 'ArrowLeft' ? -1 : 1)
+    }
+    addEventListener('keydown', keyboard, { capture: true })
+    return () => removeEventListener('keydown', keyboard, { capture: true })
+  }, [kind, navigate])
   const openStudioFallback = useCallback(async () => {
     if (fallbackStarted.current) return
     fallbackStarted.current = true
@@ -1170,7 +1192,7 @@ function MediaFileWindow({ entry, kind, onClose }: { entry: Entry; kind: 'image'
     {openingStudio && <div className="basic-file-loading" role="status"><span className="spinner" /> Browser playback failed. Opening Video Studio…</div>}
     <div className={`basic-media-stage ${kind}`}>
       {kind === 'image'
-        ? <img src={source} alt={entry.name} onError={() => setError('The image could not be displayed.')} />
+        ? <><button className="image-nav previous" disabled={images.length < 2} aria-label="Previous image" title="Previous image (Left Arrow)" onClick={() => navigate(-1)}><ChevronLeft /></button><img src={source} alt={entry.name} onError={() => setError('The image could not be displayed.')} /><button className="image-nav next" disabled={images.length < 2} aria-label="Next image" title="Next image (Right Arrow)" onClick={() => navigate(1)}><ChevronRight /></button></>
         : <video ref={videoRef} src={source} controls autoPlay muted playsInline preload="metadata" onError={videoFailed} />}
     </div>
   </FloatingWindow>
