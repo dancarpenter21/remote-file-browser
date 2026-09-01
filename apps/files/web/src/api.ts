@@ -25,6 +25,7 @@ export type Session = { authenticated: boolean; username?: string; csrfToken?: s
 export type InstalledAppAction = { id: string; label: string; accepts: string[]; minFiles: number; maxFiles: number }
 export type InstalledApp = { id: string; name: string; launchUrl: string; actions: InstalledAppAction[] }
 export type AppLaunch = { launchUrl: string; expiresAt: string }
+export type DocumentFile = { id: string; content: string; etag: string; mime: string }
 export type TrashEntry = {
   info: { id: string; originalId: string; originalName: string; deletedAt: string }
   kind: string
@@ -73,6 +74,8 @@ export const api = {
   operate: (operation: 'copy' | 'move' | 'rename', sources: string[], destinationId: string, name?: string, replace = false, merge = false) => request<Entry[]>('/fs/operations', { method: 'POST', body: JSON.stringify({ operation, sources, destinationId, name, replace, merge }) }),
   provenance: (id: string) => request<Provenance>(`/fs/provenance?id=${encodeURIComponent(id)}`),
   setProvenance: (id: string, urls: string[]) => request<Provenance>(`/fs/provenance?id=${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify({ urls }) }),
+  readDocument: (id: string) => request<DocumentFile>(`/editor/document?id=${encodeURIComponent(id)}`),
+  saveDocument: (document: DocumentFile) => request<DocumentFile>('/editor/document', { method: 'PUT', body: JSON.stringify({ id: document.id, content: document.content, expectedEtag: document.etag }) }),
   trash: (ids: string[]) => request<void>('/fs/trash', { method: 'POST', body: JSON.stringify({ ids }) }),
   listTrash: () => request<TrashEntry[]>('/trash'),
   restore: (id: string, destinationId?: string, replace = false) => request<Entry>(`/trash/${id}/restore`, { method: 'POST', body: JSON.stringify({ destinationId, replace }) }),

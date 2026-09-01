@@ -264,6 +264,7 @@ type ApiResult<T> = Result<T, ApiError>;
         exchange_app_launch,
         delegated_metadata,
         delegated_content,
+        delegated_media_info,
         delegated_write_content,
         delegated_create_output,
         list_entries,
@@ -273,6 +274,8 @@ type ApiResult<T> = Result<T, ApiError>;
         submit_provenance,
         live_events,
         content,
+        read_document,
+        write_document,
         create_item,
         upload,
         operation,
@@ -310,7 +313,10 @@ type ApiResult<T> = Result<T, ApiError>;
         AppLaunchResponse,
         AppLaunchExchangeRequest,
         AppCapabilityResponse,
-        DelegatedFileResponse
+        DelegatedFileResponse,
+        DelegatedMediaInfoResponse,
+        Document,
+        WriteDocument
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -509,6 +515,10 @@ async fn main() {
             get(delegated_content).put(delegated_write_content),
         )
         .route(
+            "/delegated/sessions/{session_id}/files/{reference}/media-info",
+            get(delegated_media_info),
+        )
+        .route(
             "/delegated/sessions/{session_id}/outputs",
             post(delegated_create_output),
         )
@@ -522,6 +532,7 @@ async fn main() {
         )
         .route("/events", get(live_events))
         .route("/fs/content", get(content))
+        .route("/editor/document", get(read_document).put(write_document))
         .route("/fs/items", post(create_item))
         .route("/fs/uploads", post(upload))
         .route("/fs/operations", post(operation))
@@ -1232,6 +1243,111 @@ async fn delegated_content(
     let file = delegated_file(&capability, &reference)?;
     let path = validate_delegated_file(&state, &file).await?;
     serve_file(path, &headers, true).await
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct DelegatedMediaInfoResponse {
+    duration_seconds: f64,
+    frame_rate: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct FfprobeMediaInfo {
+    streams: Option<Vec<FfprobeVideoStream>>,
+    format: Option<FfprobeFormat>,
+}
+
+#[derive(Deserialize)]
+struct FfprobeVideoStream {
+    codec_type: Option<String>,
+    avg_frame_rate: Option<String>,
+    r_frame_rate: Option<String>,
+    duration: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FfprobeFormat {
+    duration: Option<String>,
+}
+
+fn positive_fraction(value: Option<&str>) -> Option<f64> {
+    let (numerator, denominator) = value?.split_once('/')?;
+    let numerator = numerator.parse::<f64>().ok()?;
+    let denominator = denominator.parse::<f64>().ok()?;
+    let result = numerator / denominator;
+    (numerator > 0.0 && denominator > 0.0 && result.is_finite()).then_some(result)
+}
+
+fn parse_delegated_media_info(output: &[u8]) -> Result<DelegatedMediaInfoResponse, &'static str> {
+    let probe: FfprobeMediaInfo =
+        serde_json::from_slice(output).map_err(|_| "FFprobe returned invalid metadata")?;
+    let video = probe
+        .streams
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("video"))
+        .ok_or("The selected file has no readable video stream")?;
+    let duration_seconds = video
+        .duration
+        .as_deref()
+        .or(probe
+            .format
+            .as_ref()
+            .and_then(|format| format.duration.as_deref()))
+        .and_then(|duration| duration.parse::<f64>().ok())
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .ok_or("The video duration is missing or invalid")?;
+    let frame_rate = positive_fraction(video.avg_frame_rate.as_deref())
+        .or_else(|| positive_fraction(video.r_frame_rate.as_deref()));
+    Ok(DelegatedMediaInfoResponse {
+        duration_seconds,
+        frame_rate,
+    })
+}
+
+#[utoipa::path(get, path = "/api/v1/delegated/sessions/{session_id}/files/{reference}/media-info", tag = "apps", params(("session_id" = String, Path), ("reference" = String, Path)), responses((status = 200, body = DelegatedMediaInfoResponse), (status = 400, body = Problem), (status = 403, body = Problem)))]
+async fn delegated_media_info(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    AxumPath((session_id, reference)): AxumPath<(String, String)>,
+) -> ApiResult<Json<DelegatedMediaInfoResponse>> {
+    let capability = require_app_capability(&state, &jar, &session_id)?;
+    let file = delegated_file(&capability, &reference)?;
+    if !file.mime.starts_with("video/") {
+        return Err(ApiError::bad(
+            "not_video",
+            "Media information is available only for video files",
+        ));
+    }
+    let path = validate_delegated_file(&state, &file).await?;
+    let mut command = Command::new("ffprobe");
+    command
+        .kill_on_drop(true)
+        .args([
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+        ])
+        .arg(path);
+    let output = tokio::time::timeout(Duration::from_secs(15), command.output())
+        .await
+        .map_err(|_| ApiError::bad("media_probe_timeout", "Video metadata inspection timed out"))?
+        .map_err(ApiError::internal)?;
+    if !output.status.success() {
+        warn!(stderr = %String::from_utf8_lossy(&output.stderr), "FFprobe could not inspect delegated video");
+        return Err(ApiError::bad(
+            "media_probe_failed",
+            "The video metadata could not be read",
+        ));
+    }
+    let info = parse_delegated_media_info(&output.stdout)
+        .map_err(|message| ApiError::bad("media_probe_failed", message))?;
+    Ok(Json(info))
 }
 
 fn require_app_csrf(capability: &AppCapability, headers: &HeaderMap) -> ApiResult<()> {
@@ -3046,6 +3162,99 @@ fn is_internal(directory: &Path, config: &Config, name: &OsStr) -> bool {
         || directory == config.root.join(".cache") && name == OsStr::new("remote-file-browser")
 }
 
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct Document {
+    id: String,
+    content: String,
+    etag: String,
+    mime: String,
+}
+
+#[utoipa::path(get, path = "/api/v1/editor/document", tag = "editor", params(("id" = String, Query)), security(("sessionCookie" = [])), responses((status = 200, body = Document), (status = 400, body = Problem), (status = 404, body = Problem)))]
+async fn read_document(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(query): Query<IdQuery>,
+) -> ApiResult<Json<Document>> {
+    require_session(&state, &jar)?;
+    let path = resolve_existing(&state.config, &query.id).await?;
+    let metadata = fs::metadata(&path).await?;
+    if !metadata.is_file() || metadata.len() > state.config.editor_max {
+        return Err(ApiError::bad(
+            "not_editable",
+            "The file is not editable or exceeds the editor size limit",
+        ));
+    }
+    let bytes = fs::read(&path).await?;
+    let content = String::from_utf8(bytes.clone())
+        .map_err(|_| ApiError::bad("not_utf8", "Only UTF-8 text files can be edited"))?;
+    Ok(Json(Document {
+        id: query.id,
+        content,
+        etag: blake3::hash(&bytes).to_hex().to_string(),
+        mime: mime_guess::from_path(path)
+            .first_or_text_plain()
+            .to_string(),
+    }))
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct WriteDocument {
+    id: String,
+    content: String,
+    expected_etag: String,
+}
+
+#[utoipa::path(put, path = "/api/v1/editor/document", tag = "editor", params(("x-csrf-token" = String, Header)), request_body = WriteDocument, security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 200, body = Document), (status = 409, body = Problem), (status = 413, body = Problem)))]
+async fn write_document(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Json(input): Json<WriteDocument>,
+) -> ApiResult<Json<Document>> {
+    require_csrf(&state, &jar, &headers)?;
+    if input.content.len() as u64 > state.config.editor_max {
+        return Err(ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "document_too_large",
+            "Document exceeds editor limit".into(),
+        ));
+    }
+    let path = resolve_existing(&state.config, &input.id).await?;
+    let existing = fs::read(&path).await?;
+    if blake3::hash(&existing).to_hex().as_str() != input.expected_etag {
+        return Err(ApiError::conflict(
+            "edit_conflict",
+            "The file changed since it was opened",
+        ));
+    }
+    let mode = fs::metadata(&path).await?.permissions().mode();
+    let parent = path
+        .parent()
+        .ok_or_else(|| ApiError::bad("invalid_path", "The file has no parent directory"))?;
+    let temporary = parent.join(format!(".rfb-edit-{}", Uuid::new_v4()));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .await?;
+    file.write_all(input.content.as_bytes()).await?;
+    file.sync_all().await?;
+    fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode)).await?;
+    fs::rename(&temporary, &path).await?;
+    let bytes = input.content.into_bytes();
+    Ok(Json(Document {
+        id: input.id,
+        content: String::from_utf8_lossy(&bytes).into_owned(),
+        etag: blake3::hash(&bytes).to_hex().to_string(),
+        mime: mime_guess::from_path(path)
+            .first_or_text_plain()
+            .to_string(),
+    }))
+}
+
 #[utoipa::path(get, path = "/api/v1/fs/content", tag = "filesystem", params(("id" = String, Query), ("Range" = Option<String>, Header)), security(("sessionCookie" = [])), responses((status = 200, description = "File download", content_type = "application/octet-stream"), (status = 206, description = "Partial file download", content_type = "application/octet-stream"), (status = 404, body = Problem)))]
 async fn content(
     State(state): State<AppState>,
@@ -4142,13 +4351,100 @@ mod tests {
         .unwrap();
         std::fs::write(root.path().join("clip.mp4"), b"video-two-is-newer").unwrap();
         let stale = delegated_metadata(
+            State(state.clone()),
+            capability_jar.clone(),
+            AxumPath((capability.session_id.clone(), reference.clone())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale.0, StatusCode::CONFLICT);
+        let stale_media_info = delegated_media_info(
             State(state),
             capability_jar,
             AxumPath((capability.session_id, reference)),
         )
         .await
         .unwrap_err();
+        assert_eq!(stale_media_info.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn document_editor_reads_writes_and_rejects_stale_saves() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("first.md"), b"first content").unwrap();
+        std::fs::write(root.path().join("second.md"), b"second content").unwrap();
+        let state = test_state(root.path(), None);
+        state.sessions.insert(
+            "session-token".into(),
+            Session {
+                csrf: "csrf-token".into(),
+                expires: SystemTime::now() + SESSION_TTL,
+            },
+        );
+        let jar = CookieJar::new().add(Cookie::new(SESSION_COOKIE, "session-token"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-csrf-token", "csrf-token".parse().unwrap());
+        let first_id = encode_path(OsStr::new("first.md"));
+        let second_id = encode_path(OsStr::new("second.md"));
+
+        let Json(first) = read_document(
+            State(state.clone()),
+            jar.clone(),
+            Query(IdQuery {
+                id: first_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(second) = read_document(
+            State(state.clone()),
+            jar.clone(),
+            Query(IdQuery { id: second_id }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.content, "first content");
+        assert_eq!(second.content, "second content");
+
+        let Json(saved) = write_document(
+            State(state.clone()),
+            jar.clone(),
+            headers.clone(),
+            Json(WriteDocument {
+                id: first.id.clone(),
+                content: "updated first".into(),
+                expected_etag: first.etag.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.content, "updated first");
+        assert_eq!(
+            std::fs::read(root.path().join("first.md")).unwrap(),
+            b"updated first"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("second.md")).unwrap(),
+            b"second content"
+        );
+
+        let stale = write_document(
+            State(state),
+            jar,
+            headers,
+            Json(WriteDocument {
+                id: first.id,
+                content: "stale overwrite".into(),
+                expected_etag: first.etag,
+            }),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(stale.0, StatusCode::CONFLICT);
+        assert_eq!(
+            std::fs::read(root.path().join("first.md")).unwrap(),
+            b"updated first"
+        );
     }
 
     #[test]
@@ -4568,6 +4864,10 @@ mod tests {
                 &["get", "put"][..],
             ),
             (
+                "/api/v1/delegated/sessions/{session_id}/files/{reference}/media-info",
+                &["get"][..],
+            ),
+            (
                 "/api/v1/delegated/sessions/{session_id}/outputs",
                 &["post"][..],
             ),
@@ -4576,6 +4876,7 @@ mod tests {
             ("/api/v1/fs/provenance", &["get", "put", "post"][..]),
             ("/api/v1/events", &["get"][..]),
             ("/api/v1/fs/content", &["get"][..]),
+            ("/api/v1/editor/document", &["get", "put"][..]),
             ("/api/v1/fs/items", &["post"][..]),
             ("/api/v1/fs/uploads", &["post"][..]),
             ("/api/v1/fs/operations", &["post"][..]),
@@ -4607,6 +4908,44 @@ mod tests {
     #[test]
     fn permissions_are_symbolic() {
         assert_eq!(permission_string(0o754, "file"), "-rwxr-xr--");
+    }
+
+    #[test]
+    fn delegated_media_info_parses_duration_and_frame_rate() {
+        let info = parse_delegated_media_info(
+            br#"{
+                "streams": [
+                    {"codec_type":"audio"},
+                    {"codec_type":"video","avg_frame_rate":"30000/1001","duration":"8.008"}
+                ],
+                "format":{"duration":"9.0"}
+            }"#,
+        )
+        .unwrap();
+        assert!((info.duration_seconds - 8.008).abs() < f64::EPSILON);
+        assert!((info.frame_rate.unwrap() - 30000.0 / 1001.0).abs() < 1e-9);
+
+        let fallback = parse_delegated_media_info(
+            br#"{"streams":[{"codec_type":"video","avg_frame_rate":"0/0","r_frame_rate":"25/1"}],"format":{"duration":"3.5"}}"#,
+        )
+        .unwrap();
+        assert_eq!(fallback.duration_seconds, 3.5);
+        assert_eq!(fallback.frame_rate, Some(25.0));
+    }
+
+    #[test]
+    fn delegated_media_info_rejects_invalid_video_metadata() {
+        assert_eq!(
+            parse_delegated_media_info(br#"{"streams":[],"format":{"duration":"3"}}"#).unwrap_err(),
+            "The selected file has no readable video stream"
+        );
+        assert_eq!(
+            parse_delegated_media_info(
+                br#"{"streams":[{"codec_type":"video","avg_frame_rate":"0/0"}],"format":{"duration":"unknown"}}"#,
+            )
+            .unwrap_err(),
+            "The video duration is missing or invalid"
+        );
     }
     #[tokio::test]
     async fn directory_property_counts_are_immediate_and_hide_internal_storage() {

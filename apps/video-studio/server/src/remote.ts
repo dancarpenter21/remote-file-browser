@@ -75,6 +75,10 @@ export function remoteContentUrl(session: RemoteSession, file: RemoteFile): stri
   return `${filesApi}/delegated/sessions/${encodeURIComponent(session.sessionId)}/files/${encodeURIComponent(file.reference)}/content`;
 }
 
+export function remoteMediaInfoUrl(session: RemoteSession, file: RemoteFile): string {
+  return `${filesApi}/delegated/sessions/${encodeURIComponent(session.sessionId)}/files/${encodeURIComponent(file.reference)}/media-info`;
+}
+
 export async function remoteFetch(session: RemoteSession, url: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
   headers.set("cookie", `rfb_cap_${session.sessionId}=${session.token}`);

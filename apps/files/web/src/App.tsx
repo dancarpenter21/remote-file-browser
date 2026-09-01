@@ -1,11 +1,11 @@
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
-  Check, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Edit3, Eye, File, FileImage, FileText,
+  Check, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
   Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal,
-  ExternalLink, Link2, Minus, Plus, RefreshCw, Scissors, Search, SquareTerminal, Trash2, Upload, X,
+  ExternalLink, Link2, Minus, Plus, RefreshCw, Save, Scissors, Search, SquareTerminal, Trash2, Upload, X,
 } from 'lucide-react'
-import { api, ApiFailure, contentUrl, Entry, EntryPage, InstalledApp, LiveEvent, liveEventsUrl, liveFilesystemWatchMessage, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
+import { api, ApiFailure, contentUrl, type DocumentFile, Entry, EntryPage, InstalledApp, LiveEvent, liveEventsUrl, liveFilesystemWatchMessage, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { deleteConfirmationMessage } from './deleteConfirmation'
 import { updateFinderPathForSelection } from './finderPath'
 import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState'
@@ -16,6 +16,7 @@ import { TerminalDock } from './TerminalDock'
 import { ClipboardOperation, RemoteClipboard, clipboardIdsForEntry, clipboardShortcut, movableClipboardIds, pasteProblem, shouldHandleClipboardShortcut } from './fileClipboard'
 import { launchInstalledApp, launchReusableImageTools, launchTabbedTextEditor } from './appLaunch'
 import { MOBILE_MEDIA_QUERY, observeMobileMode } from './mobileMode'
+import { basicFileKind, isMarkdownFile, isSaveShortcut, type BasicFileKind } from './basicFileView'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type ConfirmOptions = { title?: string; confirmLabel?: string; danger?: boolean }
@@ -28,10 +29,7 @@ type PromptOptions = { title: string; label?: string; initialValue?: string; sub
 type PromptRequest = PromptOptions & { resolve: (answer: string | null) => void }
 const PromptContext = createContext<(options: PromptOptions) => Promise<string | null>>(async () => null)
 const VideoStudioContext = createContext(false)
-
-function appSupports(app: InstalledApp, actionId: string, mime: string) {
-  return app.actions.some(action => action.id === actionId && action.accepts.some(accepted => accepted === mime || accepted.endsWith('/*') && mime.startsWith(accepted.slice(0, -1))))
-}
+const InstalledAppsContext = createContext<InstalledApp[]>([])
 
 function useMobileMode() {
   const [mobile, setMobile] = useState(() => matchMedia(MOBILE_MEDIA_QUERY).matches)
@@ -128,6 +126,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [error, setError] = useState('')
   const [folderMenu, setFolderMenu] = useState<{ directoryId: string; path: string; x: number; y: number } | null>(null)
   const [properties, setProperties] = useState<{ id: string; initial?: Entry } | null>(null)
+  const [openFile, setOpenFile] = useState<{ entry: Entry; kind: BasicFileKind } | null>(null)
   const [terminal, setTerminal] = useState<{ directoryId: string; hidden: boolean } | null>(null)
   const isMobile = useMobileMode()
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -303,31 +302,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   }
   const activate = async (entry: Entry) => {
     if (entry.kind === 'directory') return navigateGrid(entry)
-    if (entry.mime.startsWith('image/')) {
-      const imageApp = installedApps.find(app => app.id === 'image-tools' && appSupports(app, 'open', entry.mime))
-      if (!imageApp) { setError('Image Tools is not available.'); return }
-      const page = entry.parentId === '' ? root : expanded[entry.parentId]
-      const images = page?.entries.filter(candidate => candidate.mime.startsWith('image/')) ?? [entry]
-      const selectedIndex = images.findIndex(candidate => candidate.id === entry.id)
-      const gallery = selectedIndex < 0 ? [entry] : [...images.slice(selectedIndex), ...images.slice(0, selectedIndex)]
-      try { await launchReusableImageTools(imageApp.launchUrl, () => api.launchApp(imageApp.id, 'open', gallery.map(image => image.id))) }
-      catch (reason) { setError(messageOf(reason)) }
-      return
-    }
-    if (entry.mime.startsWith('video/')) {
-      const videoApp = installedApps.find(app => app.id === 'video-studio' && appSupports(app, 'play', entry.mime))
-      if (!videoApp) { setError('Video Studio is not available.'); return }
-      try {
-        await launchInstalledApp(`${videoApp.launchUrl}?handoff=1`, (url, target) => window.open(url, target), () => api.launchApp(videoApp.id, 'play', [entry.id]))
-      } catch (reason) { setError(messageOf(reason)) }
-      return
-    }
-    const textApp = installedApps.find(app => app.id === 'text-editor' && appSupports(app, 'open', entry.mime))
-    if (textApp) {
-      try { await launchTabbedTextEditor(textApp.launchUrl, () => api.launchApp(textApp.id, 'open', [entry.id])) }
-      catch (reason) { setError(messageOf(reason)) }
-      return
-    }
+    const kind = basicFileKind(entry)
+    if (kind) { setOpenFile({ entry, kind }); return }
     window.location.href = contentUrl(entry.id)
   }
   const mutate = async (action: () => Promise<unknown>, dir = currentDir, replace?: () => Promise<unknown>) => {
@@ -506,7 +482,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   }
   const openCurrentFolderMenu = () => setFolderMenu({ directoryId: currentDir, path: columnPath.at(-1)?.path ?? '/fs-root', x: innerWidth - 12, y: 80 })
   const mobileSelectionEntry = primary && selected.has(primary.id) ? primary : previewEntries[0]
-  return <div className={`app-shell ${isMobile ? 'mobile-mode' : ''}`}>
+  return <InstalledAppsContext.Provider value={installedApps}><div className={`app-shell ${isMobile ? 'mobile-mode' : ''}`}>
     <header className="topbar">
       {isMobile && <button className="icon-button mobile-menu-button" title="Open navigation" aria-label="Open navigation" aria-expanded={drawerOpen} onClick={() => setDrawerOpen(true)}><Menu size={20} /></button>}
       <div className="brand"><FolderOpen size={20} /><strong>Remote Files</strong><span>/fs-root</span></div>
@@ -571,8 +547,9 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     {folderMenu && <FolderContextMenu {...folderMenu} close={() => setFolderMenu(null)} createItem={createItem} paste={() => paste(folderMenu.directoryId, folderMenu.path)} hasClipboard={Boolean(clipboard)} showProperties={id => showProperties(id)} setError={setError} mobileControls={isMobile ? { hidden, toggleHidden: () => setHidden(value => !value), refresh: () => refresh(folderMenu.directoryId) } : undefined} />}
     {isMobile && mobileSelectionMenu && mobileSelectionEntry && <ContextMenu entry={mobileSelectionEntry} selectedEntries={previewEntries} x={innerWidth - 12} y={80} close={() => setMobileSelectionMenu(false)} open={() => activate(mobileSelectionEntry)} renameEntry={rename} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} />}
     {properties && <PropertiesDialog {...properties} onClose={() => setProperties(null)} />}
+    {openFile && <BasicFileWindow key={`${openFile.entry.id}:${openFile.entry.etag}`} {...openFile} onClose={() => setOpenFile(null)} onSaved={() => refresh(openFile.entry.parentId)} />}
     <div id="window-tray" className="window-tray" role="region" aria-label="Minimized windows" />
-  </div>
+  </div></InstalledAppsContext.Provider>
 }
 
 type BrowserColumn = { directoryId: string; page?: EntryPage; label: string }
@@ -930,6 +907,9 @@ function PositionedContextMenu({ x, y, children }: { x: number; y: number; child
 function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, deleteEntry, stageClipboard, pasteInto, hasClipboard, showProperties, concatenateVideos, setError }: { entry: Entry; selectedEntries: Entry[]; x: number; y: number; close: () => void; open: () => void; renameEntry: (entry: Entry) => Promise<void>; deleteEntry: (entry: Entry) => Promise<void>; stageClipboard: (operation: ClipboardOperation, entry: Entry) => void; pasteInto: (entry: Entry) => Promise<void>; hasClipboard: boolean; showProperties: (entry: Entry) => void; concatenateVideos: (entries: Entry[]) => Promise<void>; setError: (message: string) => void }) {
   const promptAction = usePrompt()
   const videoStudioEnabled = useContext(VideoStudioContext)
+  const installedApps = useContext(InstalledAppsContext)
+  const textEditor = installedApps.find(app => app.id === 'text-editor' && app.actions.some(action => action.id === 'open'))
+  const imageTools = installedApps.find(app => app.id === 'image-tools' && app.actions.some(action => action.id === 'open'))
   const copyPath = async () => {
     try { await navigator.clipboard.writeText(entry.path) } catch { setError(clipboardError(entry.path)) }
     close()
@@ -966,6 +946,16 @@ function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, d
     close()
     void launchInstalledApp('/apps/video/?handoff=1', (url, target) => window.open(url, target), () => api.launchApp('video-studio', 'edit', [entry.id])).catch(error => setError(messageOf(error)))
   }
+  const previewMarkdown = () => {
+    if (!textEditor) return
+    close()
+    void launchTabbedTextEditor(textEditor.launchUrl, () => api.launchApp(textEditor.id, 'open', [entry.id])).catch(error => setError(messageOf(error)))
+  }
+  const openAdvancedImageTools = () => {
+    if (!imageTools) return
+    close()
+    void launchReusableImageTools(imageTools.launchUrl, () => api.launchApp(imageTools.id, 'open', [entry.id])).catch(error => setError(messageOf(error)))
+  }
   const canConcatenate = selectedEntries.length >= 2 && selectedEntries.some(item => item.id === entry.id) && selectedEntries.every(item => item.kind === 'file' && item.mime.startsWith('video/'))
   const concatenate = () => { close(); void concatenateVideos(selectedEntries) }
   return <PositionedContextMenu x={x} y={y}>
@@ -977,6 +967,8 @@ function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, d
     <button role="menuitem" onClick={copyPath}><Copy /> Copy path</button>
     <button role="menuitem" onClick={properties}><Info /> Properties</button>
     <span className="context-divider" />
+    {textEditor && entry.kind === 'file' && isMarkdownFile(entry) && <button role="menuitem" onClick={previewMarkdown}><Eye /> Open Markdown Preview</button>}
+    {imageTools && entry.kind === 'file' && entry.mime.startsWith('image/') && <button role="menuitem" onClick={openAdvancedImageTools}><FileImage /> Open in Advanced Image Tools</button>}
     {canConcatenate && <button role="menuitem" onClick={concatenate}><Film /> Concatenate videos</button>}
     {videoStudioEnabled && entry.kind === 'file' && entry.mime.startsWith('video/') && <button role="menuitem" onClick={editWithVfx}><ExternalLink /> Edit in Video Studio</button>}
     {entry.kind === 'file' && <button role="menuitem" onClick={() => void addProvenance()}><Link2 /> Add provenance URL</button>}
@@ -1063,6 +1055,125 @@ function ViewSelector({ view, setView }: { view: ViewMode; setView: (view: ViewM
   return <div className="view-selector" aria-label="View mode">
     {(['details', 'small', 'medium', 'large'] as ViewMode[]).map(mode => <button className={view === mode ? 'active' : ''} title={mode === 'details' ? 'columns' : mode} key={mode} onClick={() => setView(mode)}>{mode === 'details' ? <Columns3 /> : mode === 'small' ? <Menu /> : mode === 'medium' ? <Grid2X2 /> : <Maximize2 />}</button>)}
   </div>
+}
+
+function BasicFileWindow({ entry, kind, onClose, onSaved }: { entry: Entry; kind: BasicFileKind; onClose: () => void; onSaved: () => Promise<void> }) {
+  if (kind === 'text') return <TextFileWindow entry={entry} onClose={onClose} onSaved={onSaved} />
+  return <MediaFileWindow entry={entry} kind={kind} onClose={onClose} />
+}
+
+function TextFileWindow({ entry, onClose, onSaved }: { entry: Entry; onClose: () => void; onSaved: () => Promise<void> }) {
+  const confirmAction = useConfirm()
+  const [file, setFile] = useState<DocumentFile>()
+  const [content, setContent] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [message, setMessage] = useState('')
+  const [error, setError] = useState('')
+  const dirty = Boolean(file && content !== file.content)
+
+  useEffect(() => {
+    let active = true
+    setLoading(true); setError(''); setMessage('')
+    api.readDocument(entry.id).then(documentFile => {
+      if (!active) return
+      setFile(documentFile); setContent(documentFile.content)
+    }).catch(reason => {
+      if (active) setError(messageOf(reason))
+    }).finally(() => {
+      if (active) setLoading(false)
+    })
+    return () => { active = false }
+  }, [entry.id])
+
+  useEffect(() => {
+    if (!dirty) return
+    const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = '' }
+    addEventListener('beforeunload', warn)
+    return () => removeEventListener('beforeunload', warn)
+  }, [dirty])
+
+  const save = useCallback(async () => {
+    if (!file || !dirty || saving) return
+    setSaving(true); setError(''); setMessage('')
+    try {
+      const saved = await api.saveDocument({ ...file, content })
+      setFile(saved); setContent(saved.content); setMessage('Saved')
+      void onSaved()
+    } catch (reason) { setError(messageOf(reason)) }
+    finally { setSaving(false) }
+  }, [content, dirty, file, onSaved, saving])
+
+  useEffect(() => {
+    const shortcut = (event: KeyboardEvent) => {
+      if (!isSaveShortcut(event)) return
+      event.preventDefault(); void save()
+    }
+    addEventListener('keydown', shortcut)
+    return () => removeEventListener('keydown', shortcut)
+  }, [save])
+
+  const close = async () => {
+    if (saving) return
+    if (dirty && !await confirmAction(`Your unsaved edits to ${entry.name} will be lost.`, { title: 'Discard unsaved changes?', confirmLabel: 'Discard', danger: true })) return
+    onClose()
+  }
+
+  return <FloatingWindow title={`${entry.name} — Text`} onClose={() => void close()} className="basic-file-window basic-text-window">
+    <div className="window-toolbar">
+      <button className="primary compact" disabled={!dirty || saving || loading} title="Save (Ctrl/Cmd+S)" onClick={() => void save()}><Save /> {saving ? 'Saving…' : 'Save'}</button>
+      {message && <span className="basic-file-status" role="status">{message}</span>}
+      <span className="toolbar-spacer" /><code title={entry.path}>{entry.path}</code>
+    </div>
+    {error && <div className="banner error basic-file-error" role="alert"><span>{error}</span></div>}
+    {loading ? <div className="basic-file-loading" role="status"><span className="spinner" /> Loading text…</div> : file ? <textarea className="basic-text-editor" aria-label={`Edit ${entry.name}`} value={content} disabled={saving} spellCheck={false} onChange={event => { setContent(event.target.value); setMessage(''); setError('') }} /> : null}
+  </FloatingWindow>
+}
+
+function MediaFileWindow({ entry, kind, onClose }: { entry: Entry; kind: 'image' | 'video'; onClose: () => void }) {
+  const videoStudioEnabled = useContext(VideoStudioContext)
+  const [error, setError] = useState('')
+  const [openingStudio, setOpeningStudio] = useState(false)
+  const fallbackStarted = useRef(false)
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const source = mediaUrl(entry.id, entry.etag)
+  useLayoutEffect(() => {
+    if (kind !== 'video' || !videoRef.current) return
+    videoRef.current.volume = 0
+    videoRef.current.muted = true
+    videoRef.current.defaultMuted = true
+  }, [entry.id, kind])
+  const openStudioFallback = useCallback(async () => {
+    if (fallbackStarted.current) return
+    fallbackStarted.current = true
+    setOpeningStudio(true); setError('')
+    try {
+      await launchInstalledApp('/apps/video/?handoff=1', (url, target) => window.open(url, target), () => api.launchApp('video-studio', 'edit', [entry.id]))
+      onClose()
+    } catch (reason) {
+      fallbackStarted.current = false; setOpeningStudio(false)
+      setError(`Browser playback failed, and Video Studio could not open: ${messageOf(reason)}`)
+    }
+  }, [entry.id, onClose])
+  const openStudioWindow = useCallback(async () => {
+    try {
+      await launchInstalledApp('/apps/video/?handoff=1', (url, target) => window.open(url, target), () => api.launchApp('video-studio', 'edit', [entry.id]))
+    } catch (reason) { setError(messageOf(reason)) }
+  }, [entry.id])
+  const videoFailed = () => {
+    if (!videoStudioEnabled) { setError('This browser could not play the video.'); return }
+    void openStudioFallback()
+  }
+  return <FloatingWindow title={`${entry.name} — ${kind === 'image' ? 'Image' : 'Video'}`} onClose={onClose} className="basic-file-window basic-media-window">
+    <div className="window-toolbar"><span>{entry.mime}</span><span className="toolbar-spacer" />{kind === 'video' && videoStudioEnabled && <button disabled={openingStudio} onClick={() => void openStudioWindow()}><ExternalLink /> Edit in Video Studio</button>}<a className="button" href={contentUrl(entry.id)}><Download /> Download</a></div>
+    {error && <div className="banner error basic-file-error" role="alert"><span>{error}</span></div>}
+    {openingStudio && <div className="basic-file-loading" role="status"><span className="spinner" /> Browser playback failed. Opening Video Studio…</div>}
+    <div className={`basic-media-stage ${kind}`}>
+      {kind === 'image'
+        ? <img src={source} alt={entry.name} onError={() => setError('The image could not be displayed.')} />
+        : <video ref={videoRef} src={source} controls autoPlay muted playsInline preload="metadata" onError={videoFailed} />}
+    </div>
+  </FloatingWindow>
 }
 
 function TrashWindow({ items, onClose, onChanged, onRestored, setError }: { items: TrashEntry[]; onClose: () => void; onChanged: () => Promise<void>; onRestored: (entry: Entry) => Promise<void>; setError: (s: string) => void }) {

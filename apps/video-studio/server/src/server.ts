@@ -28,7 +28,7 @@ import {
   saveProject,
 } from "./storage.js";
 import { RenderQueue } from "./jobs.js";
-import { ffmpegPath, ffprobePath } from "./binaries.js";
+import { ffmpegPath } from "./binaries.js";
 import { runProcess } from "./process.js";
 import {
   ensureLocalSource,
@@ -37,6 +37,7 @@ import {
   remoteContentUrl,
   remoteFetch,
   remoteFile,
+  remoteMediaInfoUrl,
   remoteSession,
   type RemoteFile,
 } from "./remote.js";
@@ -186,15 +187,16 @@ export async function buildServer() {
   app.get<{ Params: { session: string; reference: string } }>("/api/handoffs/:session/files/:reference/media-info", async (request) => {
     const session = remoteSession(request.params.session);
     const file = remoteFile(session, request.params.reference);
-    const { stdout } = await runProcess(ffprobePath, [
-      "-v", "error", "-headers", `Cookie: rfb_cap_${session.sessionId}=${session.token}\r\n`,
-      "-show_streams", "-show_format", "-of", "json", remoteContentUrl(session, file),
-    ]);
-    const probe = JSON.parse(stdout.toString()) as { streams?: Array<{ codec_type?: string; avg_frame_rate?: string; duration?: string }>; format?: { duration?: string } };
-    const video = probe.streams?.find((stream) => stream.codec_type === "video");
-    const [num = 0, den = 0] = (video?.avg_frame_rate ?? "0/0").split("/").map(Number);
-    const durationSeconds = Number(video?.duration ?? probe.format?.duration);
-    return { durationSeconds, frameRate: num > 0 && den > 0 ? num / den : null };
+    const response = await remoteFetch(session, remoteMediaInfoUrl(session, file));
+    const body = await response.json().catch(() => ({ message: response.statusText })) as { durationSeconds?: unknown; frameRate?: unknown; message?: string };
+    if (!response.ok) throw Object.assign(new Error(body.message ?? "Files could not inspect the video."), { statusCode: response.status });
+    if (typeof body.durationSeconds !== "number" || !Number.isFinite(body.durationSeconds) || body.durationSeconds <= 0) {
+      throw new Error("Files returned invalid video metadata.");
+    }
+    return {
+      durationSeconds: body.durationSeconds,
+      frameRate: typeof body.frameRate === "number" && Number.isFinite(body.frameRate) && body.frameRate > 0 ? body.frameRate : null,
+    };
   });
 
   app.post<{ Params: { session: string; reference: string } }>("/api/handoffs/:session/files/:reference/extractions", async (request, reply) => {
