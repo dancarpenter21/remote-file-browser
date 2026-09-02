@@ -9,8 +9,10 @@ axum = { version = "0.8", features = ["multipart", "ws"] }
 axum-extra = { version = "0.10", features = ["cookie"] }
 base64 = "0.22"
 blake3 = "1"
+bzip2 = "0.6"
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
+flate2 = "1"
 futures-util = "0.3"
 http = "1"
 mime_guess = "2"
@@ -22,6 +24,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "mul
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subtle = "2"
+tar = "0.4"
 thiserror = "2"
 time = "0.3"
 tokio = { version = "1", features = ["full"] }
@@ -32,6 +35,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+xz2 = "0.1"
+zip = { version = "3", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"

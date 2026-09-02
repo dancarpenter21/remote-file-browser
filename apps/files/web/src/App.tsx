@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
-  Check, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
+  ArchiveRestore, Check, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
   Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal,
   ExternalLink, Link2, Minus, Plus, RefreshCw, Save, Scissors, Search, SquareTerminal, Trash2, Upload, X,
 } from 'lucide-react'
@@ -20,6 +20,7 @@ import { basicFileKind, isMarkdownFile, isSaveShortcut, type BasicFileKind } fro
 import { useUploadQueue, type UploadConflictChoice } from './UploadQueue'
 import { isExternalFileDrag, manifestFromDrop, manifestFromFiles } from './uploadIntake'
 import { conflictSummary, type UploadConflict } from './uploadPlanning'
+import { isExtractableArchive } from './archiveExtraction'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type ConfirmOptions = { title?: string; confirmLabel?: string; danger?: boolean }
@@ -33,6 +34,7 @@ type PromptRequest = PromptOptions & { resolve: (answer: string | null) => void 
 const PromptContext = createContext<(options: PromptOptions) => Promise<string | null>>(async () => null)
 const VideoStudioContext = createContext(false)
 const InstalledAppsContext = createContext<InstalledApp[]>([])
+const ArchiveExtractionContext = createContext<(entry: Entry) => Promise<void>>(async () => {})
 type UploadConflictRequest = { conflicts: UploadConflict[]; resolve: (choice: UploadConflictChoice) => void }
 const UploadConflictContext = createContext<(conflicts: UploadConflict[]) => Promise<UploadConflictChoice>>(async () => 'cancel')
 
@@ -421,6 +423,19 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   }
   const deleteSelected = () => deleteItems(Array.from(selected))
   const deleteEntry = (entry: Entry) => deleteItems(selected.has(entry.id) ? Array.from(selected) : [entry.id])
+  const extractEntry = async (entry: Entry) => {
+    const perform = (replace = false) => api.extractArchive(entry.id, replace)
+    setError('')
+    try {
+      await perform()
+    } catch (error) {
+      if (!(error instanceof ApiFailure) || error.code !== 'already_exists' || !await confirmAction(`${error.message}. Replace it and move the old item to Trash?`, { title: 'Replace extraction destination?', confirmLabel: 'Replace', danger: true })) {
+        setError(messageOf(error)); return
+      }
+      try { await perform(true) } catch (retryError) { setError(messageOf(retryError)); return }
+    }
+    await refresh(entry.parentId)
+  }
   const concatenateVideos = async (entries: Entry[]) => {
     const videoApp = installedApps.find(app => app.id === 'video-studio' && app.actions.some(action => action.id === 'concatenate'))
     if (!videoApp || entries.length < 2) return
@@ -551,7 +566,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   }
   const openCurrentFolderMenu = () => setFolderMenu({ directoryId: currentDir, path: columnPath.at(-1)?.path ?? '/fs-root', x: innerWidth - 12, y: 80 })
   const mobileSelectionEntry = primary && selected.has(primary.id) ? primary : previewEntries[0]
-  return <InstalledAppsContext.Provider value={installedApps}><div className={`app-shell ${isMobile ? 'mobile-mode' : ''}`}>
+  return <ArchiveExtractionContext.Provider value={extractEntry}><InstalledAppsContext.Provider value={installedApps}><div className={`app-shell ${isMobile ? 'mobile-mode' : ''}`}>
     <header className="topbar">
       {isMobile && <button className="icon-button mobile-menu-button" title="Open navigation" aria-label="Open navigation" aria-expanded={drawerOpen} onClick={() => setDrawerOpen(true)}><Menu size={20} /></button>}
       <div className="brand"><FolderOpen size={20} /><strong>Remote Files</strong><span>/fs-root</span></div>
@@ -626,7 +641,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     }} onClose={() => setOpenFile(null)} onSaved={() => refresh(openFile.entry.parentId)} />}
     {uploadQueue.panel}
     <div id="window-tray" className="window-tray" role="region" aria-label="Minimized windows" />
-  </div></InstalledAppsContext.Provider>
+  </div></InstalledAppsContext.Provider></ArchiveExtractionContext.Provider>
 }
 
 type BrowserColumn = { directoryId: string; page?: EntryPage; label: string }
@@ -983,6 +998,7 @@ function PositionedContextMenu({ x, y, children }: { x: number; y: number; child
 
 function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, deleteEntry, stageClipboard, pasteInto, hasClipboard, showProperties, concatenateVideos, setError }: { entry: Entry; selectedEntries: Entry[]; x: number; y: number; close: () => void; open: () => void; renameEntry: (entry: Entry) => Promise<void>; deleteEntry: (entry: Entry) => Promise<void>; stageClipboard: (operation: ClipboardOperation, entry: Entry) => void; pasteInto: (entry: Entry) => Promise<void>; hasClipboard: boolean; showProperties: (entry: Entry) => void; concatenateVideos: (entries: Entry[]) => Promise<void>; setError: (message: string) => void }) {
   const promptAction = usePrompt()
+  const extractEntry = useContext(ArchiveExtractionContext)
   const videoStudioEnabled = useContext(VideoStudioContext)
   const installedApps = useContext(InstalledAppsContext)
   const textEditor = installedApps.find(app => app.id === 'text-editor' && app.actions.some(action => action.id === 'open'))
@@ -1033,6 +1049,7 @@ function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, d
     close()
     void launchReusableImageTools(imageTools.launchUrl, () => api.launchApp(imageTools.id, 'open', [entry.id])).catch(error => setError(messageOf(error)))
   }
+  const extract = () => { close(); void extractEntry(entry) }
   const canConcatenate = selectedEntries.length >= 2 && selectedEntries.some(item => item.id === entry.id) && selectedEntries.every(item => item.kind === 'file' && item.mime.startsWith('video/'))
   const concatenate = () => { close(); void concatenateVideos(selectedEntries) }
   return <PositionedContextMenu x={x} y={y}>
@@ -1046,6 +1063,7 @@ function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, d
     <span className="context-divider" />
     {textEditor && entry.kind === 'file' && isMarkdownFile(entry) && <button role="menuitem" onClick={previewMarkdown}><Eye /> Open Markdown Preview</button>}
     {imageTools && entry.kind === 'file' && entry.mime.startsWith('image/') && <button role="menuitem" onClick={openAdvancedImageTools}><FileImage /> Open in Advanced Image Tools</button>}
+    {isExtractableArchive(entry) && <button role="menuitem" onClick={extract}><ArchiveRestore /> Extract</button>}
     {canConcatenate && <button role="menuitem" onClick={concatenate}><Film /> Concatenate videos</button>}
     {videoStudioEnabled && entry.kind === 'file' && entry.mime.startsWith('video/') && <button role="menuitem" onClick={editWithVfx}><ExternalLink /> Edit in Video Studio</button>}
     {entry.kind === 'file' && <button role="menuitem" onClick={() => void addProvenance()}><Link2 /> Add provenance URL</button>}
