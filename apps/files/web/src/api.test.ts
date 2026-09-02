@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { liveFilesystemWatchMessage, mediaUrl, setCsrf, thumbnailUrl } from './api'
+import { api, liveFilesystemWatchMessage, mediaUrl, setCsrf, thumbnailUrl, type Entry } from './api'
 
 afterEach(() => {
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
   setCsrf()
 })
 
@@ -24,5 +25,20 @@ describe('preview URLs', () => {
     expect(thumbnailUrl('folder/a & b.png', 'large', '"inode size"')).toBe(
       '/api/v1/previews/thumbnail?id=folder%2Fa%20%26%20b.png&size=large&v=%22inode%20size%22',
     )
+  })
+})
+
+describe('complete directory listings', () => {
+  it('stops when the server serializes the final next offset as null', async () => {
+    const first = { id: 'one', name: 'one' } as Entry
+    const second = { id: 'two', name: 'two' } as Entry
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ entries: [first], total: 2, nextOffset: 1 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ entries: [second], total: 2, nextOffset: null }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.listAll('Downloads', true)).resolves.toEqual([first, second])
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1][0]).toContain('offset=1')
   })
 })

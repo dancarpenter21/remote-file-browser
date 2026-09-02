@@ -20,7 +20,7 @@ export type Entry = {
   childDirectoryCount?: number
 }
 
-export type EntryPage = { entries: Entry[]; total: number; nextOffset?: number }
+export type EntryPage = { entries: Entry[]; total: number; nextOffset?: number | null }
 export type Session = { authenticated: boolean; username?: string; csrfToken?: string; terminalEnabled: boolean; videoStudioEnabled: boolean }
 export type InstalledAppAction = { id: string; label: string; accepts: string[]; minFiles: number; maxFiles: number }
 export type InstalledApp = { id: string; name: string; launchUrl: string; actions: InstalledAppAction[] }
@@ -58,6 +58,50 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>
 }
 
+async function listAll(id = '', hidden = false) {
+  const entries: Entry[] = []
+  let offset = 0
+  do {
+    const page = await request<EntryPage>(`/fs/entries?id=${encodeURIComponent(id)}&hidden=${hidden}&limit=1000&offset=${offset}`)
+    entries.push(...page.entries)
+    if (page.nextOffset == null) return entries
+    offset = page.nextOffset
+  } while (true)
+}
+
+export function uploadFile(
+  parentId: string,
+  file: File,
+  replace = false,
+  onProgress?: (loaded: number, total: number) => void,
+  signal?: AbortSignal,
+) {
+  return new Promise<Entry[]>((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    const abort = () => xhr.abort()
+    const cleanup = () => signal?.removeEventListener('abort', abort)
+    xhr.open('POST', `/api/v1/fs/uploads?id=${encodeURIComponent(parentId)}&replace=${replace}`)
+    xhr.setRequestHeader('x-csrf-token', csrf)
+    xhr.withCredentials = true
+    xhr.upload.onprogress = event => onProgress?.(event.loaded, event.lengthComputable ? event.total : file.size)
+    xhr.onerror = () => { cleanup(); reject(new ApiFailure(0, 'network_error', 'The upload connection failed')) }
+    xhr.onabort = () => { cleanup(); reject(new DOMException('The upload was cancelled', 'AbortError')) }
+    xhr.onload = () => {
+      cleanup()
+      let body: unknown
+      try { body = xhr.responseText ? JSON.parse(xhr.responseText) : undefined } catch { body = undefined }
+      if (xhr.status >= 200 && xhr.status < 300) { resolve(body as Entry[]); return }
+      const problem = body as { code?: string; message?: string } | undefined
+      reject(new ApiFailure(xhr.status, problem?.code ?? 'request_failed', problem?.message ?? xhr.statusText))
+    }
+    if (signal?.aborted) { reject(new DOMException('The upload was cancelled', 'AbortError')); return }
+    signal?.addEventListener('abort', abort, { once: true })
+    const body = new FormData()
+    body.append('files', file, file.name)
+    xhr.send(body)
+  })
+}
+
 export const api = {
   session: () => request<Session>('/auth/session'),
   login: (username: string, password: string) => request<Session>('/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
@@ -65,9 +109,10 @@ export const api = {
   apps: () => request<InstalledApp[]>('/apps'),
   launchApp: (appId: string, action: string, fileIds: string[]) => request<AppLaunch>('/launches', { method: 'POST', body: JSON.stringify({ appId, action, fileIds }) }),
   list: (id = '', hidden = false) => request<EntryPage>(`/fs/entries?id=${encodeURIComponent(id)}&hidden=${hidden}&limit=1000`),
+  listAll,
   metadata: (id: string) => request<Entry>(`/fs/metadata?id=${encodeURIComponent(id)}`),
   create: (parentId: string, name: string, kind: 'file' | 'directory', replace = false) => request<Entry>('/fs/items', { method: 'POST', body: JSON.stringify({ parentId, name, kind, replace }) }),
-  upload: async (parentId: string, files: FileList, replace = false) => {
+  upload: async (parentId: string, files: Iterable<File>, replace = false) => {
     const body = new FormData(); Array.from(files).forEach(file => body.append('files', file, file.name))
     return request<Entry[]>(`/fs/uploads?id=${encodeURIComponent(parentId)}&replace=${replace}`, { method: 'POST', body })
   },

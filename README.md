@@ -2,7 +2,7 @@
 
 Remote Workspace is a single-administrator, Dockerized workspace for files on a remote Linux host. The root Compose project runs four browser applications behind one authenticated HTTPS origin:
 
-- **Files** browses and manages the mounted filesystem, provides lightweight floating text, image, and muted video windows, offers advanced Markdown and image tools from context menus, automatically hands browser-incompatible videos to Video Studio, and includes Trash, provenance, and terminal sessions.
+- **Files** browses and manages the mounted filesystem, uploads files and folder trees through picker or desktop drag-and-drop with a cancellable progress queue, provides lightweight floating text, image, and muted video windows, offers advanced Markdown and image tools from context menus, automatically hands browser-incompatible videos to Video Studio, and includes Trash, provenance, and terminal sessions.
 - **Text Editor** opens text and Markdown in a reusable tabbed window.
 - **Image Tools** opens image galleries in a reusable window with zoom, rotation, pixel measurement, and non-destructive markup copies.
 - **Video Studio** plays delegated videos with an automatic browser-compatible streaming fallback, and imports video into isolated project storage for timeline editing and export.
