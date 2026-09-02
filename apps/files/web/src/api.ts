@@ -20,7 +20,7 @@ export type Entry = {
   childDirectoryCount?: number
 }
 
-export type EntryPage = { entries: Entry[]; total: number; nextOffset?: number }
+export type EntryPage = { entries: Entry[]; total: number; nextOffset?: number | null }
 export type Session = { authenticated: boolean; username?: string; csrfToken?: string; terminalEnabled: boolean; videoStudioEnabled: boolean }
 export type InstalledAppAction = { id: string; label: string; accepts: string[]; minFiles: number; maxFiles: number }
 export type InstalledApp = { id: string; name: string; launchUrl: string; actions: InstalledAppAction[] }
@@ -64,7 +64,7 @@ async function listAll(id = '', hidden = false) {
   do {
     const page = await request<EntryPage>(`/fs/entries?id=${encodeURIComponent(id)}&hidden=${hidden}&limit=1000&offset=${offset}`)
     entries.push(...page.entries)
-    if (page.nextOffset === undefined) return entries
+    if (page.nextOffset == null) return entries
     offset = page.nextOffset
   } while (true)
 }
