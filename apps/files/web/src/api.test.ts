@@ -42,3 +42,19 @@ describe('complete directory listings', () => {
     expect(fetchMock.mock.calls[1][0]).toContain('offset=1')
   })
 })
+
+describe('archive extraction', () => {
+  it('posts the source id, replacement choice, and CSRF token', async () => {
+    const extracted = { id: 'photos', name: 'photos', kind: 'directory' } as Entry
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(extracted), { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
+    setCsrf('csrf-token')
+
+    await expect(api.extractArchive('photos.zip', true)).resolves.toEqual(extracted)
+    const [path, init] = fetchMock.mock.calls[0]
+    expect(path).toBe('/api/v1/fs/extractions')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body as string)).toEqual({ sourceId: 'photos.zip', replace: true })
+    expect((init.headers as Headers).get('x-csrf-token')).toBe('csrf-token')
+  })
+})

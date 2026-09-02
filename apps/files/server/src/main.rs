@@ -40,6 +40,8 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
+mod archive;
+
 const SESSION_COOKIE: &str = "rfb_session";
 const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const TERMINAL_TICKET_TTL: Duration = Duration::from_secs(30);
@@ -278,6 +280,7 @@ type ApiResult<T> = Result<T, ApiError>;
         write_document,
         create_item,
         upload,
+        extract_archive,
         operation,
         soft_delete,
         list_trash,
@@ -300,6 +303,7 @@ type ApiResult<T> = Result<T, ApiError>;
         ProvenanceSubmission,
         ProvenanceEvent,
         CreateRequest,
+        ExtractRequest,
         OperationRequest,
         DeleteRequest,
         TrashInfo,
@@ -535,6 +539,7 @@ async fn main() {
         .route("/editor/document", get(read_document).put(write_document))
         .route("/fs/items", post(create_item))
         .route("/fs/uploads", post(upload))
+        .route("/fs/extractions", post(extract_archive))
         .route("/fs/operations", post(operation))
         .route("/fs/trash", post(soft_delete))
         .route("/trash", get(list_trash).delete(empty_trash))
@@ -3525,6 +3530,104 @@ async fn upload(
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
+struct ExtractRequest {
+    source_id: String,
+    #[serde(default)]
+    replace: bool,
+}
+
+#[utoipa::path(post, path = "/api/v1/fs/extractions", tag = "filesystem", params(("x-csrf-token" = String, Header)), request_body = ExtractRequest, security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 201, body = Entry), (status = 400, body = Problem), (status = 409, body = Problem)))]
+async fn extract_archive(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Json(input): Json<ExtractRequest>,
+) -> ApiResult<(StatusCode, Json<Entry>)> {
+    require_csrf(&state, &jar, &headers)?;
+    state.provenance.health().await?;
+
+    let source = resolve_existing(&state.config, &input.source_id).await?;
+    if !fs::symlink_metadata(&source).await?.is_file() {
+        return Err(ApiError::bad(
+            "not_archive_file",
+            "Only archive files can be extracted",
+        ));
+    }
+    let source_name = source
+        .file_name()
+        .ok_or_else(|| ApiError::bad("invalid_archive_name", "Archive has no filename"))?;
+    let (format, destination_name) = archive::classify(source_name).ok_or_else(|| {
+        ApiError::bad(
+            "unsupported_archive",
+            "Supported archives are ZIP, TAR, TAR.GZ, TAR.BZ2, and TAR.XZ",
+        )
+    })?;
+    let parent = source
+        .parent()
+        .ok_or_else(|| ApiError::bad("invalid_archive_name", "Archive has no parent"))?;
+    if is_internal(parent, &state.config, &destination_name)
+        || (parent == state.config.root && destination_name == OsStr::new(".cache"))
+    {
+        return Err(ApiError::forbidden(
+            "reserved_path",
+            "This path is managed internally",
+        ));
+    }
+    let target = parent.join(&destination_name);
+    if fs::symlink_metadata(&target).await.is_ok() && !input.replace {
+        return Err(ApiError::conflict(
+            "already_exists",
+            format!("{} already exists", destination_name.to_string_lossy()),
+        ));
+    }
+
+    let staging = parent.join(format!(".rfb-extract-{}", Uuid::new_v4()));
+    fs::create_dir(&staging).await?;
+    let extract_source = source.clone();
+    let extract_staging = staging.clone();
+    let extraction = tokio::task::spawn_blocking(move || {
+        archive::extract(&extract_source, &extract_staging, format)
+    })
+    .await
+    .map_err(ApiError::internal)?;
+    if let Err(error) = extraction {
+        let _ = fs::remove_dir_all(&staging).await;
+        return Err(match error {
+            archive::ExtractError::Io(error) => error.into(),
+            archive::ExtractError::Invalid(message) => ApiError::bad("invalid_archive", message),
+            archive::ExtractError::Unsafe(message) => ApiError::bad("unsafe_archive", message),
+        });
+    }
+
+    if fs::symlink_metadata(&target).await.is_ok() {
+        if !input.replace {
+            let _ = fs::remove_dir_all(&staging).await;
+            return Err(ApiError::conflict(
+                "already_exists",
+                format!("{} already exists", destination_name.to_string_lossy()),
+            ));
+        }
+        if let Err(error) = move_to_trash(&state, &target).await {
+            let _ = fs::remove_dir_all(&staging).await;
+            return Err(error);
+        }
+        if let Err(error) = invalidate_cache_prefix(&state, &target).await {
+            warn!(?error, path = %target.display(), "could not invalidate replaced extraction destination cache");
+        }
+    }
+    if let Err(error) = fs::rename(&staging, &target).await {
+        let _ = fs::remove_dir_all(&staging).await;
+        return Err(error.into());
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(entry_from_path(&state, target).await?),
+    ))
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct OperationRequest {
     operation: String,
     sources: Vec<String>,
@@ -4329,6 +4432,32 @@ mod tests {
             app_capabilities: Arc::new(DashMap::new()),
         }
     }
+
+    fn browser_auth(state: &AppState) -> (CookieJar, HeaderMap) {
+        state.sessions.insert(
+            "session-token".into(),
+            Session {
+                csrf: "csrf-token".into(),
+                expires: SystemTime::now() + SESSION_TTL,
+            },
+        );
+        let jar = CookieJar::new().add(Cookie::new(SESSION_COOKIE, "session-token"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-csrf-token", "csrf-token".parse().unwrap());
+        (jar, headers)
+    }
+
+    fn write_test_zip(path: &Path, entry_name: &str, contents: &[u8]) {
+        use std::io::Write as _;
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .start_file(entry_name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(contents).unwrap();
+        writer.finish().unwrap();
+    }
     #[tokio::test]
     async fn app_launches_are_scoped_single_use_and_version_bound() {
         let root = tempfile::tempdir().unwrap();
@@ -4925,6 +5054,7 @@ mod tests {
             ("/api/v1/editor/document", &["get", "put"][..]),
             ("/api/v1/fs/items", &["post"][..]),
             ("/api/v1/fs/uploads", &["post"][..]),
+            ("/api/v1/fs/extractions", &["post"][..]),
             ("/api/v1/fs/operations", &["post"][..]),
             ("/api/v1/fs/trash", &["post"][..]),
             ("/api/v1/trash", &["get", "delete"][..]),
@@ -4996,6 +5126,103 @@ mod tests {
             .unwrap()
             .path();
         assert_eq!(std::fs::read(item.join("payload")).unwrap(), b"original");
+    }
+
+    #[tokio::test]
+    async fn archive_extraction_conflicts_then_replaces_to_trash() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        let source = root.path().join("bundle.zip");
+        let target = root.path().join("bundle");
+        write_test_zip(&source, "nested/new.txt", b"new contents");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("old.txt"), b"old contents").unwrap();
+        let source_id = encode_path(OsStr::new("bundle.zip"));
+
+        let (jar, headers) = browser_auth(&state);
+        let conflict = extract_archive(
+            State(state.clone()),
+            jar,
+            headers,
+            Json(ExtractRequest {
+                source_id: source_id.clone(),
+                replace: false,
+            }),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(conflict.1, "already_exists");
+        assert_eq!(
+            std::fs::read(target.join("old.txt")).unwrap(),
+            b"old contents"
+        );
+
+        let (jar, headers) = browser_auth(&state);
+        let (status, Json(entry)) = extract_archive(
+            State(state),
+            jar,
+            headers,
+            Json(ExtractRequest {
+                source_id,
+                replace: true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(entry.name, "bundle");
+        assert_eq!(
+            std::fs::read(target.join("nested/new.txt")).unwrap(),
+            b"new contents"
+        );
+        assert!(source.exists());
+        let trash_item = std::fs::read_dir(root.path().join(".trash/items"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(
+            std::fs::read(trash_item.join("payload/old.txt")).unwrap(),
+            b"old contents"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_archive_preserves_existing_destination_and_cleans_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        std::fs::write(root.path().join("broken.zip"), b"not a zip archive").unwrap();
+        std::fs::create_dir(root.path().join("broken")).unwrap();
+        std::fs::write(root.path().join("broken/original.txt"), b"original").unwrap();
+        let (jar, headers) = browser_auth(&state);
+
+        let error = extract_archive(
+            State(state),
+            jar,
+            headers,
+            Json(ExtractRequest {
+                source_id: encode_path(OsStr::new("broken.zip")),
+                replace: true,
+            }),
+        )
+        .await
+        .err()
+        .unwrap();
+
+        assert_eq!(error.1, "invalid_archive");
+        assert_eq!(
+            std::fs::read(root.path().join("broken/original.txt")).unwrap(),
+            b"original"
+        );
+        assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".rfb-extract-")
+        }));
     }
 
     #[test]

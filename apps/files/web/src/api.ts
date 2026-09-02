@@ -116,6 +116,7 @@ export const api = {
     const body = new FormData(); Array.from(files).forEach(file => body.append('files', file, file.name))
     return request<Entry[]>(`/fs/uploads?id=${encodeURIComponent(parentId)}&replace=${replace}`, { method: 'POST', body })
   },
+  extractArchive: (sourceId: string, replace = false) => request<Entry>('/fs/extractions', { method: 'POST', body: JSON.stringify({ sourceId, replace }) }),
   operate: (operation: 'copy' | 'move' | 'rename', sources: string[], destinationId: string, name?: string, replace = false, merge = false) => request<Entry[]>('/fs/operations', { method: 'POST', body: JSON.stringify({ operation, sources, destinationId, name, replace, merge }) }),
   provenance: (id: string) => request<Provenance>(`/fs/provenance?id=${encodeURIComponent(id)}`),
   setProvenance: (id: string, urls: string[]) => request<Provenance>(`/fs/provenance?id=${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify({ urls }) }),
