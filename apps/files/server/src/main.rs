@@ -3374,6 +3374,12 @@ async fn create_item(
     state.provenance.health().await?;
     validate_name(&input.name)?;
     let parent = resolve_parent(&state.config, &input.parent_id).await?;
+    if is_internal(&parent, &state.config, OsStr::new(&input.name)) {
+        return Err(ApiError::forbidden(
+            "reserved_path",
+            "This path is managed internally",
+        ));
+    }
     let path = parent.join(&input.name);
     if fs::symlink_metadata(&path).await.is_ok() {
         if !input.replace {
@@ -3413,6 +3419,36 @@ fn validate_name(name: &str) -> ApiResult<()> {
     Ok(())
 }
 
+async fn commit_uploaded_file(
+    state: &AppState,
+    temporary: &Path,
+    target: &Path,
+    name: &str,
+    replace: bool,
+) -> ApiResult<()> {
+    if fs::symlink_metadata(target).await.is_ok() {
+        if !replace {
+            let _ = fs::remove_file(temporary).await;
+            return Err(ApiError::conflict(
+                "already_exists",
+                format!("{name} already exists"),
+            ));
+        }
+        if let Err(error) = move_to_trash(state, target).await {
+            let _ = fs::remove_file(temporary).await;
+            return Err(error);
+        }
+        if let Err(error) = invalidate_cache_prefix(state, target).await {
+            warn!(?error, path = %target.display(), "could not invalidate replaced cache");
+        }
+    }
+    if let Err(error) = fs::rename(temporary, target).await {
+        let _ = fs::remove_file(temporary).await;
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct UploadQuery {
     id: String,
@@ -3438,6 +3474,12 @@ async fn upload(
             .ok_or_else(|| ApiError::bad("missing_filename", "Upload has no filename"))?
             .to_string();
         validate_name(&name)?;
+        if is_internal(&parent, &state.config, OsStr::new(&name)) {
+            return Err(ApiError::forbidden(
+                "reserved_path",
+                "This path is managed internally",
+            ));
+        }
         let target = parent.join(&name);
         if fs::symlink_metadata(&target).await.is_ok() {
             if !query.replace {
@@ -3446,10 +3488,6 @@ async fn upload(
                     format!("{name} already exists"),
                 ));
             }
-            move_to_trash(&state, &target).await?;
-            if let Err(error) = invalidate_cache_prefix(&state, &target).await {
-                warn!(?error, path = %target.display(), "could not invalidate replaced cache");
-            }
         }
         let temporary = parent.join(format!(".rfb-upload-{}", Uuid::new_v4()));
         let mut file = fs::OpenOptions::new()
@@ -3457,21 +3495,29 @@ async fn upload(
             .write(true)
             .open(&temporary)
             .await?;
-        let mut written = 0u64;
-        while let Some(chunk) = field.chunk().await.map_err(ApiError::internal)? {
-            written += chunk.len() as u64;
-            if written > state.config.upload_max {
-                let _ = fs::remove_file(&temporary).await;
-                return Err(ApiError(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "upload_too_large",
-                    "Upload exceeds configured limit".into(),
-                ));
+        let write_result: ApiResult<()> = async {
+            let mut written = 0u64;
+            while let Some(chunk) = field.chunk().await.map_err(ApiError::internal)? {
+                written += chunk.len() as u64;
+                if written > state.config.upload_max {
+                    return Err(ApiError(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "upload_too_large",
+                        "Upload exceeds configured limit".into(),
+                    ));
+                }
+                file.write_all(&chunk).await?;
             }
-            file.write_all(&chunk).await?;
+            file.sync_all().await?;
+            Ok(())
         }
-        file.sync_all().await?;
-        fs::rename(&temporary, &target).await?;
+        .await;
+        drop(file);
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+        commit_uploaded_file(&state, &temporary, &target, &name, query.replace).await?;
         uploaded.push(entry_from_path(&state, target).await?);
     }
     Ok(Json(uploaded))
@@ -4908,6 +4954,63 @@ mod tests {
     #[test]
     fn permissions_are_symbolic() {
         assert_eq!(permission_string(0o754, "file"), "-rwxr-xr--");
+    }
+
+    #[tokio::test]
+    async fn upload_commit_preserves_conflicts_and_removes_staging_file() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        let target = root.path().join("same.txt");
+        let temporary = root.path().join(".rfb-upload-test");
+        std::fs::write(&target, b"original").unwrap();
+        std::fs::write(&temporary, b"replacement").unwrap();
+
+        let error = commit_uploaded_file(&state, &temporary, &target, "same.txt", false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.1, "already_exists");
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert!(!temporary.exists());
+    }
+
+    #[tokio::test]
+    async fn upload_commit_replaces_only_after_staging_is_complete() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        let target = root.path().join("same.txt");
+        let temporary = root.path().join(".rfb-upload-test");
+        std::fs::write(&target, b"original").unwrap();
+        std::fs::write(&temporary, b"replacement").unwrap();
+
+        commit_uploaded_file(&state, &temporary, &target, "same.txt", true)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+        assert!(!temporary.exists());
+        let item = std::fs::read_dir(root.path().join(".trash/items"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read(item.join("payload")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn uploads_recognize_internal_storage_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let cache_parent = root.path().join(".cache");
+        std::fs::create_dir(&cache_parent).unwrap();
+        let config = test_state(root.path(), None).config;
+        assert!(is_internal(root.path(), &config, OsStr::new(".trash")));
+        assert!(is_internal(
+            &cache_parent,
+            &config,
+            OsStr::new("remote-file-browser")
+        ));
+        assert!(!is_internal(root.path(), &config, OsStr::new("ordinary")));
     }
 
     #[test]

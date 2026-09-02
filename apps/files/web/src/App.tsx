@@ -17,6 +17,9 @@ import { ClipboardOperation, RemoteClipboard, clipboardIdsForEntry, clipboardSho
 import { launchInstalledApp, launchReusableImageTools, launchTabbedTextEditor } from './appLaunch'
 import { MOBILE_MEDIA_QUERY, observeMobileMode } from './mobileMode'
 import { basicFileKind, isMarkdownFile, isSaveShortcut, type BasicFileKind } from './basicFileView'
+import { useUploadQueue, type UploadConflictChoice } from './UploadQueue'
+import { isExternalFileDrag, manifestFromDrop, manifestFromFiles } from './uploadIntake'
+import { conflictSummary, type UploadConflict } from './uploadPlanning'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type ConfirmOptions = { title?: string; confirmLabel?: string; danger?: boolean }
@@ -30,6 +33,8 @@ type PromptRequest = PromptOptions & { resolve: (answer: string | null) => void 
 const PromptContext = createContext<(options: PromptOptions) => Promise<string | null>>(async () => null)
 const VideoStudioContext = createContext(false)
 const InstalledAppsContext = createContext<InstalledApp[]>([])
+type UploadConflictRequest = { conflicts: UploadConflict[]; resolve: (choice: UploadConflictChoice) => void }
+const UploadConflictContext = createContext<(conflicts: UploadConflict[]) => Promise<UploadConflictChoice>>(async () => 'cancel')
 
 function useMobileMode() {
   const [mobile, setMobile] = useState(() => matchMedia(MOBILE_MEDIA_QUERY).matches)
@@ -63,6 +68,19 @@ function MergeProvider({ children }: { children: React.ReactNode }) {
 }
 function useMergeChoice() { return useContext(MergeContext) }
 
+function UploadConflictProvider({ children }: { children: React.ReactNode }) {
+  const [request, setRequest] = useState<UploadConflictRequest | null>(null)
+  const choose = useCallback((conflicts: UploadConflict[]) => new Promise<UploadConflictChoice>(resolve => setRequest({ conflicts, resolve })), [])
+  const answer = (choice: UploadConflictChoice) => { request?.resolve(choice); setRequest(null) }
+  useEffect(() => {
+    if (!request) return
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') answer('cancel') }
+    addEventListener('keydown', escape); return () => removeEventListener('keydown', escape)
+  }, [request])
+  return <UploadConflictContext.Provider value={choose}>{children}{request && <div className="modal-backdrop" role="presentation" onPointerDown={() => answer('cancel')}><section className="confirm-dialog upload-conflict-dialog" role="alertdialog" aria-modal="true" aria-labelledby="upload-conflict-title" onPointerDown={event => event.stopPropagation()}><div className="confirm-mark danger"><Upload /></div><h2 id="upload-conflict-title">Upload conflicts</h2><p className="confirm-message">{conflictSummary(request.conflicts)}</p><p className="merge-detail">Existing folders will be merged. Replace moves every listed conflicting item to Trash; Skip omits conflicting files and folder subtrees.</p><div className="confirm-actions merge-actions"><button onClick={() => answer('cancel')}>Cancel upload</button><button onClick={() => answer('skip')}>Skip all</button><button className="danger-confirm" onClick={() => answer('replace')}>Replace all</button></div></section></div>}</UploadConflictContext.Provider>
+}
+function useUploadConflictChoice() { return useContext(UploadConflictContext) }
+
 function PromptProvider({ children }: { children: React.ReactNode }) {
   const [request, setRequest] = useState<PromptRequest | null>(null)
   const [value, setValue] = useState('')
@@ -83,7 +101,7 @@ export default function App() {
   useEffect(() => { api.session().then(s => { setCsrf(s.csrfToken); setSession(s) }) }, [])
   if (!session) return <div className="center"><span className="spinner" /></div>
   if (!session.authenticated) return <Login onLogin={s => { setCsrf(s.csrfToken); setSession(s) }} />
-  return <ConfirmProvider><MergeProvider><PromptProvider><VideoStudioContext.Provider value={session.videoStudioEnabled}><FileManager session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false, terminalEnabled: false, videoStudioEnabled: false }) }} /></VideoStudioContext.Provider></PromptProvider></MergeProvider></ConfirmProvider>
+  return <ConfirmProvider><MergeProvider><UploadConflictProvider><PromptProvider><VideoStudioContext.Provider value={session.videoStudioEnabled}><FileManager session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false, terminalEnabled: false, videoStudioEnabled: false }) }} /></VideoStudioContext.Provider></PromptProvider></UploadConflictProvider></MergeProvider></ConfirmProvider>
 }
 
 function Login({ onLogin }: { onLogin: (session: Session) => void }) {
@@ -110,6 +128,7 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
 function FileManager({ session, onLogout }: { session: Session; onLogout: () => void }) {
   const confirmAction = useConfirm()
   const chooseMerge = useMergeChoice()
+  const chooseUploadConflicts = useUploadConflictChoice()
   const promptAction = usePrompt()
   const [root, setRoot] = useState<EntryPage | null>(null)
   const [expanded, setExpanded] = useState<Record<string, EntryPage>>({})
@@ -143,6 +162,9 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     catch { return {} }
   })
   const inputRef = useRef<HTMLInputElement>(null)
+  const folderInputRef = useRef<HTMLInputElement>(null)
+  const dropElement = useRef<HTMLElement | null>(null)
+  const [externalDropPath, setExternalDropPath] = useState<string | null>(null)
   useEffect(() => {
     let active = true
     api.apps().then(apps => { if (active) setInstalledApps(apps) }).catch(() => { if (active) setInstalledApps([]) })
@@ -262,6 +284,50 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       const page = await api.list(id, hidden)
       if (id === '') setRoot(page); else setExpanded(previous => ({ ...previous, [id]: page }))
     } catch (e) { setError(messageOf(e)) }
+  }
+  const uploadQueue = useUploadQueue(chooseUploadConflicts, async ids => {
+    await Promise.all([...ids].map(id => refresh(id)))
+  })
+  const destinationPath = (id: string) => id ? findEntry(id, root, expanded)?.path ?? '/fs-root' : '/fs-root'
+  const enqueueUpload = (manifest: ReturnType<typeof manifestFromFiles>, directoryId = currentDir, path = destinationPath(directoryId)) => {
+    setError('')
+    try { uploadQueue.enqueue(manifest, directoryId, path) } catch (error) { setError(messageOf(error)) }
+  }
+  const resetDropTarget = () => {
+    dropElement.current?.classList.remove('external-upload-target')
+    dropElement.current = null; setExternalDropPath(null)
+  }
+  const setDropTarget = (target: EventTarget | null) => {
+    const element = target instanceof Element ? target.closest<HTMLElement>('[data-upload-directory-id]') : null
+    if (!element || element === dropElement.current) return element
+    dropElement.current?.classList.remove('external-upload-target')
+    element.classList.add('external-upload-target'); dropElement.current = element
+    setExternalDropPath(element.dataset.uploadDirectoryPath ?? destinationPath(element.dataset.uploadDirectoryId ?? currentDir))
+    return element
+  }
+  const externalDragOver = (event: React.DragEvent) => {
+    if (!isExternalFileDrag(event.dataTransfer)) return
+    event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'copy'; setDropTarget(event.target)
+  }
+  const externalDragLeave = (event: React.DragEvent) => {
+    if (!isExternalFileDrag(event.dataTransfer)) return
+    const related = event.relatedTarget as Node | null
+    if (!related || !event.currentTarget.contains(related)) resetDropTarget()
+  }
+  const externalDrop = (event: React.DragEvent) => {
+    if (!isExternalFileDrag(event.dataTransfer)) return
+    event.preventDefault(); event.stopPropagation()
+    const element = setDropTarget(event.target)
+    const directoryId = element?.dataset.uploadDirectoryId ?? currentDir
+    const path = element?.dataset.uploadDirectoryPath ?? destinationPath(directoryId)
+    const transfer = event.dataTransfer
+    resetDropTarget()
+    void manifestFromDrop(transfer).then(manifest => enqueueUpload(manifest, directoryId, path)).catch(error => setError(messageOf(error)))
+  }
+  const filesPicked = (event: React.ChangeEvent<HTMLInputElement>, folders = false) => {
+    const files = event.currentTarget.files
+    if (files?.length) enqueueUpload(manifestFromFiles(files, folders))
+    event.currentTarget.value = ''
   }
   const loadDirectory = async (entry: Entry) => {
     if (liveState.current.expanded[entry.id]) return true
@@ -512,16 +578,20 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
             <button disabled={!selected.size} title="Selected item actions" aria-label="Selected item actions" onClick={() => setMobileSelectionMenu(true)}><MoreHorizontal /><span>Actions</span></button>
           </> : <>
             <button title="Upload files" onClick={() => inputRef.current?.click()}><Upload /><span>Upload</span></button>
+            <button title="Upload folder" onClick={() => folderInputRef.current?.click()}><FolderOpen /><span>Folder</span></button>
             <span className="toolbar-spacer" />
             <button title="Select files" onClick={() => { setSelected(new Set()); setPrimary(null); setMobileSelecting(true) }}><Check /><span>Select</span></button>
             <button title="Folder actions" aria-label="Folder actions" onClick={openCurrentFolderMenu}><MoreHorizontal /><span>Actions</span></button>
           </>}
-          <input ref={inputRef} type="file" multiple hidden onChange={e => e.target.files && mutate(() => api.upload(currentDir, e.target.files!), currentDir, () => api.upload(currentDir, e.target.files!, true))} />
+          <input ref={inputRef} type="file" multiple hidden onChange={event => filesPicked(event)} />
+          <input ref={folderInputRef} type="file" multiple hidden {...{ webkitdirectory: '' }} onChange={event => filesPicked(event, true)} />
         </div> : <div className="toolbar">
           <button onClick={() => createItem('directory')}><Plus size={16} /> Folder</button>
           <button onClick={() => createItem('file')}><File size={16} /> File</button>
           <button onClick={() => inputRef.current?.click()}><Upload size={16} /> Upload</button>
-          <input ref={inputRef} type="file" multiple hidden onChange={e => e.target.files && mutate(() => api.upload(currentDir, e.target.files!), currentDir, () => api.upload(currentDir, e.target.files!, true))} />
+          <button onClick={() => folderInputRef.current?.click()}><FolderOpen size={16} /> Upload folder</button>
+          <input ref={inputRef} type="file" multiple hidden onChange={event => filesPicked(event)} />
+          <input ref={folderInputRef} type="file" multiple hidden {...{ webkitdirectory: '' }} onChange={event => filesPicked(event, true)} />
           <span className="divider" />
           <button disabled={!selected.size} title="Copy (Ctrl/Cmd+C)" onClick={() => stageClipboard('copy')}><Copy size={16} /> Copy</button>
           <button disabled={!selected.size} title="Cut (Ctrl/Cmd+X)" onClick={() => stageClipboard('move')}><Scissors size={16} /> Cut</button>
@@ -534,9 +604,10 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
           <button className={`icon-button ${showPreview ? 'active' : ''}`} title={`${showPreview ? 'Hide' : 'Show'} preview`} aria-pressed={showPreview} onClick={() => setShowPreview(value => !value)}><Eye size={16} /></button>
           <ViewSelector view={view} setView={setView} />
         </div>}
-        <div className="location">{isMobile && <button className="mobile-back" disabled={!columnPath.length} title="Parent folder" aria-label="Go to parent folder" onClick={goToParent}><ChevronLeft /></button>}<nav className="breadcrumbs" aria-label="Current directory"><button onClick={goToRoot}>fs-root</button>{columnPath.map((entry, index) => <span key={entry.id}><ChevronRight /><button onClick={() => { setCurrentDir(entry.id); setSelected(new Set()); setPrimary(null); setColumnPath(previous => previous.slice(0, index + 1)) }}>{entry.name}</button></span>)}</nav><span>{visibleCount} visible</span></div>
+        <div className="location">{isMobile && <button className="mobile-back" disabled={!columnPath.length} title="Parent folder" aria-label="Go to parent folder" onClick={goToParent}><ChevronLeft /></button>}<nav className="breadcrumbs" aria-label="Current directory"><button data-upload-directory-id="" data-upload-directory-path="/fs-root" onClick={goToRoot}>fs-root</button>{columnPath.map((entry, index) => <span key={entry.id}><ChevronRight /><button data-upload-directory-id={entry.id} data-upload-directory-path={entry.path} onClick={() => { setCurrentDir(entry.id); setSelected(new Set()); setPrimary(null); setColumnPath(previous => previous.slice(0, index + 1)) }}>{entry.name}</button></span>)}</nav><span>{visibleCount} visible</span></div>
         {error && <div className="banner error"><span>{error}</span><button onClick={() => setError('')}><X size={15} /></button></div>}
-        <div className="browser-body"><div className="browser-view" onContextMenu={view === 'details' ? undefined : event => showFolderMenu(event, currentDir, columnPath.at(-1)?.path ?? '/fs-root')}>
+        <div className="browser-body"><div className="browser-view" data-upload-directory-id={currentDir} data-upload-directory-path={destinationPath(currentDir)} onDragEnterCapture={externalDragOver} onDragOverCapture={externalDragOver} onDragLeaveCapture={externalDragLeave} onDropCapture={externalDrop} onContextMenu={view === 'details' ? undefined : event => showFolderMenu(event, currentDir, columnPath.at(-1)?.path ?? '/fs-root')}>
+          {externalDropPath && <div className="external-upload-overlay"><Upload /><strong>Upload to {externalDropPath}</strong><span>Drop files or folders to add them here</span></div>}
           {!root ? <div className="center"><span className="spinner" /></div> : isMobile ?
             !activePage ? <div className="center"><span className="spinner" /></div> : <MobileDirectoryList rows={gridRows} selecting={mobileSelecting} canNavigateUp={Boolean(columnPath.length)} selected={selected} cutIds={cutIds} setSelected={setSelected} setPrimary={setPrimary} navigateUp={goToParent} activate={entry => { setMobileSelecting(false); activate(entry) }} renameEntry={rename} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} /> : view === 'details' ?
             <ColumnBrowser root={root} path={columnPath} pages={expanded} filter={filter} selected={selected} cutIds={cutIds} primary={primary} defaultColumnWidth={defaultColumnWidth} columnWidths={columnWidths} setColumnWidth={(key, width) => setColumnWidths(previous => ({ ...previous, [key]: width }))} navigate={navigateColumn} loadDirectory={loadDirectory} selectItems={selectColumnItems} selectDragItems={(ids, entry) => { setSelected(ids); setPrimary(entry) }} selectParent={selectParentColumn} activate={activate} renameEntry={rename} moveEntries={moveByDrag} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showFolderMenu={showFolderMenu} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} /> :
@@ -553,6 +624,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     {openFile && <BasicFileWindow key={openFile.kind === 'image' ? 'image-viewer' : `${openFile.entry.id}:${openFile.entry.etag}`} {...openFile} images={viewerImages} onNavigate={entry => {
       setOpenFile({ entry, kind: 'image' }); setSelected(new Set([entry.id])); setPrimary(entry)
     }} onClose={() => setOpenFile(null)} onSaved={() => refresh(openFile.entry.parentId)} />}
+    {uploadQueue.panel}
     <div id="window-tray" className="window-tray" role="region" aria-label="Minimized windows" />
   </div></InstalledAppsContext.Provider>
 }
@@ -718,8 +790,8 @@ function ColumnBrowser({ root, path, pages, filter, selected, cutIds, primary, d
     {columns.map((column, columnIndex) => {
       const entries = visibleEntries(column), targetKey = column.directoryId || '__root__', branchId = visiblePath[columnIndex]?.id
       const width = Math.min(480, Math.max(180, columnWidths[targetKey] || defaultColumnWidth))
-      return <div className={`finder-column ${activeColumn === columnIndex ? 'active' : ''} ${dropTarget === targetKey ? 'drop-target' : ''}`} style={{ '--column-width': `${width}px` } as React.CSSProperties} key={targetKey} ref={node => { columnRefs.current[columnIndex] = node }} tabIndex={0} role="listbox" aria-label={column.label} aria-multiselectable="true" onFocus={() => setActiveColumn(columnIndex)} onKeyDown={event => keyboard(event, columnIndex)} onContextMenu={event => showFolderMenu(event, column.directoryId, columnIndex === 0 ? '/fs-root' : visiblePath[columnIndex - 1].path)} onDragOver={event => { cancelSpringOpen(); acceptDrop(event, column.directoryId) }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null) }} onDrop={event => drop(event, column.directoryId)}>
-        {!column.page ? <div className="column-state"><span className="spinner" /></div> : entries.length === 0 ? <div className="column-state">{filter ? 'No matches' : 'Empty folder'}</div> : entries.map((entry, entryIndex) => <div className={`column-row ${selected.has(entry.id) ? 'selected' : branchId === entry.id ? 'branch-selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} key={entry.id} role="option" aria-selected={selected.has(entry.id)} aria-current={branchId === entry.id ? 'location' : undefined} draggable onDragStart={event => startDrag(event, entry)} onDragEnd={endDrag} onClick={event => choose(entry, columnIndex, entryIndex, event, true)} onDoubleClick={() => entry.kind === 'directory' ? void navigate(entry, columnIndex) : activate(entry)} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ entry, columnIndex, x: event.clientX, y: event.clientY }) }} onDragOver={event => { if (entry.kind === 'directory' && acceptDrop(event, entry.id)) scheduleSpringOpen(entry, columnIndex) }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) { cancelSpringOpen(entry.id); setDropTarget(current => current === entry.id ? null : current) } }} onDrop={event => { if (entry.kind === 'directory') drop(event, entry.id) }}>
+      return <div className={`finder-column ${activeColumn === columnIndex ? 'active' : ''} ${dropTarget === targetKey ? 'drop-target' : ''}`} data-upload-directory-id={column.directoryId} data-upload-directory-path={columnIndex === 0 ? '/fs-root' : visiblePath[columnIndex - 1].path} style={{ '--column-width': `${width}px` } as React.CSSProperties} key={targetKey} ref={node => { columnRefs.current[columnIndex] = node }} tabIndex={0} role="listbox" aria-label={column.label} aria-multiselectable="true" onFocus={() => setActiveColumn(columnIndex)} onKeyDown={event => keyboard(event, columnIndex)} onContextMenu={event => showFolderMenu(event, column.directoryId, columnIndex === 0 ? '/fs-root' : visiblePath[columnIndex - 1].path)} onDragOver={event => { cancelSpringOpen(); acceptDrop(event, column.directoryId) }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null) }} onDrop={event => drop(event, column.directoryId)}>
+        {!column.page ? <div className="column-state"><span className="spinner" /></div> : entries.length === 0 ? <div className="column-state">{filter ? 'No matches' : 'Empty folder'}</div> : entries.map((entry, entryIndex) => <div className={`column-row ${selected.has(entry.id) ? 'selected' : branchId === entry.id ? 'branch-selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} data-upload-directory-id={entry.kind === 'directory' ? entry.id : undefined} data-upload-directory-path={entry.kind === 'directory' ? entry.path : undefined} key={entry.id} role="option" aria-selected={selected.has(entry.id)} aria-current={branchId === entry.id ? 'location' : undefined} draggable onDragStart={event => startDrag(event, entry)} onDragEnd={endDrag} onClick={event => choose(entry, columnIndex, entryIndex, event, true)} onDoubleClick={() => entry.kind === 'directory' ? void navigate(entry, columnIndex) : activate(entry)} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ entry, columnIndex, x: event.clientX, y: event.clientY }) }} onDragOver={event => { if (entry.kind === 'directory' && acceptDrop(event, entry.id)) scheduleSpringOpen(entry, columnIndex) }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) { cancelSpringOpen(entry.id); setDropTarget(current => current === entry.id ? null : current) } }} onDrop={event => { if (entry.kind === 'directory') drop(event, entry.id) }}>
           <FileGlyph entry={entry} /><span title={entry.name}>{entry.name}</span>{entry.kind === 'directory' && <ChevronRight className="column-arrow" />}
         </div>)}
         <div className="column-resizer" role="separator" aria-orientation="vertical" aria-label={`Resize ${column.label} column`} title="Resize column" onPointerDown={event => startResize(event, targetKey, width)} />
@@ -837,7 +909,7 @@ function FileList({ rows, view, selected, cutIds, setSelected, setPrimary, activ
   })
   const contextMenu = menu && <ContextMenu {...menu} selectedEntries={rows.map(row => row.entry).filter(entry => selected.has(entry.id))} close={() => setMenu(null)} open={() => activate(menu.entry)} renameEntry={renameEntry} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={pasteInto} hasClipboard={hasClipboard} showProperties={showProperties} concatenateVideos={concatenateVideos} setError={setError} />
   return <div className={`preview-list ${view}`}>
-    {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => selectEntry(entry, index, event)} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
+    {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} data-upload-directory-id={entry.kind === 'directory' ? entry.id : undefined} data-upload-directory-path={entry.kind === 'directory' ? entry.path : undefined} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => selectEntry(entry, index, event)} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
       <button className="card-menu" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>
       {entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : entry.mime.startsWith('image/') || (view !== 'small' && entry.mime.startsWith('video/')) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view, entry.etag)} loading="lazy" /></button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
       <button className="filename" tabIndex={-1} title={entry.name}>{entry.name}</button>
@@ -872,7 +944,7 @@ function MobileDirectoryList({ rows, selecting, canNavigateUp, selected, cutIds,
   return <div className="mobile-directory-list" role="list" aria-label="Directory contents">
     {canNavigateUp && <button className="mobile-parent-row" onClick={navigateUp}><span className="mobile-glyph-slot"><ChevronLeft /></span><span className="mobile-entry-label"><strong>Parent folder</strong><small>Go up one level</small></span></button>}
     {!rows.length && <Empty />}
-    {rows.map(({ entry }) => <div className={`mobile-directory-row ${selected.has(entry.id) ? 'selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''}`} role="listitem" key={entry.id}>
+    {rows.map(({ entry }) => <div className={`mobile-directory-row ${selected.has(entry.id) ? 'selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''}`} data-upload-directory-id={entry.kind === 'directory' ? entry.id : undefined} data-upload-directory-path={entry.kind === 'directory' ? entry.path : undefined} role="listitem" key={entry.id}>
       {selecting && <input type="checkbox" aria-label={`Select ${entry.name}`} checked={selected.has(entry.id)} onChange={() => toggle(entry)} />}
       <button className="mobile-entry-open" onClick={() => selecting ? toggle(entry) : activate(entry)}>
         <span className="mobile-glyph-slot"><FileGlyph entry={entry} /></span>
