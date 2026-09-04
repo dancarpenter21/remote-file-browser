@@ -79,6 +79,18 @@ export function remoteMediaInfoUrl(session: RemoteSession, file: RemoteFile): st
   return `${filesApi}/delegated/sessions/${encodeURIComponent(session.sessionId)}/files/${encodeURIComponent(file.reference)}/media-info`;
 }
 
+export function remoteHlsBaseUrl(session: RemoteSession, file: RemoteFile): string {
+  return `${filesApi}/delegated/sessions/${encodeURIComponent(session.sessionId)}/files/${encodeURIComponent(file.reference)}/hls`;
+}
+
+export function remoteHlsStatusUrl(session: RemoteSession, file: RemoteFile, key: string): string {
+  return `${remoteHlsBaseUrl(session, file)}/${encodeURIComponent(key)}/status`;
+}
+
+export function remoteHlsAssetUrl(session: RemoteSession, file: RemoteFile, key: string, asset: string): string {
+  return `${remoteHlsBaseUrl(session, file)}/${encodeURIComponent(key)}/${encodeURIComponent(asset)}`;
+}
+
 export async function remoteFetch(session: RemoteSession, url: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
   headers.set("cookie", `rfb_cap_${session.sessionId}=${session.token}`);

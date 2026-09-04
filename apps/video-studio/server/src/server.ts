@@ -37,6 +37,9 @@ import {
   remoteContentUrl,
   remoteFetch,
   remoteFile,
+  remoteHlsAssetUrl,
+  remoteHlsBaseUrl,
+  remoteHlsStatusUrl,
   remoteMediaInfoUrl,
   remoteSession,
   type RemoteFile,
@@ -51,6 +54,20 @@ type UtilityJob = {
   error?: string;
   result?: { id: string; name: string };
 };
+
+type SharedHlsJob = UtilityJob & {
+  playlistUrl: string;
+  mode: "remux" | "audio" | "full";
+};
+
+async function remoteError(response: Response, fallback: string): Promise<Error> {
+  const body = await response.json().catch(() => ({})) as { error?: string; message?: string };
+  return Object.assign(new Error(body.error ?? body.message ?? fallback), { statusCode: response.status });
+}
+
+function localHlsJob(sessionId: string, job: SharedHlsJob): SharedHlsJob {
+  return { ...job, playlistUrl: `/apps/video/api/handoffs/${sessionId}/hls/${job.key}/index.m3u8` };
+}
 
 function outputName(value: string, fallback: string): string {
   const name = path.basename(value).replaceAll(/[^a-zA-Z0-9._-]/g, "-");
@@ -147,6 +164,7 @@ export async function buildServer() {
   const queue = new RenderQueue();
   const integrationImports = new Map<string, Promise<Project>>();
   const utilityJobs = new Map<string, UtilityJob>();
+  const sharedHlsJobs = new Map<string, string>();
   await app.register(multipart, { limits: { files: 1, fileSize: 40 * 1024 * 1024 * 1024 } });
 
   app.addHook("onRequest", async (request, reply) => {
@@ -235,33 +253,45 @@ export async function buildServer() {
   });
 
   app.get<{ Params: { session: string; key: string } }>("/api/handoffs/:session/jobs/:key", async (request, reply) => {
-    remoteSession(request.params.session);
-    return utilityJobs.get(request.params.key) ?? reply.code(404).send({ error: "Job not found." });
+    const session = remoteSession(request.params.session);
+    const local = utilityJobs.get(request.params.key);
+    if (local) return local;
+    const reference = sharedHlsJobs.get(`${session.localId}:${request.params.key}`);
+    if (!reference) return reply.code(404).send({ error: "Job not found." });
+    const file = remoteFile(session, reference);
+    const response = await remoteFetch(session, remoteHlsStatusUrl(session, file, request.params.key));
+    if (!response.ok) throw await remoteError(response, "Files could not read video conversion status.");
+    return localHlsJob(session.localId, await response.json() as SharedHlsJob);
   });
 
   app.post<{ Params: { session: string; reference: string } }>("/api/handoffs/:session/files/:reference/hls", async (request, reply) => {
     const session = remoteSession(request.params.session);
     const file = remoteFile(session, request.params.reference);
-    const key = randomUUID();
-    const directory = path.join(dataDirectory, "handoffs", session.localId, `hls-${key}`);
-    const job: UtilityJob = { key, status: "working", playable: false, progress: 0, playlistUrl: `/apps/video/api/handoffs/${session.localId}/hls/${key}/index.m3u8` };
-    utilityJobs.set(key, job);
-    void (async () => {
-      try {
-        const source = await ensureLocalSource(session, file);
-        await mkdir(directory, { recursive: true });
-        await runProcess(ffmpegPath, ["-hide_banner", "-y", "-i", source, "-map", "0:v:0", "-map", "0:a:0?", "-vf", "scale='min(1920,iw)':-2", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-hls_time", "4", "-hls_playlist_type", "event", "-hls_segment_filename", path.join(directory, "segment-%05d.ts"), path.join(directory, "index.m3u8")]);
-        job.status = "ready"; job.playable = true; job.progress = 1;
-      } catch (error) { job.status = "failed"; job.error = error instanceof Error ? error.message : "Video conversion failed."; }
-    })();
-    return reply.code(202).send(job);
+    const response = await remoteFetch(session, remoteHlsBaseUrl(session, file), {
+      method: "POST",
+      headers: { "x-app-csrf-token": session.csrfToken },
+    });
+    if (!response.ok) throw await remoteError(response, "Files could not prepare the video stream.");
+    const job = await response.json() as SharedHlsJob;
+    sharedHlsJobs.set(`${session.localId}:${job.key}`, file.reference);
+    return reply.code(response.status).send(localHlsJob(session.localId, job));
   });
 
   app.get<{ Params: { session: string; key: string; file: string } }>("/api/handoffs/:session/hls/:key/:file", async (request, reply) => {
     const session = remoteSession(request.params.session);
-    if (!utilityJobs.has(request.params.key) || !/^(index\.m3u8|segment-\d{5}\.ts)$/.test(request.params.file)) return reply.code(404).send();
-    const file = path.join(dataDirectory, "handoffs", session.localId, `hls-${request.params.key}`, request.params.file);
-    return reply.type(request.params.file.endsWith(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp2t").send(createReadStream(file));
+    const reference = sharedHlsJobs.get(`${session.localId}:${request.params.key}`);
+    if (!reference || !/^(index\.m3u8|segment-\d{5}\.ts)$/.test(request.params.file)) return reply.code(404).send();
+    const file = remoteFile(session, reference);
+    const headers = new Headers();
+    if (request.headers.range) headers.set("range", request.headers.range);
+    const response = await remoteFetch(session, remoteHlsAssetUrl(session, file, request.params.key, request.params.file), { headers });
+    reply.code(response.status);
+    for (const header of ["accept-ranges", "cache-control", "content-length", "content-range", "content-type", "etag", "last-modified"]) {
+      const value = response.headers.get(header);
+      if (value) reply.header(header, value);
+    }
+    if (!response.body) return reply.send();
+    return reply.send(Readable.fromWeb(response.body as never));
   });
 
   app.post<{ Params: { session: string } }>("/api/handoffs/:session/concatenations", async (request, reply) => {

@@ -2,6 +2,8 @@
 
 Video Studio is the workspace video application. It imports a capability-scoped source from Files into app-owned project storage, provides frame-accurate slow-motion and stadium-ambience editing, and publishes completed exports beside the source without overwriting existing files.
 
+Delegated playback uses Files' persistent HLS cache, so opening the same source in Files and Video Studio reuses one browser-compatible conversion. The editor's 720p project proxy remains app-owned and separate because it serves timeline editing rather than ordinary playback.
+
 It is deployed by the repository's root `compose.yaml`, not as a separate stack. Production is authenticated and routed at `/apps/video/`; development is proxied through Files at `http://localhost:5173/apps/video/`. The server has no production host port.
 
 Requirements for host-side work are Linux x64, Node.js 24+, and enough space for the imported source, 720p proxy, previews, and exports. FFmpeg and FFprobe are pinned npm dependencies and startup verifies the required filters and encoder.

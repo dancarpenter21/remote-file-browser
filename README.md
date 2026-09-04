@@ -2,10 +2,10 @@
 
 Remote Workspace is a single-administrator, Dockerized workspace for files on a remote Linux host. The root Compose project runs four browser applications behind one authenticated HTTPS origin:
 
-- **Files** browses and manages the mounted filesystem, uploads files and folder trees through picker or desktop drag-and-drop with a cancellable progress queue, extracts ZIP and common tar archives from context menus, provides lightweight floating text, image, and muted video windows, offers advanced Markdown and image tools, automatically hands browser-incompatible videos to Video Studio, and includes Trash, provenance, and terminal sessions.
+- **Files** browses and manages the mounted filesystem, uploads files and folder trees through picker or desktop drag-and-drop with a cancellable progress queue, extracts ZIP and common tar archives from context menus, provides lightweight floating text, image, and muted video windows, extracts video frames and clips beside their source, loops videos shorter than 40 seconds, converts browser-incompatible videos for inline playback, shows conversion progress in the sidebar, and includes advanced Markdown and image tools, Trash, provenance, and terminal sessions.
 - **Text Editor** opens text and Markdown in a reusable tabbed window.
 - **Image Tools** opens image galleries in a reusable window with zoom, rotation, pixel measurement, and non-destructive markup copies.
-- **Video Studio** plays delegated videos with an automatic browser-compatible streaming fallback, and imports video into isolated project storage for timeline editing and export.
+- **Video Studio** plays delegated videos through the same browser-compatible stream cache as Files, and imports video into isolated project storage for timeline editing and export.
 
 Files is the only service with the `/fs-root` mount. Other apps receive short-lived, single-use capabilities for selected files. Capabilities are session- and version-bound and grant only the reads or output operations declared by the app action.
 
@@ -64,7 +64,7 @@ Run individual web apps with `npm run dev:files`, `npm run dev:images`, `npm run
 
 `FILES_ROOT_PATH` must be an existing path visible to Docker. Compose bind-mounts it at `/fs-root` without creating a missing host directory. The service runs as `FILES_UID:FILES_GID`; Windows-mounted WSL filesystems do not reproduce all POSIX ownership and permission behavior.
 
-The application owns `.trash` and `.cache/remote-file-browser` inside the mounted root. Ordinary deletion moves entries to `.trash`; permanent deletion is available from Trash. Thumbnail cache limits are controlled by `FILES_CACHE_MAX_BYTES` and `FILES_CACHE_MAX_AGE_DAYS`.
+The application owns `.trash` and `.cache/remote-file-browser` inside the mounted root. Ordinary deletion moves entries to `.trash`; permanent deletion is available from Trash. Thumbnail and shared converted-video cache limits are controlled by `FILES_CACHE_MAX_BYTES` and `FILES_CACHE_MAX_AGE_DAYS`.
 
 The authenticated terminal runs inside the read-only Files server container, not on the Docker host, but it can modify `/fs-root`. Disable it with `FILES_TERMINAL_ENABLED=false` when command execution is unnecessary. Rotate the administrator password by replacing `secrets/admin_password`; new login attempts read the new value without a restart.
 
@@ -104,4 +104,4 @@ The automation overlay does not publish an internal service or database port.
 
 `RFB_*`, `VFX_EDITOR_*`, and `TRAEFIK_*` variable aliases remain accepted for existing deployments, but new configuration should use the `RWS_*`, `FILES_*`, `VIDEO_STUDIO_*`, and `INGRESS_*` names shown in the templates.
 
-The Files server image builds FFmpeg 8.1.2 from verified source for previews. Video Studio uses pinned npm-distributed FFmpeg and FFprobe binaries. Licensing and source notices are kept with each application.
+The Files server image builds FFmpeg 8.1.2 from verified source for previews, shared browser-compatible playback streams, compatibility inspection, and local frame or clip extraction. Video Studio uses pinned npm-distributed FFmpeg and FFprobe binaries for editing. Licensing and source notices are kept with each application.

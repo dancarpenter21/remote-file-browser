@@ -5,6 +5,7 @@ use std::{
     os::unix::ffi::{OsStrExt, OsStringExt},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Component, Path, PathBuf},
+    process::Stdio,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -29,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, broadcast},
 };
@@ -67,6 +68,10 @@ struct AppState {
     terminal_slots: Arc<Semaphore>,
     app_launches: Arc<DashMap<String, PendingAppLaunch>>,
     app_capabilities: Arc<DashMap<String, AppCapability>>,
+    direct_playable: Arc<DashMap<String, bool>>,
+    media_jobs: Arc<DashMap<String, MediaJob>>,
+    hls_start: Arc<Mutex<()>>,
+    extraction_jobs: Arc<DashMap<String, ExtractionJob>>,
 }
 
 struct Config {
@@ -267,6 +272,16 @@ type ApiResult<T> = Result<T, ApiError>;
         delegated_metadata,
         delegated_content,
         delegated_media_info,
+        delegated_start_hls,
+        delegated_hls_status,
+        delegated_hls_file,
+        media_info,
+        start_hls,
+        list_media_jobs,
+        hls_status,
+        hls_file,
+        start_media_extraction,
+        media_extraction_status,
         delegated_write_content,
         delegated_create_output,
         list_entries,
@@ -319,6 +334,11 @@ type ApiResult<T> = Result<T, ApiError>;
         AppCapabilityResponse,
         DelegatedFileResponse,
         DelegatedMediaInfoResponse,
+        HlsRequest,
+        HlsResponse,
+        MediaJob,
+        MediaExtractionRequest,
+        ExtractionJob,
         Document,
         WriteDocument
     )),
@@ -382,6 +402,9 @@ async fn main() {
     fs::create_dir_all(cache.join("thumbnails"))
         .await
         .expect("create thumbnail cache");
+    fs::create_dir_all(cache.join("hls"))
+        .await
+        .expect("create media cache");
     if let Err(error) = fs::remove_dir_all(cache.join("hls")).await
         && error.kind() != std::io::ErrorKind::NotFound
     {
@@ -494,6 +517,10 @@ async fn main() {
         terminal_slots: Arc::new(Semaphore::new(terminal_max_sessions)),
         app_launches: Arc::new(DashMap::new()),
         app_capabilities: Arc::new(DashMap::new()),
+        direct_playable: Arc::new(DashMap::new()),
+        media_jobs: Arc::new(DashMap::new()),
+        hls_start: Arc::new(Mutex::new(())),
+        extraction_jobs: Arc::new(DashMap::new()),
     };
 
     migrate_provenance_json(&state)
@@ -523,6 +550,18 @@ async fn main() {
             get(delegated_media_info),
         )
         .route(
+            "/delegated/sessions/{session_id}/files/{reference}/hls",
+            post(delegated_start_hls),
+        )
+        .route(
+            "/delegated/sessions/{session_id}/files/{reference}/hls/{key}/status",
+            get(delegated_hls_status),
+        )
+        .route(
+            "/delegated/sessions/{session_id}/files/{reference}/hls/{key}/{file}",
+            get(delegated_hls_file),
+        )
+        .route(
             "/delegated/sessions/{session_id}/outputs",
             post(delegated_create_output),
         )
@@ -547,6 +586,13 @@ async fn main() {
         .route("/trash/{id}", delete(purge_trash))
         .route("/previews/thumbnail", get(thumbnail))
         .route("/media/file", get(media_file))
+        .route("/media/info", get(media_info))
+        .route("/media/hls", post(start_hls))
+        .route("/media/jobs", get(list_media_jobs))
+        .route("/media/hls/{key}/status", get(hls_status))
+        .route("/media/hls/{key}/{file}", get(hls_file))
+        .route("/media/extractions", post(start_media_extraction))
+        .route("/media/extractions/{key}", get(media_extraction_status))
         .route("/terminal/tickets", post(create_terminal_ticket))
         .route("/terminal/ws", get(terminal_websocket));
 
@@ -1327,6 +1373,10 @@ async fn delegated_media_info(
         ));
     }
     let path = validate_delegated_file(&state, &file).await?;
+    Ok(Json(probe_media_info(&path).await?))
+}
+
+async fn probe_media_info(path: &Path) -> ApiResult<DelegatedMediaInfoResponse> {
     let mut command = Command::new("ffprobe");
     command
         .kill_on_drop(true)
@@ -1344,15 +1394,301 @@ async fn delegated_media_info(
         .map_err(|_| ApiError::bad("media_probe_timeout", "Video metadata inspection timed out"))?
         .map_err(ApiError::internal)?;
     if !output.status.success() {
-        warn!(stderr = %String::from_utf8_lossy(&output.stderr), "FFprobe could not inspect delegated video");
+        warn!(stderr = %String::from_utf8_lossy(&output.stderr), path = %path.display(), "FFprobe could not inspect video");
         return Err(ApiError::bad(
             "media_probe_failed",
             "The video metadata could not be read",
         ));
     }
-    let info = parse_delegated_media_info(&output.stdout)
-        .map_err(|message| ApiError::bad("media_probe_failed", message))?;
-    Ok(Json(info))
+    parse_delegated_media_info(&output.stdout)
+        .map_err(|message| ApiError::bad("media_probe_failed", message))
+}
+
+#[utoipa::path(get, path = "/api/v1/media/info", tag = "media", params(("id" = String, Query)), security(("sessionCookie" = [])), responses((status = 200, body = DelegatedMediaInfoResponse), (status = 400, body = Problem)))]
+async fn media_info(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(query): Query<IdQuery>,
+) -> ApiResult<Json<DelegatedMediaInfoResponse>> {
+    require_session(&state, &jar)?;
+    let source = resolve_existing(&state.config, &query.id).await?;
+    let metadata = fs::metadata(&source).await?;
+    let mime = mime_guess::from_path(&source).first_or_octet_stream();
+    if !metadata.is_file() || mime.type_() != mime_guess::mime::VIDEO {
+        return Err(ApiError::bad(
+            "not_video",
+            "Media information is available only for regular video files",
+        ));
+    }
+    Ok(Json(probe_media_info(&source).await?))
+}
+
+#[derive(Clone, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct MediaExtractionRequest {
+    id: String,
+    kind: String,
+    time: Option<f64>,
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+}
+
+#[derive(Clone, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct ExtractionJob {
+    key: String,
+    file_name: String,
+    kind: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_time: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_time: Option<f64>,
+    started_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Entry>,
+}
+
+fn valid_media_time(value: f64, duration: f64) -> bool {
+    value.is_finite() && value >= 0.0 && value < duration
+}
+
+fn media_timestamp_label(seconds: f64) -> String {
+    let millis = (seconds.max(0.0) * 1000.0).round() as u64;
+    format!(
+        "{:02}-{:02}-{:02}.{:03}",
+        millis / 3_600_000,
+        millis / 60_000 % 60,
+        millis / 1000 % 60,
+        millis % 1000
+    )
+}
+
+fn frame_extraction_command(source: &Path, target: &Path, time: f64) -> Command {
+    let mut command = Command::new("ffmpeg");
+    command
+        .kill_on_drop(true)
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-ss"])
+        .arg(format!("{time:.6}"))
+        .args(["-accurate_seek", "-i"])
+        .arg(source)
+        .args(["-map", "0:v:0", "-frames:v", "1", "-y"])
+        .arg(target);
+    command
+}
+
+fn segment_extraction_command(source: &Path, target: &Path, start: f64, end: f64) -> Command {
+    let mut command = Command::new("ffmpeg");
+    command
+        .kill_on_drop(true)
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(source)
+        .args([
+            "-ss",
+            &format!("{start:.6}"),
+            "-t",
+            &format!("{:.6}", end - start),
+        ])
+        .args([
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-sn",
+            "-dn",
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            "-y",
+        ])
+        .arg(target);
+    command
+}
+
+async fn run_media_extraction(
+    state: &AppState,
+    request: &MediaExtractionRequest,
+    source: &Path,
+) -> ApiResult<Entry> {
+    let directory = source
+        .parent()
+        .ok_or_else(|| ApiError::bad("invalid_path", "Video has no parent directory"))?;
+    let stem = source
+        .file_stem()
+        .unwrap_or_else(|| OsStr::new("video"))
+        .to_string_lossy();
+    let (name, temporary, mut command) = if request.kind == "frame" {
+        let time = request.time.unwrap();
+        let name = format!("{stem}-frame-{}.png", media_timestamp_label(time));
+        let temporary = directory.join(format!(".rfb-extraction-{}.png", Uuid::new_v4()));
+        let command = frame_extraction_command(source, &temporary, time);
+        (name, temporary, command)
+    } else {
+        let start = request.start_time.unwrap();
+        let end = request.end_time.unwrap();
+        let name = format!(
+            "{stem}-clip-{}-to-{}.mp4",
+            media_timestamp_label(start),
+            media_timestamp_label(end)
+        );
+        let temporary = directory.join(format!(".rfb-extraction-{}.mp4", Uuid::new_v4()));
+        let command = segment_extraction_command(source, &temporary, start, end);
+        (name, temporary, command)
+    };
+    let output = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(ApiError::internal(error));
+        }
+    };
+    if !output.status.success() {
+        let _ = fs::remove_file(&temporary).await;
+        error!(kind = %request.kind, source = %source.display(), detail = %String::from_utf8_lossy(&output.stderr), "media extraction failed");
+        return Err(ApiError::bad(
+            "extraction_failed",
+            "FFmpeg could not extract the media",
+        ));
+    }
+    let mode = fs::metadata(source).await?.permissions().mode();
+    fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode)).await?;
+    let target = match publish_app_output(&temporary, directory, &name).await {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+    };
+    entry_from_path(state, target).await
+}
+
+#[utoipa::path(post, path = "/api/v1/media/extractions", tag = "media", params(("x-csrf-token" = String, Header)), request_body = MediaExtractionRequest, security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 202, body = ExtractionJob), (status = 400, body = Problem)))]
+async fn start_media_extraction(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Json(request): Json<MediaExtractionRequest>,
+) -> ApiResult<(StatusCode, Json<ExtractionJob>)> {
+    require_csrf(&state, &jar, &headers)?;
+    let source = resolve_existing(&state.config, &request.id).await?;
+    let metadata = fs::metadata(&source).await?;
+    let mime = mime_guess::from_path(&source).first_or_octet_stream();
+    if !metadata.is_file() || mime.type_() != mime_guess::mime::VIDEO {
+        return Err(ApiError::bad(
+            "not_video",
+            "Video source must be a regular video file",
+        ));
+    }
+    let info = probe_media_info(&source).await?;
+    match request.kind.as_str() {
+        "frame"
+            if request
+                .time
+                .is_some_and(|time| valid_media_time(time, info.duration_seconds)) => {}
+        "segment"
+            if request
+                .start_time
+                .is_some_and(|time| valid_media_time(time, info.duration_seconds))
+                && request.end_time.is_some_and(|time| {
+                    time.is_finite() && time > 0.0 && time <= info.duration_seconds
+                })
+                && request.end_time.unwrap() > request.start_time.unwrap() => {}
+        "frame" | "segment" => {
+            return Err(ApiError::bad(
+                "invalid_time",
+                "Extraction timestamps are outside the video",
+            ));
+        }
+        _ => {
+            return Err(ApiError::bad(
+                "invalid_kind",
+                "Extraction kind must be frame or segment",
+            ));
+        }
+    }
+    let key = Uuid::new_v4().simple().to_string();
+    let job = ExtractionJob {
+        key: key.clone(),
+        file_name: source
+            .file_name()
+            .unwrap_or_else(|| OsStr::new("video"))
+            .to_string_lossy()
+            .into_owned(),
+        kind: request.kind.clone(),
+        status: "working".into(),
+        time: request.time,
+        start_time: request.start_time,
+        end_time: request.end_time,
+        started_at: Utc::now(),
+        error: None,
+        result: None,
+    };
+    state.extraction_jobs.insert(key.clone(), job.clone());
+    if state.extraction_jobs.len() > 100 {
+        let mut completed = state
+            .extraction_jobs
+            .iter()
+            .filter(|candidate| candidate.status != "working")
+            .map(|candidate| (candidate.started_at, candidate.key.clone()))
+            .collect::<Vec<_>>();
+        completed.sort_by_key(|candidate| candidate.0);
+        for (_, old_key) in completed
+            .into_iter()
+            .take(state.extraction_jobs.len().saturating_sub(100))
+        {
+            state.extraction_jobs.remove(&old_key);
+        }
+    }
+    let task_state = state.clone();
+    tokio::spawn(async move {
+        let outcome = run_media_extraction(&task_state, &request, &source).await;
+        if let Some(mut stored) = task_state.extraction_jobs.get_mut(&key) {
+            match outcome {
+                Ok(entry) => {
+                    stored.status = "ready".into();
+                    stored.result = Some(entry);
+                }
+                Err(error) => {
+                    stored.status = "failed".into();
+                    stored.error = Some(error.2);
+                }
+            }
+        }
+    });
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+#[utoipa::path(get, path = "/api/v1/media/extractions/{key}", tag = "media", params(("key" = String, Path)), security(("sessionCookie" = [])), responses((status = 200, body = ExtractionJob), (status = 404, body = Problem)))]
+async fn media_extraction_status(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    AxumPath(key): AxumPath<String>,
+) -> ApiResult<Json<ExtractionJob>> {
+    require_session(&state, &jar)?;
+    let job = state
+        .extraction_jobs
+        .get(&key)
+        .map(|job| job.value().clone())
+        .ok_or_else(|| ApiError::not_found("Extraction job does not exist"))?;
+    Ok(Json(job))
 }
 
 fn require_app_csrf(capability: &AppCapability, headers: &HeaderMap) -> ApiResult<()> {
@@ -1425,14 +1761,13 @@ async fn delegated_write_content(
         etag: metadata_etag(&metadata),
         ..file
     };
-    if let Some(mut stored) = state.app_capabilities.get_mut(&session_id) {
-        if let Some(stored_file) = stored
+    if let Some(mut stored) = state.app_capabilities.get_mut(&session_id)
+        && let Some(stored_file) = stored
             .files
             .iter_mut()
             .find(|candidate| candidate.reference == reference)
-        {
-            *stored_file = next.clone();
-        }
+    {
+        *stored_file = next.clone();
     }
     Ok(Json(DelegatedFileResponse::from(&next)))
 }
@@ -1588,6 +1923,7 @@ struct Entry {
     symlink_target: Option<String>,
     etag: String,
     has_provenance: bool,
+    browser_ready: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     child_file_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1777,11 +2113,28 @@ enum LiveEvent {
     Provenance {
         change: ProvenanceEvent,
     },
+    MediaSnapshot {
+        jobs: Vec<MediaJob>,
+    },
+    MediaJob {
+        job: Box<MediaJob>,
+    },
     CacheCleanup {
         state: String,
         report: Option<CacheCleanupReport>,
         error: Option<String>,
     },
+}
+
+fn media_snapshot(state: &AppState) -> LiveEvent {
+    let mut jobs = state
+        .media_jobs
+        .iter()
+        .map(|job| job.value().clone())
+        .collect::<Vec<_>>();
+    jobs.sort_by_key(|job| std::cmp::Reverse(job.started_at));
+    jobs.truncate(20);
+    LiveEvent::MediaSnapshot { jobs }
 }
 
 #[derive(Clone)]
@@ -2497,6 +2850,9 @@ async fn live_socket(mut socket: WebSocket, state: AppState) {
     if !send_live_event(&mut socket, &LiveEvent::Resync).await {
         return;
     }
+    if !send_live_event(&mut socket, &media_snapshot(&state)).await {
+        return;
+    }
     loop {
         tokio::select! {
             incoming = socket.recv() => match incoming {
@@ -2942,9 +3298,13 @@ fn remapped_source_id(config: &Config, id: &str, source: &Path, target: &Path) -
 }
 
 fn cache_artifact_path(cache: &Path, record: &CacheRecord) -> PathBuf {
-    cache
-        .join("thumbnails")
-        .join(format!("{}.webp", record.key))
+    if record.kind == "hls" {
+        cache.join("hls").join(&record.key)
+    } else {
+        cache
+            .join("thumbnails")
+            .join(format!("{}.webp", record.key))
+    }
 }
 
 async fn invalidate_cache_prefix(state: &AppState, path: &Path) -> ApiResult<()> {
@@ -2967,7 +3327,20 @@ async fn invalidate_cache_prefix(state: &AppState, path: &Path) -> ApiResult<()>
     *state.cache_index.write().await = index;
     drop(_write);
     for (_, record) in removed {
-        let _ = fs::remove_file(cache_artifact_path(&state.config.cache, &record)).await;
+        let active = record.kind == "hls"
+            && state
+                .media_jobs
+                .get(&record.key)
+                .is_some_and(|job| job.status == "working");
+        if active {
+            continue;
+        }
+        let artifact = cache_artifact_path(&state.config.cache, &record);
+        if record.kind == "hls" {
+            let _ = fs::remove_dir_all(artifact).await;
+        } else {
+            let _ = fs::remove_file(artifact).await;
+        }
     }
     Ok(())
 }
@@ -2994,7 +3367,111 @@ async fn remap_cache(state: &AppState, source: &Path, target: &Path) -> ApiResul
     *state.cache_index.write().await = index;
     drop(_write);
 
+    let updates = state
+        .media_jobs
+        .iter()
+        .filter_map(|job| {
+            remapped_source_id(&state.config, &job.source_id, source, target)
+                .map(|new_id| (job.key.clone(), new_id))
+        })
+        .collect::<Vec<_>>();
+    for (key, new_id) in updates {
+        let file_name = state
+            .config
+            .root
+            .join(decode_path(&new_id)?)
+            .file_name()
+            .unwrap_or_else(|| OsStr::new("video"))
+            .to_string_lossy()
+            .into_owned();
+        emit_media_job(state, &key, |job| {
+            job.source_id = new_id;
+            job.file_name = file_name;
+        });
+    }
+
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct BrowserProbe {
+    streams: Vec<BrowserProbeStream>,
+    format: Option<BrowserProbeFormat>,
+}
+
+#[derive(Deserialize)]
+struct BrowserProbeStream {
+    codec_type: Option<String>,
+    codec_name: Option<String>,
+    pix_fmt: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BrowserProbeFormat {
+    format_name: Option<String>,
+}
+
+fn browser_compatible_source(probe: &BrowserProbe) -> bool {
+    let formats = probe
+        .format
+        .as_ref()
+        .and_then(|format| format.format_name.as_deref())
+        .unwrap_or_default()
+        .split(',')
+        .collect::<Vec<_>>();
+    let Some(video) = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("video"))
+    else {
+        return false;
+    };
+    let audio = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("audio"));
+    if formats
+        .iter()
+        .any(|format| matches!(*format, "mov" | "mp4" | "m4a" | "3gp" | "3g2" | "mj2"))
+    {
+        return video.codec_name.as_deref() == Some("h264")
+            && matches!(video.pix_fmt.as_deref(), Some("yuv420p") | Some("yuvj420p"))
+            && audio.is_none_or(|stream| stream.codec_name.as_deref() == Some("aac"));
+    }
+    formats.contains(&"webm")
+        && matches!(
+            video.codec_name.as_deref(),
+            Some("vp8") | Some("vp9") | Some("av1")
+        )
+        && audio.is_none_or(|stream| {
+            matches!(stream.codec_name.as_deref(), Some("opus") | Some("vorbis"))
+        })
+}
+
+async fn probe_browser_compatibility(path: &Path) -> bool {
+    let mut command = Command::new("ffprobe");
+    command
+        .kill_on_drop(true)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=format_name:stream=codec_type,codec_name,pix_fmt",
+            "-of",
+            "json",
+        ])
+        .arg(path);
+    let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(15), command.output()).await
+    else {
+        return false;
+    };
+    output.status.success()
+        && serde_json::from_slice::<BrowserProbe>(&output.stdout)
+            .is_ok_and(|probe| browser_compatible_source(&probe))
+}
+
+fn browser_compatibility_cache_key(id: &str, etag: &str) -> String {
+    format!("{id}:{etag}")
 }
 
 async fn entry_from_path(state: &AppState, path: PathBuf) -> ApiResult<Entry> {
@@ -3046,6 +3523,27 @@ async fn entry_from_path_with_provenance(
             .lookup(vec![id.clone()])
             .await?
             .contains_key(&id);
+    let browser_ready = if kind == "file" && mime.starts_with("video/") {
+        let hls_key = find_cache_key(state, "hls", &id, &meta, None)
+            .await
+            .unwrap_or_else(|| hls_cache_key(&id, &meta));
+        if playlist_state(&config.cache.join("hls").join(hls_key)).0 {
+            true
+        } else if let Some(ready) = state
+            .direct_playable
+            .get(&browser_compatibility_cache_key(&id, &etag))
+        {
+            *ready
+        } else {
+            let ready = probe_browser_compatibility(&path).await;
+            state
+                .direct_playable
+                .insert(browser_compatibility_cache_key(&id, &etag), ready);
+            ready
+        }
+    } else {
+        false
+    };
     Ok(Entry {
         id,
         parent_id: encode_path(parent.as_os_str()),
@@ -3072,6 +3570,7 @@ async fn entry_from_path_with_provenance(
         symlink_target,
         etag,
         has_provenance,
+        browser_ready,
         child_file_count: None,
         child_directory_count: None,
     })
@@ -3486,13 +3985,11 @@ async fn upload(
             ));
         }
         let target = parent.join(&name);
-        if fs::symlink_metadata(&target).await.is_ok() {
-            if !query.replace {
-                return Err(ApiError::conflict(
-                    "already_exists",
-                    format!("{name} already exists"),
-                ));
-            }
+        if fs::symlink_metadata(&target).await.is_ok() && !query.replace {
+            return Err(ApiError::conflict(
+                "already_exists",
+                format!("{name} already exists"),
+            ));
         }
         let temporary = parent.join(format!(".rfb-upload-{}", Uuid::new_v4()));
         let mut file = fs::OpenOptions::new()
@@ -4216,6 +4713,652 @@ async fn media_file(
     serve_file(path, &headers, true).await
 }
 
+#[derive(Deserialize, utoipa::ToSchema)]
+struct HlsRequest {
+    id: String,
+}
+
+#[derive(Clone, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct HlsResponse {
+    key: String,
+    status: String,
+    playlist_url: String,
+    playable: bool,
+    mode: String,
+    progress: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Clone, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct MediaJob {
+    key: String,
+    file_name: String,
+    status: String,
+    playable: bool,
+    mode: String,
+    started_at: DateTime<Utc>,
+    progress: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip)]
+    #[schema(ignore)]
+    source_id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConversionMode {
+    Remux,
+    Audio,
+    Full,
+}
+
+impl ConversionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Remux => "remux",
+            Self::Audio => "audio",
+            Self::Full => "full",
+        }
+    }
+}
+
+fn conversion_mode(probe: &BrowserProbe) -> ConversionMode {
+    let Some(video) = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("video"))
+    else {
+        return ConversionMode::Full;
+    };
+    if video.codec_name.as_deref() != Some("h264")
+        || !matches!(video.pix_fmt.as_deref(), Some("yuv420p") | Some("yuvj420p"))
+    {
+        return ConversionMode::Full;
+    }
+    match probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("audio"))
+    {
+        None => ConversionMode::Remux,
+        Some(audio) if audio.codec_name.as_deref() == Some("aac") => ConversionMode::Remux,
+        Some(_) => ConversionMode::Audio,
+    }
+}
+
+async fn probe_conversion_mode(source: &Path) -> ConversionMode {
+    let mut command = Command::new("ffprobe");
+    command
+        .kill_on_drop(true)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=format_name:stream=codec_type,codec_name,pix_fmt",
+            "-of",
+            "json",
+        ])
+        .arg(source);
+    let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(15), command.output()).await
+    else {
+        return ConversionMode::Full;
+    };
+    if !output.status.success() {
+        return ConversionMode::Full;
+    }
+    serde_json::from_slice::<BrowserProbe>(&output.stdout)
+        .map(|probe| conversion_mode(&probe))
+        .unwrap_or(ConversionMode::Full)
+}
+
+fn playlist_state(directory: &Path) -> (bool, bool) {
+    let Ok(content) = std::fs::read_to_string(directory.join("index.m3u8")) else {
+        return (false, false);
+    };
+    let segments = content
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    let playable = !segments.is_empty()
+        && segments.iter().all(|name| {
+            Path::new(name).components().count() == 1 && directory.join(name).is_file()
+        });
+    (
+        playable,
+        playable && content.lines().any(|line| line == "#EXT-X-ENDLIST"),
+    )
+}
+
+const HLS_CACHE_VERSION: &str = "ffmpeg-8.1.2-progressive-hls-v3-shared";
+
+fn hls_cache_key(id: &str, source_meta: &std::fs::Metadata) -> String {
+    let fingerprint = format!(
+        "{}:{}:{}:{}:{}",
+        id,
+        source_meta.ino(),
+        source_meta.len(),
+        source_modified_ns(source_meta),
+        HLS_CACHE_VERSION
+    );
+    blake3::hash(fingerprint.as_bytes()).to_hex().to_string()
+}
+
+fn cached_mode(directory: &Path) -> String {
+    std::fs::read_to_string(directory.join("mode"))
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| matches!(value.as_str(), "remux" | "audio" | "full"))
+        .unwrap_or_else(|| "full".into())
+}
+
+fn emit_media_job(state: &AppState, key: &str, update: impl FnOnce(&mut MediaJob)) {
+    let job = state.media_jobs.get_mut(key).map(|mut job| {
+        update(&mut job);
+        job.clone()
+    });
+    if let Some(job) = job {
+        let _ = state
+            .live_events
+            .send(LiveEvent::MediaJob { job: Box::new(job) });
+    }
+}
+
+fn ffmpeg_progress_seconds(line: &str) -> Option<f64> {
+    let value = line.strip_prefix("out_time_us=")?.parse::<f64>().ok()? / 1_000_000.0;
+    (value.is_finite() && value >= 0.0).then_some(value)
+}
+
+async fn track_media_progress(
+    reader: tokio::process::ChildStdout,
+    state: AppState,
+    key: String,
+    duration: f64,
+) {
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Some(seconds) = ffmpeg_progress_seconds(&line) else {
+            continue;
+        };
+        let progress = (seconds / duration).clamp(0.0, 0.995);
+        let should_emit = state
+            .media_jobs
+            .get(&key)
+            .and_then(|job| job.progress)
+            .is_none_or(|previous| progress >= previous + 0.01);
+        if should_emit {
+            emit_media_job(&state, &key, |job| {
+                job.progress = Some(progress.max(job.progress.unwrap_or(0.0)));
+            });
+        }
+    }
+}
+
+fn hls_response(job: &MediaJob, playlist_url: String) -> HlsResponse {
+    HlsResponse {
+        key: job.key.clone(),
+        status: job.status.clone(),
+        playlist_url,
+        playable: job.playable,
+        mode: job.mode.clone(),
+        progress: job.progress,
+        error: job.error.clone(),
+    }
+}
+
+fn prune_media_jobs(state: &AppState) {
+    if state.media_jobs.len() <= 100 {
+        return;
+    }
+    let mut completed = state
+        .media_jobs
+        .iter()
+        .filter(|job| job.status != "working")
+        .map(|job| (job.started_at, job.key.clone()))
+        .collect::<Vec<_>>();
+    completed.sort_by_key(|job| job.0);
+    for (_, key) in completed
+        .into_iter()
+        .take(state.media_jobs.len().saturating_sub(100))
+    {
+        state.media_jobs.remove(&key);
+    }
+}
+
+async fn prepare_hls(
+    state: &AppState,
+    id: &str,
+    source: &Path,
+    playlist_url: impl Fn(&str) -> String,
+) -> ApiResult<(StatusCode, HlsResponse)> {
+    // Starting a conversion changes both the persistent cache index and the job map.
+    // Serialize that short setup phase so simultaneous Files and Video Studio opens
+    // cannot launch duplicate FFmpeg processes for the same source.
+    let _start_guard = state.hls_start.lock().await;
+    let source_meta = fs::metadata(source).await?;
+    if !source_meta.is_file() {
+        return Err(ApiError::bad(
+            "not_file",
+            "Video source must be a regular file",
+        ));
+    }
+    let mime = mime_guess::from_path(source).first_or_octet_stream();
+    if mime.type_() != mime_guess::mime::VIDEO {
+        return Err(ApiError::bad(
+            "not_video",
+            "HLS conversion is available only for video files",
+        ));
+    }
+    let key = find_cache_key(state, "hls", id, &source_meta, None)
+        .await
+        .unwrap_or_else(|| hls_cache_key(id, &source_meta));
+    let directory = state.config.cache.join("hls").join(&key);
+    let playlist = directory.join("index.m3u8");
+    let file_name = source
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("video"))
+        .to_string_lossy()
+        .into_owned();
+    let (cached_playable, cached_ready) = playlist_state(&directory);
+    if cached_ready {
+        register_cache_record(
+            state,
+            CacheRecord {
+                kind: "hls".into(),
+                key: key.clone(),
+                source_id: id.to_string(),
+                source_inode: source_meta.ino(),
+                source_size: source_meta.len(),
+                source_modified_ns: source_modified_ns(&source_meta),
+                dimension: None,
+            },
+        )
+        .await?;
+        let job = MediaJob {
+            key: key.clone(),
+            file_name,
+            status: "ready".into(),
+            playable: true,
+            mode: cached_mode(&directory),
+            started_at: Utc::now(),
+            progress: Some(1.0),
+            error: None,
+            source_id: id.to_string(),
+        };
+        state.media_jobs.insert(key.clone(), job.clone());
+        let _ = state.live_events.send(LiveEvent::MediaJob {
+            job: Box::new(job.clone()),
+        });
+        return Ok((StatusCode::OK, hls_response(&job, playlist_url(&key))));
+    }
+    if let Some(job) = state
+        .media_jobs
+        .get(&key)
+        .filter(|job| job.status == "working")
+        .map(|job| job.value().clone())
+    {
+        return Ok((StatusCode::ACCEPTED, hls_response(&job, playlist_url(&key))));
+    }
+
+    let duration = probe_media_info(source).await?.duration_seconds;
+    if fs::metadata(&directory).await.is_ok() {
+        fs::remove_dir_all(&directory).await?;
+    }
+    fs::create_dir_all(&directory).await?;
+    let mode = probe_conversion_mode(source).await;
+    fs::write(directory.join("mode"), mode.as_str()).await?;
+    register_cache_record(
+        state,
+        CacheRecord {
+            kind: "hls".into(),
+            key: key.clone(),
+            source_id: id.to_string(),
+            source_inode: source_meta.ino(),
+            source_size: source_meta.len(),
+            source_modified_ns: source_modified_ns(&source_meta),
+            dimension: None,
+        },
+    )
+    .await?;
+    let job = MediaJob {
+        key: key.clone(),
+        file_name,
+        status: "working".into(),
+        playable: cached_playable,
+        mode: mode.as_str().into(),
+        started_at: Utc::now(),
+        progress: Some(0.0),
+        error: None,
+        source_id: id.to_string(),
+    };
+    state.media_jobs.insert(key.clone(), job.clone());
+    prune_media_jobs(state);
+    let _ = state.live_events.send(LiveEvent::MediaJob {
+        job: Box::new(job.clone()),
+    });
+
+    let task_state = state.clone();
+    let job_key = key.clone();
+    let source = source.to_path_buf();
+    tokio::spawn(async move {
+        let segment = directory.join("segment-%05d.ts");
+        let mut command = Command::new("ffmpeg");
+        command
+            .kill_on_drop(true)
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                "-protocol_whitelist",
+                "file,pipe",
+                "-i",
+            ])
+            .arg(&source)
+            .args(["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"]);
+        match mode {
+            ConversionMode::Remux => {
+                command.args(["-c", "copy"]);
+            }
+            ConversionMode::Audio => {
+                command.args(["-c:v", "copy", "-c:a", "aac"]);
+            }
+            ConversionMode::Full => {
+                command.args([
+                    "-vf",
+                    "scale='min(1920,iw)':-2",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-force_key_frames",
+                    "expr:gte(t,n_forced*4)",
+                    "-c:a",
+                    "aac",
+                ]);
+            }
+        }
+        command
+            .args([
+                "-hls_time",
+                "4",
+                "-hls_playlist_type",
+                "event",
+                "-hls_flags",
+                "temp_file",
+                "-hls_segment_filename",
+            ])
+            .arg(segment)
+            .arg(&playlist)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let child = command.spawn();
+        let status = match child {
+            Ok(mut child) => {
+                let progress = child.stdout.take().map(|stdout| {
+                    tokio::spawn(track_media_progress(
+                        stdout,
+                        task_state.clone(),
+                        job_key.clone(),
+                        duration,
+                    ))
+                });
+                let status = loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break Some(status),
+                        Ok(None) => {
+                            let (playable, _) = playlist_state(&directory);
+                            if playable
+                                && task_state
+                                    .media_jobs
+                                    .get(&job_key)
+                                    .is_some_and(|job| !job.playable)
+                            {
+                                emit_media_job(&task_state, &job_key, |job| job.playable = true);
+                            }
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                        Err(_) => break None,
+                    }
+                };
+                if let Some(progress) = progress {
+                    let _ = progress.await;
+                }
+                status
+            }
+            Err(_) => None,
+        };
+        let (playable, ready) = playlist_state(&directory);
+        emit_media_job(&task_state, &job_key, |job| {
+            job.playable = playable;
+            if status.is_some_and(|status| status.success()) && ready {
+                job.status = "ready".into();
+                job.progress = Some(1.0);
+                job.error = None;
+            } else {
+                job.status = "failed".into();
+                job.error = Some("FFmpeg could not create a browser-compatible stream".into());
+            }
+        });
+    });
+
+    Ok((StatusCode::ACCEPTED, hls_response(&job, playlist_url(&key))))
+}
+
+fn valid_hls_key(key: &str) -> bool {
+    key.len() == 64 && key.chars().all(|character| character.is_ascii_hexdigit())
+}
+
+fn valid_hls_asset(file: &str) -> bool {
+    file == "index.m3u8"
+        || file
+            .strip_prefix("segment-")
+            .and_then(|value| value.strip_suffix(".ts"))
+            .is_some_and(|digits| {
+                digits.len() == 5 && digits.chars().all(|digit| digit.is_ascii_digit())
+            })
+}
+
+fn hls_status_for(state: &AppState, key: &str, playlist_url: String) -> ApiResult<HlsResponse> {
+    if !valid_hls_key(key) {
+        return Err(ApiError::bad("invalid_key", "Invalid media key"));
+    }
+    let directory = state.config.cache.join("hls").join(key);
+    let (disk_playable, disk_ready) = playlist_state(&directory);
+    let job = state.media_jobs.get(key).map(|job| job.value().clone());
+    let status = if disk_ready {
+        "ready".into()
+    } else {
+        job.as_ref()
+            .map(|job| job.status.clone())
+            .unwrap_or_else(|| "missing".into())
+    };
+    Ok(HlsResponse {
+        key: key.to_string(),
+        status,
+        playlist_url,
+        playable: disk_playable || job.as_ref().is_some_and(|job| job.playable),
+        mode: job
+            .as_ref()
+            .map(|job| job.mode.clone())
+            .unwrap_or_else(|| cached_mode(&directory)),
+        progress: job.as_ref().and_then(|job| job.progress),
+        error: job.and_then(|job| job.error),
+    })
+}
+
+async fn serve_hls_asset(
+    state: &AppState,
+    headers: &HeaderMap,
+    key: &str,
+    file: &str,
+) -> ApiResult<Response> {
+    if !valid_hls_key(key) || !valid_hls_asset(file) {
+        return Err(ApiError::bad("invalid_media_path", "Invalid media path"));
+    }
+    let mut response = serve_file(
+        state.config.cache.join("hls").join(key).join(file),
+        headers,
+        true,
+    )
+    .await?;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        if file == "index.m3u8" {
+            "no-store"
+        } else {
+            "private, max-age=86400"
+        }
+        .parse()
+        .unwrap(),
+    );
+    Ok(response)
+}
+
+async fn hls_key_for_delegated_file(state: &AppState, file: &DelegatedFile) -> ApiResult<String> {
+    let source = validate_delegated_file(state, file).await?;
+    let meta = fs::metadata(&source).await?;
+    Ok(find_cache_key(state, "hls", &file.id, &meta, None)
+        .await
+        .unwrap_or_else(|| hls_cache_key(&file.id, &meta)))
+}
+
+fn require_video_studio_hls(capability: &AppCapability) -> ApiResult<()> {
+    if capability.app_id != "video-studio" || !matches!(capability.action.as_str(), "play" | "edit")
+    {
+        return Err(ApiError::forbidden(
+            "app_action_not_granted",
+            "This app session cannot prepare video playback",
+        ));
+    }
+    Ok(())
+}
+
+#[utoipa::path(get, path = "/api/v1/media/jobs", tag = "media", security(("sessionCookie" = [])), responses((status = 200, body = [MediaJob])))]
+async fn list_media_jobs(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> ApiResult<Json<Vec<MediaJob>>> {
+    require_session(&state, &jar)?;
+    let LiveEvent::MediaSnapshot { jobs } = media_snapshot(&state) else {
+        unreachable!();
+    };
+    Ok(Json(jobs))
+}
+
+#[utoipa::path(post, path = "/api/v1/media/hls", tag = "media", params(("x-csrf-token" = String, Header)), request_body = HlsRequest, security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 200, body = HlsResponse), (status = 202, body = HlsResponse)))]
+async fn start_hls(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Json(input): Json<HlsRequest>,
+) -> ApiResult<(StatusCode, Json<HlsResponse>)> {
+    require_csrf(&state, &jar, &headers)?;
+    let source = resolve_existing(&state.config, &input.id).await?;
+    let (status, response) = prepare_hls(&state, &input.id, &source, |key| {
+        format!("/api/v1/media/hls/{key}/index.m3u8")
+    })
+    .await?;
+    Ok((status, Json(response)))
+}
+
+#[utoipa::path(get, path = "/api/v1/media/hls/{key}/status", tag = "media", params(("key" = String, Path)), security(("sessionCookie" = [])), responses((status = 200, body = HlsResponse)))]
+async fn hls_status(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    AxumPath(key): AxumPath<String>,
+) -> ApiResult<Json<HlsResponse>> {
+    require_session(&state, &jar)?;
+    Ok(Json(hls_status_for(
+        &state,
+        &key,
+        format!("/api/v1/media/hls/{key}/index.m3u8"),
+    )?))
+}
+
+#[utoipa::path(get, path = "/api/v1/media/hls/{key}/{file}", tag = "media", params(("key" = String, Path), ("file" = String, Path)), security(("sessionCookie" = [])), responses((status = 200, description = "HLS playlist or MPEG-TS segment"), (status = 206, description = "Partial HLS asset")))]
+async fn hls_file(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    AxumPath((key, file)): AxumPath<(String, String)>,
+) -> ApiResult<Response> {
+    require_session(&state, &jar)?;
+    serve_hls_asset(&state, &headers, &key, &file).await
+}
+
+#[utoipa::path(post, path = "/api/v1/delegated/sessions/{session_id}/files/{reference}/hls", tag = "apps", params(("session_id" = String, Path), ("reference" = String, Path), ("x-app-csrf-token" = String, Header)), responses((status = 200, body = HlsResponse), (status = 202, body = HlsResponse)))]
+async fn delegated_start_hls(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    AxumPath((session_id, reference)): AxumPath<(String, String)>,
+) -> ApiResult<(StatusCode, Json<HlsResponse>)> {
+    let capability = require_app_capability(&state, &jar, &session_id)?;
+    require_video_studio_hls(&capability)?;
+    require_app_csrf(&capability, &headers)?;
+    let file = delegated_file(&capability, &reference)?;
+    if !file.mime.starts_with("video/") {
+        return Err(ApiError::bad(
+            "not_video",
+            "HLS conversion is available only for video files",
+        ));
+    }
+    let source = validate_delegated_file(&state, &file).await?;
+    let base = format!("/api/v1/delegated/sessions/{session_id}/files/{reference}/hls");
+    let (status, response) = prepare_hls(&state, &file.id, &source, |key| {
+        format!("{base}/{key}/index.m3u8")
+    })
+    .await?;
+    Ok((status, Json(response)))
+}
+
+#[utoipa::path(get, path = "/api/v1/delegated/sessions/{session_id}/files/{reference}/hls/{key}/status", tag = "apps", params(("session_id" = String, Path), ("reference" = String, Path), ("key" = String, Path)), responses((status = 200, body = HlsResponse)))]
+async fn delegated_hls_status(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    AxumPath((session_id, reference, key)): AxumPath<(String, String, String)>,
+) -> ApiResult<Json<HlsResponse>> {
+    let capability = require_app_capability(&state, &jar, &session_id)?;
+    require_video_studio_hls(&capability)?;
+    let file = delegated_file(&capability, &reference)?;
+    if hls_key_for_delegated_file(&state, &file).await? != key {
+        return Err(ApiError::forbidden(
+            "media_not_delegated",
+            "This stream was not delegated to the app",
+        ));
+    }
+    let playlist_url =
+        format!("/api/v1/delegated/sessions/{session_id}/files/{reference}/hls/{key}/index.m3u8");
+    Ok(Json(hls_status_for(&state, &key, playlist_url)?))
+}
+
+#[utoipa::path(get, path = "/api/v1/delegated/sessions/{session_id}/files/{reference}/hls/{key}/{file}", tag = "apps", params(("session_id" = String, Path), ("reference" = String, Path), ("key" = String, Path), ("file" = String, Path)), responses((status = 200, description = "Delegated HLS asset"), (status = 206, description = "Delegated partial HLS asset")))]
+async fn delegated_hls_file(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    AxumPath((session_id, reference, key, file_name)): AxumPath<(String, String, String, String)>,
+) -> ApiResult<Response> {
+    let capability = require_app_capability(&state, &jar, &session_id)?;
+    require_video_studio_hls(&capability)?;
+    let file = delegated_file(&capability, &reference)?;
+    if hls_key_for_delegated_file(&state, &file).await? != key {
+        return Err(ApiError::forbidden(
+            "media_not_delegated",
+            "This stream was not delegated to the app",
+        ));
+    }
+    serve_hls_asset(&state, &headers, &key, &file_name).await
+}
+
 fn spawn_cache_cleanup(state: AppState) {
     tokio::spawn(async move {
         loop {
@@ -4246,10 +5389,42 @@ fn spawn_cache_cleanup(state: AppState) {
     });
 }
 
-async fn reconcile_cache(state: &AppState) -> ApiResult<CacheCleanupReport> {
+fn directory_stats(path: &Path) -> (u64, SystemTime) {
+    let mut size = 0;
+    let mut access = SystemTime::UNIX_EPOCH;
+    if let Ok(read) = std::fs::read_dir(path) {
+        for item in read.flatten() {
+            if let Ok(meta) = item.metadata() {
+                if meta.is_dir() {
+                    let (child_size, child_access) = directory_stats(&item.path());
+                    size += child_size;
+                    access = access.max(child_access);
+                } else {
+                    size += meta.len();
+                    access = access.max(meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH));
+                }
+            }
+        }
+    }
+    (size, access)
+}
+
+fn remove_cache_artifact(path: &Path, directory: bool) -> std::io::Result<()> {
+    if directory {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+async fn reconcile_cache(
+    state: &AppState,
+    active: &HashSet<String>,
+) -> ApiResult<CacheCleanupReport> {
     let root = state.config.root.clone();
     let cache = state.config.cache.clone();
     let index = state.cache_index.read().await.clone();
+    let active = active.clone();
     let (index, report) = tokio::task::spawn_blocking(move || {
         let mut index = index;
         let mut report = CacheCleanupReport::default();
@@ -4257,6 +5432,9 @@ async fn reconcile_cache(state: &AppState) -> ApiResult<CacheCleanupReport> {
             .records
             .iter()
             .filter_map(|(record_id, record)| {
+                if record.kind == "hls" && active.contains(&record.key) {
+                    return None;
+                }
                 let artifact = cache_artifact_path(&cache, record);
                 let source = decode_path(&record.source_id)
                     .ok()
@@ -4269,17 +5447,23 @@ async fn reconcile_cache(state: &AppState) -> ApiResult<CacheCleanupReport> {
                             && meta.len() == record.source_size
                             && source_modified_ns(&meta) == record.source_modified_ns
                     });
-                let artifact_valid = artifact.exists();
+                let artifact_valid =
+                    artifact.exists() && (record.kind != "hls" || playlist_state(&artifact).1);
                 (!source_valid || !artifact_valid).then_some((record_id.clone(), record.clone()))
             })
             .collect::<Vec<_>>();
         for (record_id, record) in stale {
             let artifact = cache_artifact_path(&cache, &record);
             if artifact.exists() {
-                let bytes = std::fs::metadata(&artifact)
-                    .map(|meta| meta.len())
-                    .unwrap_or(0);
-                if std::fs::remove_file(&artifact).is_ok() {
+                let directory = record.kind == "hls";
+                let bytes = if directory {
+                    directory_stats(&artifact).0
+                } else {
+                    std::fs::metadata(&artifact)
+                        .map(|meta| meta.len())
+                        .unwrap_or(0)
+                };
+                if remove_cache_artifact(&artifact, directory).is_ok() {
                     report.artifacts_removed += 1;
                     report.bytes_reclaimed += bytes;
                 }
@@ -4293,6 +5477,25 @@ async fn reconcile_cache(state: &AppState) -> ApiResult<CacheCleanupReport> {
             .filter(|record| record.kind == "thumbnail")
             .map(|record| format!("{}.webp", record.key))
             .collect::<HashSet<_>>();
+        let referenced_hls = index
+            .records
+            .values()
+            .filter(|record| record.kind == "hls")
+            .map(|record| record.key.clone())
+            .collect::<HashSet<_>>();
+        if let Ok(read) = std::fs::read_dir(cache.join("hls")) {
+            for item in read.flatten() {
+                let key = item.file_name().to_string_lossy().into_owned();
+                if referenced_hls.contains(&key) || active.contains(&key) {
+                    continue;
+                }
+                let bytes = directory_stats(&item.path()).0;
+                if std::fs::remove_dir_all(item.path()).is_ok() {
+                    report.artifacts_removed += 1;
+                    report.bytes_reclaimed += bytes;
+                }
+            }
+        }
         if let Ok(read) = std::fs::read_dir(cache.join("thumbnails")) {
             for item in read.flatten() {
                 let name = item.file_name().to_string_lossy().into_owned();
@@ -4315,12 +5518,12 @@ async fn reconcile_cache(state: &AppState) -> ApiResult<CacheCleanupReport> {
     Ok(report)
 }
 
-async fn evict_cache(state: &AppState) -> ApiResult<(u64, u64)> {
+async fn evict_cache(state: &AppState, active: HashSet<String>) -> ApiResult<(u64, u64)> {
     let max_age = Duration::from_secs(state.config.cache_age_days * 24 * 60 * 60);
     let cache = state.config.cache.clone();
     let max_bytes = state.config.cache_max;
     tokio::task::spawn_blocking(move || {
-        let mut units = Vec::<(PathBuf, u64, SystemTime)>::new();
+        let mut units = Vec::<(PathBuf, u64, SystemTime, bool)>::new();
         if let Ok(read) = std::fs::read_dir(cache.join("thumbnails")) {
             for item in read.flatten() {
                 if let Ok(meta) = item.metadata()
@@ -4330,34 +5533,44 @@ async fn evict_cache(state: &AppState) -> ApiResult<(u64, u64)> {
                         item.path(),
                         meta.len(),
                         meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH),
+                        false,
                     ));
+                }
+            }
+        }
+        if let Ok(read) = std::fs::read_dir(cache.join("hls")) {
+            for item in read.flatten() {
+                let key = item.file_name().to_string_lossy().into_owned();
+                if item.file_type().is_ok_and(|kind| kind.is_dir()) && !active.contains(&key) {
+                    let (size, access) = directory_stats(&item.path());
+                    units.push((item.path(), size, access, true));
                 }
             }
         }
         let now = SystemTime::now();
         let mut removed_count = 0;
         let mut reclaimed = 0;
-        for (path, _, access) in &units {
+        for (path, _, access, directory) in &units {
             if now.duration_since(*access).unwrap_or_default() > max_age {
                 let bytes = units
                     .iter()
-                    .find(|(candidate, _, _)| candidate == path)
-                    .map(|(_, size, _)| *size)
+                    .find(|(candidate, _, _, _)| candidate == path)
+                    .map(|(_, size, _, _)| *size)
                     .unwrap_or(0);
-                if std::fs::remove_file(path).is_ok() {
+                if remove_cache_artifact(path, *directory).is_ok() {
                     removed_count += 1;
                     reclaimed += bytes;
                 }
             }
         }
-        units.retain(|(path, _, _)| path.exists());
-        let mut total: u64 = units.iter().map(|(_, size, _)| *size).sum();
-        units.sort_by_key(|(_, _, access)| *access);
-        for (path, size, _) in units {
+        units.retain(|(path, _, _, _)| path.exists());
+        let mut total: u64 = units.iter().map(|(_, size, _, _)| *size).sum();
+        units.sort_by_key(|(_, _, access, _)| *access);
+        for (path, size, _, directory) in units {
             if total <= max_bytes.saturating_mul(9) / 10 {
                 break;
             }
-            let removed = std::fs::remove_file(path);
+            let removed = remove_cache_artifact(&path, directory);
             if removed.is_ok() {
                 total = total.saturating_sub(size);
                 removed_count += 1;
@@ -4374,8 +5587,14 @@ async fn evict_cache(state: &AppState) -> ApiResult<(u64, u64)> {
 async fn cleanup_cache(state: &AppState) -> ApiResult<CacheCleanupReport> {
     let _cleanup = state.cache_cleanup.lock().await;
     let _write = state.cache_write.lock().await;
-    let mut report = reconcile_cache(state).await?;
-    let (evicted, reclaimed) = evict_cache(state).await?;
+    let active = state
+        .media_jobs
+        .iter()
+        .filter(|job| job.status == "working")
+        .map(|job| job.key.clone())
+        .collect::<HashSet<_>>();
+    let mut report = reconcile_cache(state, &active).await?;
+    let (evicted, reclaimed) = evict_cache(state, active).await?;
     report.artifacts_removed += evicted;
     report.bytes_reclaimed += reclaimed;
     let mut index = state.cache_index.read().await.clone();
@@ -4396,6 +5615,7 @@ mod tests {
     fn test_state(root: &Path, token: Option<&str>) -> AppState {
         let cache = root.join(".cache/remote-file-browser");
         std::fs::create_dir_all(cache.join("thumbnails")).unwrap();
+        std::fs::create_dir_all(cache.join("hls")).unwrap();
         let trash = root.join(".trash");
         std::fs::create_dir_all(trash.join("items")).unwrap();
         let (events, _) = broadcast::channel(16);
@@ -4430,6 +5650,10 @@ mod tests {
             terminal_slots: Arc::new(Semaphore::new(2)),
             app_launches: Arc::new(DashMap::new()),
             app_capabilities: Arc::new(DashMap::new()),
+            direct_playable: Arc::new(DashMap::new()),
+            media_jobs: Arc::new(DashMap::new()),
+            hls_start: Arc::new(Mutex::new(())),
+            extraction_jobs: Arc::new(DashMap::new()),
         }
     }
 
@@ -5043,6 +6267,18 @@ mod tests {
                 &["get"][..],
             ),
             (
+                "/api/v1/delegated/sessions/{session_id}/files/{reference}/hls",
+                &["post"][..],
+            ),
+            (
+                "/api/v1/delegated/sessions/{session_id}/files/{reference}/hls/{key}/status",
+                &["get"][..],
+            ),
+            (
+                "/api/v1/delegated/sessions/{session_id}/files/{reference}/hls/{key}/{file}",
+                &["get"][..],
+            ),
+            (
                 "/api/v1/delegated/sessions/{session_id}/outputs",
                 &["post"][..],
             ),
@@ -5062,6 +6298,13 @@ mod tests {
             ("/api/v1/trash/{id}", &["delete"][..]),
             ("/api/v1/previews/thumbnail", &["get"][..]),
             ("/api/v1/media/file", &["get"][..]),
+            ("/api/v1/media/info", &["get"][..]),
+            ("/api/v1/media/hls", &["post"][..]),
+            ("/api/v1/media/jobs", &["get"][..]),
+            ("/api/v1/media/hls/{key}/status", &["get"][..]),
+            ("/api/v1/media/hls/{key}/{file}", &["get"][..]),
+            ("/api/v1/media/extractions", &["post"][..]),
+            ("/api/v1/media/extractions/{key}", &["get"][..]),
             ("/api/v1/terminal/tickets", &["post"][..]),
             ("/api/v1/terminal/ws", &["get"][..]),
         ] {
@@ -5277,6 +6520,92 @@ mod tests {
             "The video duration is missing or invalid"
         );
     }
+
+    #[test]
+    fn browser_compatibility_is_conservative_about_containers_and_codecs() {
+        let compatible_mp4: BrowserProbe = serde_json::from_str(
+            r#"{"streams":[{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p"},{"codec_type":"audio","codec_name":"aac"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2"}}"#,
+        )
+        .unwrap();
+        let incompatible_mp4: BrowserProbe = serde_json::from_str(
+            r#"{"streams":[{"codec_type":"video","codec_name":"hevc","pix_fmt":"yuv420p"}],"format":{"format_name":"mov,mp4"}}"#,
+        )
+        .unwrap();
+        let compatible_webm: BrowserProbe = serde_json::from_str(
+            r#"{"streams":[{"codec_type":"video","codec_name":"vp9","pix_fmt":"yuv420p"},{"codec_type":"audio","codec_name":"opus"}],"format":{"format_name":"matroska,webm"}}"#,
+        )
+        .unwrap();
+        assert!(browser_compatible_source(&compatible_mp4));
+        assert!(!browser_compatible_source(&incompatible_mp4));
+        assert!(browser_compatible_source(&compatible_webm));
+        assert_ne!(
+            browser_compatibility_cache_key("video", "etag-one"),
+            browser_compatibility_cache_key("video", "etag-two")
+        );
+    }
+
+    #[test]
+    fn extraction_times_names_and_commands_are_stable() {
+        assert!(valid_media_time(0.0, 10.0));
+        assert!(valid_media_time(9.999, 10.0));
+        assert!(!valid_media_time(10.0, 10.0));
+        assert!(!valid_media_time(f64::NAN, 10.0));
+        assert_eq!(media_timestamp_label(3661.234), "01-01-01.234");
+
+        let command = frame_extraction_command(
+            Path::new("/videos/source.mp4"),
+            Path::new("/videos/frame.png"),
+            12.3456789,
+        );
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            [
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                "12.345679",
+                "-accurate_seek",
+                "-i",
+                "/videos/source.mp4",
+                "-map",
+                "0:v:0",
+                "-frames:v",
+                "1",
+                "-y",
+                "/videos/frame.png",
+            ]
+        );
+
+        let segment = segment_extraction_command(
+            Path::new("/videos/source.mp4"),
+            Path::new("/videos/clip.mp4"),
+            1.25,
+            3.75,
+        );
+        let segment_arguments = segment
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            segment_arguments
+                .windows(2)
+                .any(|pair| pair == ["-t", "2.500000"])
+        );
+        assert!(
+            segment_arguments
+                .windows(2)
+                .any(|pair| pair == ["-c:v", "libx264"])
+        );
+        assert!(segment_arguments.contains(&"+faststart".into()));
+    }
     #[tokio::test]
     async fn directory_property_counts_are_immediate_and_hide_internal_storage() {
         let root = tempfile::tempdir().unwrap();
@@ -5332,6 +6661,76 @@ mod tests {
             .unwrap(),
             serde_json::json!({ "type": "filesystem", "directoryIds": ["folder"] })
         );
+        let job = MediaJob {
+            key: "a".repeat(64),
+            file_name: "clip.wmv".into(),
+            status: "working".into(),
+            playable: false,
+            mode: "full".into(),
+            started_at: Utc::now(),
+            progress: Some(0.25),
+            error: None,
+            source_id: "clip.wmv".into(),
+        };
+        let value = serde_json::to_value(LiveEvent::MediaJob { job: Box::new(job) }).unwrap();
+        assert_eq!(value["type"], "mediaJob");
+        assert_eq!(value["job"]["fileName"], "clip.wmv");
+        assert_eq!(value["job"]["progress"], 0.25);
+        assert!(value["job"].get("sourceId").is_none());
+    }
+
+    #[test]
+    fn hls_conversion_modes_and_paths_are_constrained() {
+        let probe = |video: (&str, &str), audio: Option<&str>| BrowserProbe {
+            streams: std::iter::once(BrowserProbeStream {
+                codec_type: Some("video".into()),
+                codec_name: Some(video.0.into()),
+                pix_fmt: Some(video.1.into()),
+            })
+            .chain(audio.map(|codec| BrowserProbeStream {
+                codec_type: Some("audio".into()),
+                codec_name: Some(codec.into()),
+                pix_fmt: None,
+            }))
+            .collect(),
+            format: None,
+        };
+        assert_eq!(
+            conversion_mode(&probe(("h264", "yuv420p"), Some("aac"))),
+            ConversionMode::Remux
+        );
+        assert_eq!(
+            conversion_mode(&probe(("h264", "yuv420p"), Some("flac"))),
+            ConversionMode::Audio
+        );
+        assert_eq!(
+            conversion_mode(&probe(("hevc", "yuv420p"), Some("aac"))),
+            ConversionMode::Full
+        );
+        assert!(valid_hls_key(&"a".repeat(64)));
+        assert!(!valid_hls_key("../cache"));
+        assert!(valid_hls_asset("index.m3u8"));
+        assert!(valid_hls_asset("segment-00042.ts"));
+        assert!(!valid_hls_asset("segment-42.ts"));
+        assert!(!valid_hls_asset("../index.m3u8"));
+    }
+
+    #[test]
+    fn progressive_playlist_is_playable_before_it_is_complete() {
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(cache.path().join("segment-00000.ts"), b"segment").unwrap();
+        std::fs::write(
+            cache.path().join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:4.0,\nsegment-00000.ts\n",
+        )
+        .unwrap();
+        assert_eq!(playlist_state(cache.path()), (true, false));
+        std::fs::write(
+            cache.path().join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:4.0,\nsegment-00000.ts\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        assert_eq!(playlist_state(cache.path()), (true, true));
     }
     #[test]
     fn live_watch_messages_and_events_target_loaded_directories() {

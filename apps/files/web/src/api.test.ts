@@ -58,3 +58,42 @@ describe('archive extraction', () => {
     expect((init.headers as Headers).get('x-csrf-token')).toBe('csrf-token')
   })
 })
+
+describe('video extraction', () => {
+  it('reads media metadata and starts authenticated extraction jobs', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ durationSeconds: 12, frameRate: 24 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ key: 'job', kind: 'frame', status: 'working' }), { status: 202 }))
+    vi.stubGlobal('fetch', fetchMock)
+    setCsrf('csrf-token')
+
+    await expect(api.mediaInfo('folder/clip.mp4')).resolves.toEqual({ durationSeconds: 12, frameRate: 24 })
+    await api.startExtraction({ id: 'folder/clip.mp4', kind: 'frame', time: 1.25 })
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/media/info?id=folder%2Fclip.mp4')
+    const [path, init] = fetchMock.mock.calls[1]
+    expect(path).toBe('/api/v1/media/extractions')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body as string)).toEqual({ id: 'folder/clip.mp4', kind: 'frame', time: 1.25 })
+    expect((init.headers as Headers).get('x-csrf-token')).toBe('csrf-token')
+  })
+
+  it('starts and polls shared HLS conversion jobs', async () => {
+    const job = { key: 'a'.repeat(64), status: 'working', playable: false, mode: 'full', progress: 0, playlistUrl: '/api/v1/media/hls/key/index.m3u8' }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(job), { status: 202 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...job, playable: true }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    setCsrf('csrf-token')
+
+    await api.startHls('folder/legacy clip.wmv')
+    await api.hlsStatus(job.key)
+
+    const [path, init] = fetchMock.mock.calls[0]
+    expect(path).toBe('/api/v1/media/hls')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body as string)).toEqual({ id: 'folder/legacy clip.wmv' })
+    expect((init.headers as Headers).get('x-csrf-token')).toBe('csrf-token')
+    expect(fetchMock.mock.calls[1][0]).toBe(`/api/v1/media/hls/${job.key}/status`)
+  })
+})

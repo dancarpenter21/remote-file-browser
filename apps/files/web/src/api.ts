@@ -16,6 +16,7 @@ export type Entry = {
   symlinkTarget?: string
   etag: string
   hasProvenance: boolean
+  browserReady: boolean
   childFileCount?: number
   childDirectoryCount?: number
 }
@@ -33,10 +34,45 @@ export type TrashEntry = {
 }
 export type Provenance = { urls: string[] }
 export type ProvenanceChange = { id: string; path?: string; urls: string[] }
+export type MediaInfo = { durationSeconds: number; frameRate: number | null }
+export type ConversionMode = 'remux' | 'audio' | 'full'
+export type ConversionJob = {
+  key: string
+  fileName: string
+  status: 'working' | 'ready' | 'failed'
+  playable: boolean
+  mode: ConversionMode
+  startedAt: string
+  progress: number | null
+  error?: string
+}
+export type HlsJob = {
+  key: string
+  status: 'working' | 'ready' | 'failed' | 'missing'
+  playlistUrl: string
+  playable: boolean
+  mode: ConversionMode
+  progress: number | null
+  error?: string
+}
+export type ExtractionJob = {
+  key: string
+  fileName: string
+  kind: 'frame' | 'segment'
+  status: 'working' | 'ready' | 'failed'
+  time?: number
+  startTime?: number
+  endTime?: number
+  startedAt: string
+  error?: string
+  result?: Entry
+}
 export type LiveEvent =
   | { type: 'resync' }
   | { type: 'filesystem'; directoryIds: string[] }
   | { type: 'provenance'; change: ProvenanceChange }
+  | { type: 'mediaSnapshot'; jobs: ConversionJob[] }
+  | { type: 'mediaJob'; job: ConversionJob }
 
 export class ApiFailure extends Error {
   constructor(public status: number, public code: string, message: string) { super(message) }
@@ -122,6 +158,13 @@ export const api = {
   setProvenance: (id: string, urls: string[]) => request<Provenance>(`/fs/provenance?id=${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify({ urls }) }),
   readDocument: (id: string) => request<DocumentFile>(`/editor/document?id=${encodeURIComponent(id)}`),
   saveDocument: (document: DocumentFile) => request<DocumentFile>('/editor/document', { method: 'PUT', body: JSON.stringify({ id: document.id, content: document.content, expectedEtag: document.etag }) }),
+  mediaInfo: (id: string) => request<MediaInfo>(`/media/info?id=${encodeURIComponent(id)}`),
+  startHls: (id: string) => request<HlsJob>('/media/hls', { method: 'POST', body: JSON.stringify({ id }) }),
+  hlsStatus: (key: string) => request<HlsJob>(`/media/hls/${encodeURIComponent(key)}/status`),
+  conversionJobs: () => request<ConversionJob[]>('/media/jobs'),
+  startExtraction: (input: { id: string; kind: 'frame'; time: number } | { id: string; kind: 'segment'; startTime: number; endTime: number }) =>
+    request<ExtractionJob>('/media/extractions', { method: 'POST', body: JSON.stringify(input) }),
+  extractionStatus: (key: string) => request<ExtractionJob>(`/media/extractions/${encodeURIComponent(key)}`),
   trash: (ids: string[]) => request<void>('/fs/trash', { method: 'POST', body: JSON.stringify({ ids }) }),
   listTrash: () => request<TrashEntry[]>('/trash'),
   restore: (id: string, destinationId?: string, replace = false) => request<Entry>(`/trash/${id}/restore`, { method: 'POST', body: JSON.stringify({ destinationId, replace }) }),

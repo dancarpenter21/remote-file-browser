@@ -1,11 +1,12 @@
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import Hls from 'hls.js'
 import {
-  ArchiveRestore, Check, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
+  ArchiveRestore, Camera, Check, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
   Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal,
-  ExternalLink, Link2, Minus, Plus, RefreshCw, Save, Scissors, Search, SquareTerminal, Trash2, Upload, X,
+  ExternalLink, Link2, Minus, Play, Plus, RefreshCw, Save, Scissors, Search, SquareTerminal, Trash2, Upload, X,
 } from 'lucide-react'
-import { api, ApiFailure, contentUrl, type DocumentFile, Entry, EntryPage, InstalledApp, LiveEvent, liveEventsUrl, liveFilesystemWatchMessage, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
+import { api, ApiFailure, contentUrl, type ConversionJob, type DocumentFile, Entry, EntryPage, InstalledApp, LiveEvent, liveEventsUrl, liveFilesystemWatchMessage, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { deleteConfirmationMessage } from './deleteConfirmation'
 import { updateFinderPathForSelection } from './finderPath'
 import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState'
@@ -21,6 +22,8 @@ import { useUploadQueue, type UploadConflictChoice } from './UploadQueue'
 import { isExternalFileDrag, manifestFromDrop, manifestFromFiles } from './uploadIntake'
 import { conflictSummary, type UploadConflict } from './uploadPlanning'
 import { isExtractableArchive } from './archiveExtraction'
+import { createPlaybackFallbackGate, DIRECT_PLAYBACK_TIMEOUT_MS, formatMediaTime, hlsRecoveryAction, ignoresVideoShortcut, shouldAutoLoop, stepFrameTime, validSegment } from './videoPlayerState'
+import { progressPercent, upsertJob } from './mediaJobState'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type ConfirmOptions = { title?: string; confirmLabel?: string; danger?: boolean }
@@ -145,6 +148,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [installedApps, setInstalledApps] = useState<InstalledApp[]>([])
   const [trash, setTrash] = useState<TrashEntry[] | null>(null)
   const [error, setError] = useState('')
+  const [conversionJobs, setConversionJobs] = useState<ConversionJob[]>([])
   const [folderMenu, setFolderMenu] = useState<{ directoryId: string; path: string; x: number; y: number } | null>(null)
   const [properties, setProperties] = useState<{ id: string; initial?: Entry } | null>(null)
   const [openFile, setOpenFile] = useState<{ entry: Entry; kind: BasicFileKind } | null>(null)
@@ -265,6 +269,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
           if (event.type === 'resync') resync()
           else if (event.type === 'filesystem') schedule(event.directoryIds)
           else if (event.type === 'provenance') dispatchEvent(new CustomEvent<ProvenanceChange>('rfb:provenance-changed', { detail: event.change }))
+          else if (event.type === 'mediaSnapshot') setConversionJobs(event.jobs)
+          else if (event.type === 'mediaJob') setConversionJobs(jobs => upsertJob(jobs, event.job))
         } catch { resync() }
       }
       connection.onclose = () => {
@@ -581,6 +587,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         <button className="nav-item active" onClick={() => { goToRoot(); setDrawerOpen(false) }}><Folder size={17} /> Files</button>
         <button className="nav-item" onClick={() => { void openTrash(); setDrawerOpen(false) }}><Trash2 size={17} /> Trash</button>
         {session.terminalEnabled && <button className={`nav-item ${terminal && !terminal.hidden ? 'active' : ''}`} aria-pressed={Boolean(terminal && !terminal.hidden)} onClick={() => { toggleTerminal(); setDrawerOpen(false) }}><SquareTerminal size={17} /> Terminal</button>}
+        <ConversionJobs jobs={conversionJobs} />
         <div className="aside-note"><span>Signed in as</span><strong>{session.username}</strong>{isMobile && <button onClick={() => void logout()}><LogOut /> Sign out</button>}</div>
       </aside>
       <div className="content-stack">
@@ -642,6 +649,19 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     {uploadQueue.panel}
     <div id="window-tray" className="window-tray" role="region" aria-label="Minimized windows" />
   </div></InstalledAppsContext.Provider></ArchiveExtractionContext.Provider>
+}
+
+function ConversionJobs({ jobs }: { jobs: ConversionJob[] }) {
+  const working = jobs.some(job => job.status === 'working')
+  return <section className="conversion-jobs" aria-label="Video conversions">
+    <div className="conversion-jobs-heading"><Film /> Video conversions{working && <span className="conversion-pulse" aria-label="Conversion active" />}</div>
+    <div className="conversion-job-list">
+      {jobs.length === 0 ? <p>No converted videos yet.</p> : jobs.map(job => <article className={`conversion-job ${job.status}`} key={job.key} title={job.error}>
+        <span className="conversion-status" />
+        <div><strong>{job.fileName}</strong><small>{job.status === 'working' ? `${job.mode} · ${progressPercent(job.progress)}%` : `${job.mode} · ${job.status}`}</small>{job.status === 'working' && <progress max={1} value={job.progress ?? 0} />}</div>
+      </article>)}
+    </div>
+  </section>
 }
 
 type BrowserColumn = { directoryId: string; page?: EntryPage; label: string }
@@ -926,7 +946,7 @@ function FileList({ rows, view, selected, cutIds, setSelected, setPrimary, activ
   return <div className={`preview-list ${view}`}>
     {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} data-upload-directory-id={entry.kind === 'directory' ? entry.id : undefined} data-upload-directory-path={entry.kind === 'directory' ? entry.path : undefined} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => selectEntry(entry, index, event)} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
       <button className="card-menu" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>
-      {entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : entry.mime.startsWith('image/') || (view !== 'small' && entry.mime.startsWith('video/')) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view, entry.etag)} loading="lazy" /></button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
+      {entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : entry.mime.startsWith('image/') || (view !== 'small' && entry.mime.startsWith('video/')) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view, entry.etag)} loading="lazy" /><FileBadges entry={entry} /></button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
       <button className="filename" tabIndex={-1} title={entry.name}>{entry.name}</button>
       {view !== 'small' && <small>{formatBytes(entry.size)}</small>}
     </div>)}
@@ -1229,8 +1249,22 @@ function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: 
   const videoStudioEnabled = useContext(VideoStudioContext)
   const [error, setError] = useState('')
   const [openingStudio, setOpeningStudio] = useState(false)
-  const fallbackStarted = useRef(false)
+  const [currentTime, setCurrentTime] = useState(0)
+  const [duration, setDuration] = useState(0)
+  const [frameRate, setFrameRate] = useState<number>()
+  const [markIn, setMarkIn] = useState<number>()
+  const [markOut, setMarkOut] = useState<number>()
+  const [extracting, setExtracting] = useState(false)
+  const [actionMessage, setActionMessage] = useState('')
+  const [playbackMessage, setPlaybackMessage] = useState('')
+  const [usingFallback, setUsingFallback] = useState(false)
+  const [hlsPlaylist, setHlsPlaylist] = useState('')
+  const fallbackGate = useRef(createPlaybackFallbackGate())
+  const cancelled = useRef(false)
   const videoRef = useRef<HTMLVideoElement>(null)
+  const hlsRef = useRef<Hls | null>(null)
+  const readinessTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const stallTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const source = mediaUrl(entry.id, entry.etag)
   const imageIndex = images.findIndex(image => image.id === entry.id)
   const navigate = useCallback((direction: -1 | 1) => {
@@ -1238,7 +1272,19 @@ function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: 
     const current = imageIndex >= 0 ? imageIndex : 0
     onNavigate(images[(current + direction + images.length) % images.length])
   }, [imageIndex, images, onNavigate])
-  useEffect(() => { setError('') }, [entry.id])
+  useEffect(() => {
+    cancelled.current = false
+    fallbackGate.current.reset()
+    clearTimeout(readinessTimer.current); clearTimeout(stallTimer.current); hlsRef.current?.destroy(); hlsRef.current = null
+    setError(''); setCurrentTime(0); setDuration(0); setFrameRate(undefined); setMarkIn(undefined); setMarkOut(undefined); setExtracting(false); setActionMessage(''); setPlaybackMessage(''); setUsingFallback(false); setHlsPlaylist('')
+    if (kind === 'video') void api.mediaInfo(entry.id).then(info => {
+      if (!cancelled.current) { setDuration(info.durationSeconds); setFrameRate(info.frameRate ?? undefined) }
+    }).catch(reason => { if (!cancelled.current) setActionMessage(messageOf(reason)) })
+    return () => {
+      cancelled.current = true
+      clearTimeout(readinessTimer.current); clearTimeout(stallTimer.current); hlsRef.current?.destroy(); hlsRef.current = null
+    }
+  }, [entry.id, kind])
   useLayoutEffect(() => {
     if (kind !== 'video' || !videoRef.current) return
     videoRef.current.volume = 0
@@ -1255,36 +1301,150 @@ function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: 
     addEventListener('keydown', keyboard, { capture: true })
     return () => removeEventListener('keydown', keyboard, { capture: true })
   }, [kind, navigate])
-  const openStudioFallback = useCallback(async () => {
-    if (fallbackStarted.current) return
-    fallbackStarted.current = true
-    setOpeningStudio(true); setError('')
-    try {
-      await launchInstalledApp('/apps/video/?handoff=1', (url, target) => window.open(url, target), () => api.launchApp('video-studio', 'edit', [entry.id]))
-      onClose()
-    } catch (reason) {
-      fallbackStarted.current = false; setOpeningStudio(false)
-      setError(`Browser playback failed, and Video Studio could not open: ${messageOf(reason)}`)
-    }
-  }, [entry.id, onClose])
   const openStudioWindow = useCallback(async () => {
+    setOpeningStudio(true)
     try {
       await launchInstalledApp('/apps/video/?handoff=1', (url, target) => window.open(url, target), () => api.launchApp('video-studio', 'edit', [entry.id]))
     } catch (reason) { setError(messageOf(reason)) }
+    finally { setOpeningStudio(false) }
   }, [entry.id])
-  const videoFailed = () => {
-    if (!videoStudioEnabled) { setError('This browser could not play the video.'); return }
-    void openStudioFallback()
+  const attachHls = useCallback((playlistUrl: string) => {
+    const video = videoRef.current
+    if (!video || cancelled.current) return
+    clearTimeout(readinessTimer.current); clearTimeout(stallTimer.current)
+    hlsRef.current?.destroy(); hlsRef.current = null
+    setPlaybackMessage('Starting converted video…')
+    if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = playlistUrl
+      video.play().catch(() => undefined)
+      return
+    }
+    if (!Hls.isSupported()) {
+      setPlaybackMessage(''); setError('This browser cannot play HLS video.')
+      return
+    }
+    const hls = new Hls()
+    let networkRecoveries = 0
+    let mediaRecoveries = 0
+    hlsRef.current = hls
+    hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(playlistUrl))
+    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => undefined))
+    hls.on(Hls.Events.ERROR, (_event, data) => {
+      if (!data.fatal) return
+      const action = hlsRecoveryAction(data.type, networkRecoveries, mediaRecoveries)
+      if (action === 'retry-network') { networkRecoveries += 1; hls.startLoad(); return }
+      if (action === 'recover-media') { mediaRecoveries += 1; hls.recoverMediaError(); return }
+      hls.destroy(); hlsRef.current = null
+      if (!cancelled.current) { setPlaybackMessage(''); setError('The converted video stream could not be played.') }
+    })
+    hls.attachMedia(video)
+  }, [])
+  useEffect(() => {
+    if (kind === 'video' && usingFallback && hlsPlaylist) attachHls(hlsPlaylist)
+  }, [attachHls, hlsPlaylist, kind, usingFallback])
+  const startPlaybackFallback = useCallback(async () => {
+    if (!fallbackGate.current.claim()) return
+    clearTimeout(readinessTimer.current); clearTimeout(stallTimer.current)
+    setUsingFallback(true)
+    const video = videoRef.current
+    if (video) { video.pause(); video.removeAttribute('src'); video.load() }
+    setError(''); setPlaybackMessage('Preparing a browser-compatible video…')
+    try {
+      let job = await api.startHls(entry.id)
+      while (!job.playable && job.status === 'working' && !cancelled.current) {
+        setPlaybackMessage(`Converting video… ${progressPercent(job.progress)}%`)
+        await new Promise(resolve => setTimeout(resolve, 700))
+        if (!cancelled.current) job = await api.hlsStatus(job.key)
+      }
+      if (cancelled.current) return
+      if (!job.playable) throw new Error(job.error ?? 'Video conversion failed.')
+      setHlsPlaylist(job.playlistUrl)
+    } catch (reason) {
+      if (!cancelled.current) { setPlaybackMessage(''); setError(messageOf(reason)) }
+    }
+  }, [entry.id])
+  useEffect(() => {
+    if (kind !== 'video') return
+    if (!entry.browserReady) { void startPlaybackFallback(); return }
+    readinessTimer.current = setTimeout(() => void startPlaybackFallback(), DIRECT_PLAYBACK_TIMEOUT_MS)
+    return () => clearTimeout(readinessTimer.current)
+  }, [entry.browserReady, entry.id, kind, startPlaybackFallback])
+  const directPlaybackReady = () => {
+    clearTimeout(readinessTimer.current); readinessTimer.current = undefined
+    clearTimeout(stallTimer.current); stallTimer.current = undefined
+    setPlaybackMessage('')
   }
+  const directPlaybackWaiting = () => {
+    if (fallbackGate.current.started || stallTimer.current) return
+    stallTimer.current = setTimeout(() => { stallTimer.current = undefined; void startPlaybackFallback() }, DIRECT_PLAYBACK_TIMEOUT_MS)
+  }
+  const stepFrame = (direction: -1 | 1) => {
+    const video = videoRef.current
+    if (!video || !frameRate || !duration) return
+    video.pause()
+    const next = stepFrameTime(video.currentTime, direction, frameRate, duration)
+    video.currentTime = next; setCurrentTime(next)
+  }
+  const awaitExtraction = async (job: Awaited<ReturnType<typeof api.startExtraction>>) => {
+    setExtracting(true)
+    setActionMessage(job.kind === 'frame' ? 'Extracting frame…' : 'Extracting segment…')
+    try {
+      let current = job
+      while (current.status === 'working' && !cancelled.current) {
+        await new Promise(resolve => setTimeout(resolve, 700))
+        if (!cancelled.current) current = await api.extractionStatus(current.key)
+      }
+      if (cancelled.current) return
+      if (current.status !== 'ready') throw new Error(current.error ?? 'Extraction failed.')
+      setActionMessage(`Created ${current.result?.name ?? 'output'}`)
+    } catch (reason) {
+      if (!cancelled.current) setActionMessage(messageOf(reason))
+    } finally {
+      if (!cancelled.current) setExtracting(false)
+    }
+  }
+  const extractFrame = () => {
+    if (!duration || extracting) return
+    const time = Math.min(currentTime, Math.max(0, duration - (frameRate ? 1 / frameRate : .001)))
+    setExtracting(true); setActionMessage('Starting frame extraction…')
+    void api.startExtraction({ id: entry.id, kind: 'frame', time }).then(awaitExtraction).catch(reason => {
+      if (!cancelled.current) { setExtracting(false); setActionMessage(messageOf(reason)) }
+    })
+  }
+  const extractSegment = () => {
+    if (extracting || !validSegment(markIn, markOut)) return
+    setExtracting(true); setActionMessage('Starting segment extraction…')
+    void api.startExtraction({ id: entry.id, kind: 'segment', startTime: markIn, endTime: markOut! }).then(awaitExtraction).catch(reason => {
+      if (!cancelled.current) { setExtracting(false); setActionMessage(messageOf(reason)) }
+    })
+  }
+  useEffect(() => {
+    if (kind !== 'video') return
+    const keyboard = (event: KeyboardEvent) => {
+      if (ignoresVideoShortcut(event.target) || event.metaKey || event.ctrlKey || event.altKey) return
+      if (event.key === ',') { event.preventDefault(); stepFrame(-1) }
+      else if (event.key === '.') { event.preventDefault(); stepFrame(1) }
+      else if (event.key.toLowerCase() === 'i' && !event.shiftKey) { event.preventDefault(); setMarkIn(currentTime) }
+      else if (event.key.toLowerCase() === 'o' && !event.shiftKey) { event.preventDefault(); setMarkOut(currentTime) }
+      else if (event.key.toLowerCase() === 'f' && event.shiftKey && !extracting) { event.preventDefault(); extractFrame() }
+      else if (event.key.toLowerCase() === 'x' && event.shiftKey && !extracting && validSegment(markIn, markOut)) { event.preventDefault(); extractSegment() }
+    }
+    addEventListener('keydown', keyboard)
+    return () => removeEventListener('keydown', keyboard)
+  }, [currentTime, duration, extracting, frameRate, kind, markIn, markOut])
   return <FloatingWindow title={`${entry.name} — ${kind === 'image' ? 'Image' : 'Video'}`} onClose={onClose} className="basic-file-window basic-media-window">
     <div className="window-toolbar"><span>{entry.mime}</span><span className="toolbar-spacer" />{kind === 'video' && videoStudioEnabled && <button disabled={openingStudio} onClick={() => void openStudioWindow()}><ExternalLink /> Edit in Video Studio</button>}<a className="button" href={contentUrl(entry.id)}><Download /> Download</a></div>
     {error && <div className="banner error basic-file-error" role="alert"><span>{error}</span></div>}
-    {openingStudio && <div className="basic-file-loading" role="status"><span className="spinner" /> Browser playback failed. Opening Video Studio…</div>}
-    <div className={`basic-media-stage ${kind}`}>
-      {kind === 'image'
-        ? <><button className="image-nav previous" disabled={images.length < 2} aria-label="Previous image" title="Previous image (Left Arrow)" onClick={() => navigate(-1)}><ChevronLeft /></button><img src={source} alt={entry.name} onError={() => setError('The image could not be displayed.')} /><button className="image-nav next" disabled={images.length < 2} aria-label="Next image" title="Next image (Right Arrow)" onClick={() => navigate(1)}><ChevronRight /></button></>
-        : <video ref={videoRef} src={source} controls autoPlay muted playsInline preload="metadata" onError={videoFailed} />}
-    </div>
+    {playbackMessage && <div className="basic-file-loading" role="status"><span className="spinner" /> {playbackMessage}</div>}
+    {kind === 'image' ? <div className="basic-media-stage image"><button className="image-nav previous" disabled={images.length < 2} aria-label="Previous image" title="Previous image (Left Arrow)" onClick={() => navigate(-1)}><ChevronLeft /></button><img src={source} alt={entry.name} onError={() => setError('The image could not be displayed.')} /><button className="image-nav next" disabled={images.length < 2} aria-label="Next image" title="Next image (Right Arrow)" onClick={() => navigate(1)}><ChevronRight /></button></div> : <div className="basic-video-player">
+      <div className="basic-media-stage video"><video ref={videoRef} src={usingFallback ? undefined : source} controls autoPlay muted playsInline preload="metadata" loop={shouldAutoLoop(duration)} onError={() => void startPlaybackFallback()} onCanPlay={directPlaybackReady} onPlaying={directPlaybackReady} onWaiting={directPlaybackWaiting} onStalled={directPlaybackWaiting} onLoadedMetadata={event => { if (Number.isFinite(event.currentTarget.duration) && event.currentTarget.duration > 0) setDuration(event.currentTarget.duration) }} onTimeUpdate={event => setCurrentTime(event.currentTarget.currentTime)} onSeeked={event => setCurrentTime(event.currentTarget.currentTime)} /></div>
+      <div className="basic-video-tools" aria-label="Video extraction controls">
+        <div className="frame-controls"><button title="Previous frame (,)" aria-label="Previous frame" disabled={!frameRate} onClick={() => stepFrame(-1)}><ChevronLeft /></button><code>{formatMediaTime(currentTime)}</code><button title="Next frame (.)" aria-label="Next frame" disabled={!frameRate} onClick={() => stepFrame(1)}><ChevronRight /></button><span>{frameRate ? `${frameRate.toFixed(3)} fps` : 'FPS unavailable'}</span></div>
+        <div className="marker-controls"><button title="Set In (I)" onClick={() => setMarkIn(currentTime)}>In</button><code>{markIn === undefined ? '--:--:--.---' : formatMediaTime(markIn)}</code><button title="Clear In" aria-label="Clear In" disabled={markIn === undefined} onClick={() => setMarkIn(undefined)}><X /></button><button title="Set Out (O)" onClick={() => setMarkOut(currentTime)}>Out</button><code>{markOut === undefined ? '--:--:--.---' : formatMediaTime(markOut)}</code><button title="Clear Out" aria-label="Clear Out" disabled={markOut === undefined} onClick={() => setMarkOut(undefined)}><X /></button></div>
+        <div className="extract-controls"><button title="Extract frame (Shift+F)" disabled={extracting || !duration} onClick={extractFrame}><Camera /> Frame</button><button title="Extract segment (Shift+X)" disabled={extracting || !validSegment(markIn, markOut)} onClick={extractSegment}><Scissors /> Segment</button></div>
+        {actionMessage && <div className="video-action-message" role="status">{actionMessage}</div>}
+      </div>
+    </div>}
   </FloatingWindow>
 }
 
@@ -1342,8 +1502,9 @@ function FileGlyph({ entry }: { entry: Pick<Entry, 'kind'> & Partial<Entry> }) {
   if (entry.kind === 'directory') return <Folder className="glyph folder" />
   const video = entry.mime?.startsWith('video/')
   const icon = entry.mime?.startsWith('image/') ? <FileImage /> : video ? <Film /> : entry.mime?.startsWith('text/') ? <FileText /> : <File />
-  return <span className="file-glyph glyph">{icon}{entry.hasProvenance && <span className="provenance-check">✓</span>}</span>
+  return <span className="file-glyph glyph">{icon}<FileBadges entry={entry} /></span>
 }
+function FileBadges({ entry }: { entry: Partial<Entry> }) { return <>{entry.mime?.startsWith('video/') && entry.browserReady && <span className="browser-ready" aria-label="Playable in integrated player" title="Playable in integrated player"><Play aria-hidden="true" fill="currentColor" /></span>}{entry.hasProvenance && <span className="provenance-check" aria-label="Has provenance URL" title="Has provenance URL">✓</span>}</> }
 function first<T>(set: Set<T>) { return set.values().next().value }
 function findEntry(id: string | undefined, root: EntryPage | null, pages: Record<string, EntryPage>) { if (id === undefined) return; return [...(root?.entries ?? []), ...Object.values(pages).flatMap(p => p.entries)].find(entry => entry.id === id) }
 function formatBytes(bytes: number) { if (bytes < 1024) return `${bytes} B`; const units = ['KB', 'MB', 'GB', 'TB']; let value = bytes / 1024, unit = 0; while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++ } return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}` }
