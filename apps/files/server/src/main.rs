@@ -3781,7 +3781,7 @@ async fn serve_file(path: PathBuf, headers: &HeaderMap, inline: bool) -> ApiResu
     }
     let total = meta.len();
     if total == 0 {
-        return Response::builder()
+        let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(
                 header::CONTENT_TYPE,
@@ -3789,9 +3789,11 @@ async fn serve_file(path: PathBuf, headers: &HeaderMap, inline: bool) -> ApiResu
                     .first_or_octet_stream()
                     .to_string(),
             )
-            .header(header::CONTENT_LENGTH, "0")
-            .body(Body::empty())
-            .map_err(ApiError::internal);
+            .header(header::CONTENT_LENGTH, "0");
+        if !inline {
+            response = response.header(header::CONTENT_DISPOSITION, download_disposition(&path));
+        }
+        return response.body(Body::empty()).map_err(ApiError::internal);
     }
     let (start, end, status) = parse_range(headers, total)?;
     let mut file = fs::File::open(&path).await?;
@@ -3814,11 +3816,55 @@ async fn serve_file(path: PathBuf, headers: &HeaderMap, inline: bool) -> ApiResu
         );
     }
     if !inline {
-        response = response.header(header::CONTENT_DISPOSITION, "attachment");
+        response = response.header(header::CONTENT_DISPOSITION, download_disposition(&path));
     }
     response
         .body(Body::from_stream(stream))
         .map_err(ApiError::internal)
+}
+
+fn download_disposition(path: &Path) -> String {
+    let filename = path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("download"))
+        .to_string_lossy();
+    let fallback: String = filename
+        .chars()
+        .map(|character| {
+            if character.is_ascii()
+                && !character.is_ascii_control()
+                && character != '"'
+                && character != '\\'
+            {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let encoded = filename
+        .as_bytes()
+        .iter()
+        .map(|byte| match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'&'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~' => (*byte as char).to_string(),
+            _ => format!("%{byte:02X}"),
+        })
+        .collect::<String>();
+    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
 }
 
 fn parse_range(headers: &HeaderMap, total: u64) -> ApiResult<(u64, u64, StatusCode)> {
@@ -5611,6 +5657,37 @@ async fn cleanup_cache(state: &AppState) -> ApiResult<CacheCleanupReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_disposition_preserves_ascii_and_utf8_filenames() {
+        assert_eq!(
+            download_disposition(Path::new("quarterly report.csv")),
+            "attachment; filename=\"quarterly report.csv\"; filename*=UTF-8''quarterly%20report.csv"
+        );
+        assert_eq!(
+            download_disposition(Path::new("résumé.pdf")),
+            "attachment; filename=\"r_sum_.pdf\"; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf"
+        );
+    }
+
+    #[tokio::test]
+    async fn downloads_include_the_filename_for_empty_and_nonempty_files() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, contents) in [
+            ("empty file.txt", b"".as_slice()),
+            ("data.bin", b"data".as_slice()),
+        ] {
+            let path = root.path().join(name);
+            std::fs::write(&path, contents).unwrap();
+
+            let response = serve_file(path, &HeaderMap::new(), false).await.unwrap();
+
+            assert_eq!(
+                response.headers()[header::CONTENT_DISPOSITION],
+                download_disposition(Path::new(name))
+            );
+        }
+    }
 
     fn test_state(root: &Path, token: Option<&str>) -> AppState {
         let cache = root.join(".cache/remote-file-browser");
