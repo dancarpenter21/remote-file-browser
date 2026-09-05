@@ -1,10 +1,13 @@
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import Hls from 'hls.js'
+import ReactMarkdown from 'react-markdown'
+import rehypeSanitize from 'rehype-sanitize'
+import remarkGfm from 'remark-gfm'
 import {
   ArchiveRestore, Camera, Check, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
   Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal,
-  ExternalLink, Link2, Minus, Play, Plus, RefreshCw, Save, Scissors, Search, SquareTerminal, Trash2, Upload, X,
+  ExternalLink, Link2, Minus, Play, Plus, RefreshCw, Save, Scissors, Search, SquareTerminal, Trash2, Upload, WrapText, X,
 } from 'lucide-react'
 import { api, ApiFailure, contentUrl, type ConversionJob, type DocumentFile, Entry, EntryPage, InstalledApp, LiveEvent, liveEventsUrl, liveFilesystemWatchMessage, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { deleteConfirmationMessage } from './deleteConfirmation'
@@ -24,6 +27,7 @@ import { conflictSummary, type UploadConflict } from './uploadPlanning'
 import { isExtractableArchive } from './archiveExtraction'
 import { createPlaybackFallbackGate, DIRECT_PLAYBACK_TIMEOUT_MS, formatMediaTime, hlsRecoveryAction, ignoresVideoShortcut, shouldAutoLoop, stepFrameTime, validSegment } from './videoPlayerState'
 import { progressPercent, upsertJob } from './mediaJobState'
+import { markdownSanitizeSchema, markdownUrlTransform, resolveMarkdownImageSource } from './markdownPreview'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type ConfirmOptions = { title?: string; confirmLabel?: string; danger?: boolean }
@@ -1185,7 +1189,12 @@ function TextFileWindow({ entry, onClose, onSaved }: { entry: Entry; onClose: ()
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
+  const [previewing, setPreviewing] = useState(false)
+  const [wordWrap, setWordWrap] = useState(() => localStorage.getItem('rfb-basic-text-word-wrap') !== 'false')
+  const markdown = isMarkdownFile(entry)
   const dirty = Boolean(file && content !== file.content)
+
+  useEffect(() => { localStorage.setItem('rfb-basic-text-word-wrap', String(wordWrap)) }, [wordWrap])
 
   useEffect(() => {
     let active = true
@@ -1237,11 +1246,18 @@ function TextFileWindow({ entry, onClose, onSaved }: { entry: Entry; onClose: ()
   return <FloatingWindow title={`${entry.name} — Text`} onClose={() => void close()} className="basic-file-window basic-text-window">
     <div className="window-toolbar">
       <button className="primary compact" disabled={!dirty || saving || loading} title="Save (Ctrl/Cmd+S)" onClick={() => void save()}><Save /> {saving ? 'Saving…' : 'Save'}</button>
+      {markdown && <button className={previewing ? 'active' : ''} aria-pressed={previewing} disabled={loading} onClick={() => setPreviewing(value => !value)}>{previewing ? <Edit3 /> : <Eye />} {previewing ? 'Text' : 'Preview'}</button>}
+      <button className={wordWrap ? 'active' : ''} aria-pressed={wordWrap} onClick={() => setWordWrap(value => !value)}><WrapText /> Word wrap</button>
       {message && <span className="basic-file-status" role="status">{message}</span>}
       <span className="toolbar-spacer" /><code title={entry.path}>{entry.path}</code>
     </div>
     {error && <div className="banner error basic-file-error" role="alert"><span>{error}</span></div>}
-    {loading ? <div className="basic-file-loading" role="status"><span className="spinner" /> Loading text…</div> : file ? <textarea className="basic-text-editor" aria-label={`Edit ${entry.name}`} value={content} disabled={saving} spellCheck={false} onChange={event => { setContent(event.target.value); setMessage(''); setError('') }} /> : null}
+    {loading ? <div className="basic-file-loading" role="status"><span className="spinner" /> Loading text…</div> : file ? previewing ? <article className={`basic-markdown-preview ${wordWrap ? 'word-wrap' : 'no-word-wrap'}`}><ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      rehypePlugins={[[rehypeSanitize, markdownSanitizeSchema]]}
+      urlTransform={markdownUrlTransform}
+      components={{ img: ({ src, ...props }) => <img {...props} src={resolveMarkdownImageSource(entry.id, src)} /> }}
+    >{content}</ReactMarkdown></article> : <textarea className="basic-text-editor" aria-label={`Edit ${entry.name}`} value={content} disabled={saving} spellCheck={false} wrap={wordWrap ? 'soft' : 'off'} onChange={event => { setContent(event.target.value); setMessage(''); setError('') }} /> : null}
   </FloatingWindow>
 }
 
