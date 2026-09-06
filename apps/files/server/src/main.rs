@@ -1642,6 +1642,9 @@ async fn start_media_extraction(
         result: None,
     };
     state.extraction_jobs.insert(key.clone(), job.clone());
+    let _ = state.live_events.send(LiveEvent::ExtractionJob {
+        job: Box::new(job.clone()),
+    });
     if state.extraction_jobs.len() > 100 {
         let mut completed = state
             .extraction_jobs
@@ -1660,18 +1663,16 @@ async fn start_media_extraction(
     let task_state = state.clone();
     tokio::spawn(async move {
         let outcome = run_media_extraction(&task_state, &request, &source).await;
-        if let Some(mut stored) = task_state.extraction_jobs.get_mut(&key) {
-            match outcome {
-                Ok(entry) => {
-                    stored.status = "ready".into();
-                    stored.result = Some(entry);
-                }
-                Err(error) => {
-                    stored.status = "failed".into();
-                    stored.error = Some(error.2);
-                }
+        emit_extraction_job(&task_state, &key, |stored| match outcome {
+            Ok(entry) => {
+                stored.status = "ready".into();
+                stored.result = Some(entry);
             }
-        }
+            Err(error) => {
+                stored.status = "failed".into();
+                stored.error = Some(error.2);
+            }
+        });
     });
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
@@ -2119,6 +2120,12 @@ enum LiveEvent {
     MediaJob {
         job: Box<MediaJob>,
     },
+    ExtractionSnapshot {
+        jobs: Vec<ExtractionJob>,
+    },
+    ExtractionJob {
+        job: Box<ExtractionJob>,
+    },
     CacheCleanup {
         state: String,
         report: Option<CacheCleanupReport>,
@@ -2135,6 +2142,29 @@ fn media_snapshot(state: &AppState) -> LiveEvent {
     jobs.sort_by_key(|job| std::cmp::Reverse(job.started_at));
     jobs.truncate(20);
     LiveEvent::MediaSnapshot { jobs }
+}
+
+fn extraction_snapshot(state: &AppState) -> LiveEvent {
+    let mut jobs = state
+        .extraction_jobs
+        .iter()
+        .map(|job| job.value().clone())
+        .collect::<Vec<_>>();
+    jobs.sort_by_key(|job| std::cmp::Reverse(job.started_at));
+    jobs.truncate(20);
+    LiveEvent::ExtractionSnapshot { jobs }
+}
+
+fn emit_extraction_job(state: &AppState, key: &str, update: impl FnOnce(&mut ExtractionJob)) {
+    let job = state.extraction_jobs.get_mut(key).map(|mut job| {
+        update(&mut job);
+        job.clone()
+    });
+    if let Some(job) = job {
+        let _ = state
+            .live_events
+            .send(LiveEvent::ExtractionJob { job: Box::new(job) });
+    }
 }
 
 #[derive(Clone)]
@@ -2851,6 +2881,9 @@ async fn live_socket(mut socket: WebSocket, state: AppState) {
         return;
     }
     if !send_live_event(&mut socket, &media_snapshot(&state)).await {
+        return;
+    }
+    if !send_live_event(&mut socket, &extraction_snapshot(&state)).await {
         return;
     }
     loop {
@@ -6754,6 +6787,26 @@ mod tests {
         assert_eq!(value["job"]["fileName"], "clip.wmv");
         assert_eq!(value["job"]["progress"], 0.25);
         assert!(value["job"].get("sourceId").is_none());
+
+        let extraction = ExtractionJob {
+            key: "extraction-key".into(),
+            file_name: "clip.mp4".into(),
+            kind: "frame".into(),
+            status: "working".into(),
+            time: Some(1.25),
+            start_time: None,
+            end_time: None,
+            started_at: Utc::now(),
+            error: None,
+            result: None,
+        };
+        let value = serde_json::to_value(LiveEvent::ExtractionJob {
+            job: Box::new(extraction),
+        })
+        .unwrap();
+        assert_eq!(value["type"], "extractionJob");
+        assert_eq!(value["job"]["fileName"], "clip.mp4");
+        assert_eq!(value["job"]["kind"], "frame");
     }
 
     #[test]

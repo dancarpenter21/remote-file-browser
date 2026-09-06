@@ -9,7 +9,7 @@ import {
   Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal,
   ExternalLink, Link2, Minus, Play, Plus, RefreshCw, Save, Scissors, Search, SquareTerminal, Trash2, Upload, WrapText, X,
 } from 'lucide-react'
-import { api, ApiFailure, contentUrl, type ConversionJob, type DocumentFile, Entry, EntryPage, InstalledApp, LiveEvent, liveEventsUrl, liveFilesystemWatchMessage, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
+import { api, ApiFailure, contentUrl, type ConversionJob, type DocumentFile, Entry, EntryPage, type ExtractionJob, InstalledApp, LiveEvent, liveEventsUrl, liveFilesystemWatchMessage, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { deleteConfirmationMessage } from './deleteConfirmation'
 import { updateFinderPathForSelection } from './finderPath'
 import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState'
@@ -44,6 +44,16 @@ const InstalledAppsContext = createContext<InstalledApp[]>([])
 const ArchiveExtractionContext = createContext<(entry: Entry) => Promise<void>>(async () => {})
 type UploadConflictRequest = { conflicts: UploadConflict[]; resolve: (choice: UploadConflictChoice) => void }
 const UploadConflictContext = createContext<(conflicts: UploadConflict[]) => Promise<UploadConflictChoice>>(async () => 'cancel')
+
+function startDownload(entry: Entry) {
+  const link = document.createElement('a')
+  link.href = contentUrl(entry.id)
+  link.download = entry.name
+  link.hidden = true
+  document.body.append(link)
+  link.click()
+  link.remove()
+}
 
 function useMobileMode() {
   const [mobile, setMobile] = useState(() => matchMedia(MOBILE_MEDIA_QUERY).matches)
@@ -153,6 +163,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [trash, setTrash] = useState<TrashEntry[] | null>(null)
   const [error, setError] = useState('')
   const [conversionJobs, setConversionJobs] = useState<ConversionJob[]>([])
+  const [extractionJobs, setExtractionJobs] = useState<ExtractionJob[]>([])
   const [folderMenu, setFolderMenu] = useState<{ directoryId: string; path: string; x: number; y: number } | null>(null)
   const [properties, setProperties] = useState<{ id: string; initial?: Entry } | null>(null)
   const [openFile, setOpenFile] = useState<{ entry: Entry; kind: BasicFileKind } | null>(null)
@@ -284,6 +295,10 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
             playableJobs.current[event.job.key] = event.job.playable
             setConversionJobs(jobs => upsertJob(jobs, event.job))
             if (refreshBrowserReady) void refreshDirectories()
+          } else if (event.type === 'extractionSnapshot') {
+            setExtractionJobs(event.jobs)
+          } else if (event.type === 'extractionJob') {
+            setExtractionJobs(jobs => upsertJob(jobs, event.job))
           }
         } catch { resync() }
       }
@@ -392,7 +407,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     if (entry.kind === 'directory') return navigateGrid(entry)
     const kind = basicFileKind(entry)
     if (kind) { setOpenFile({ entry, kind }); return }
-    window.location.href = contentUrl(entry.id)
+    startDownload(entry)
   }
   const mutate = async (action: () => Promise<unknown>, dir = currentDir, replace?: () => Promise<unknown>) => {
     setError(''); try { await action(); await refresh(dir) } catch (e) {
@@ -601,7 +616,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         <button className="nav-item active" onClick={() => { goToRoot(); setDrawerOpen(false) }}><Folder size={17} /> Files</button>
         <button className="nav-item" onClick={() => { void openTrash(); setDrawerOpen(false) }}><Trash2 size={17} /> Trash</button>
         {session.terminalEnabled && <button className={`nav-item ${terminal && !terminal.hidden ? 'active' : ''}`} aria-pressed={Boolean(terminal && !terminal.hidden)} onClick={() => { toggleTerminal(); setDrawerOpen(false) }}><SquareTerminal size={17} /> Terminal</button>}
-        <ConversionJobs jobs={conversionJobs} />
+        <MediaJobs conversions={conversionJobs} extractions={extractionJobs} />
         <div className="aside-note"><span>Signed in as</span><strong>{session.username}</strong>{isMobile && <button onClick={() => void logout()}><LogOut /> Sign out</button>}</div>
       </aside>
       <div className="content-stack">
@@ -665,14 +680,17 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   </div></InstalledAppsContext.Provider></ArchiveExtractionContext.Provider>
 }
 
-function ConversionJobs({ jobs }: { jobs: ConversionJob[] }) {
+function MediaJobs({ conversions, extractions }: { conversions: ConversionJob[]; extractions: ExtractionJob[] }) {
+  const jobs = [...conversions, ...extractions].sort((left, right) => right.startedAt.localeCompare(left.startedAt)).slice(0, 20)
   const working = jobs.some(job => job.status === 'working')
-  return <section className="conversion-jobs" aria-label="Video conversions">
-    <div className="conversion-jobs-heading"><Film /> Video conversions{working && <span className="conversion-pulse" aria-label="Conversion active" />}</div>
+  return <section className="conversion-jobs" aria-label="Media jobs">
+    <div className="conversion-jobs-heading"><Film /> Media jobs{working && <span className="conversion-pulse" aria-label="Media job active" />}</div>
     <div className="conversion-job-list">
-      {jobs.length === 0 ? <p>No converted videos yet.</p> : jobs.map(job => <article className={`conversion-job ${job.status}`} key={job.key} title={job.error}>
+      {jobs.length === 0 ? <p>No media jobs yet.</p> : jobs.map(job => <article className={`conversion-job ${job.status}`} key={job.key} title={job.error}>
         <span className="conversion-status" />
-        <div><strong>{job.fileName}</strong><small>{job.status === 'working' ? `${job.mode} · ${progressPercent(job.progress)}%` : `${job.mode} · ${job.status}`}</small>{job.status === 'working' && <progress max={1} value={job.progress ?? 0} />}</div>
+        <div><strong>{job.fileName}</strong>{'mode' in job
+          ? <><small>{job.status === 'working' ? `${job.mode} · ${progressPercent(job.progress)}%` : `${job.mode} · ${job.status}`}</small>{job.status === 'working' && <progress max={1} value={job.progress ?? 0} />}</>
+          : <small>{job.kind} extraction · {job.status}</small>}</div>
       </article>)}
     </div>
   </section>
@@ -1059,6 +1077,7 @@ function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, d
   const paste = () => { close(); void pasteInto(entry) }
   const rename = () => { close(); void renameEntry(entry) }
   const properties = () => { close(); showProperties(entry) }
+  const download = () => { close(); startDownload(entry) }
   const addProvenance = async () => {
     close()
     const url = await promptAction({ title: 'Add provenance URL', label: 'Source URL', submitLabel: 'Add', placeholder: 'https://example.com/source' })
@@ -1094,6 +1113,7 @@ function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, d
     <button role="menuitem" onClick={rename}><Edit3 /> Rename</button>
     <button role="menuitem" onClick={copyPath}><Copy /> Copy path</button>
     <button role="menuitem" onClick={properties}><Info /> Properties</button>
+    {entry.kind === 'file' && <button role="menuitem" onClick={download}><Download /> Download</button>}
     <span className="context-divider" />
     {textEditor && entry.kind === 'file' && isMarkdownFile(entry) && <button role="menuitem" onClick={previewMarkdown}><Eye /> Open Markdown Preview</button>}
     {imageTools && entry.kind === 'file' && entry.mime.startsWith('image/') && <button role="menuitem" onClick={openAdvancedImageTools}><FileImage /> Open in Advanced Image Tools</button>}
@@ -1460,7 +1480,7 @@ function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: 
     return () => removeEventListener('keydown', keyboard)
   }, [currentTime, duration, extracting, frameRate, kind, markIn, markOut])
   return <FloatingWindow title={`${entry.name} — ${kind === 'image' ? 'Image' : 'Video'}`} onClose={onClose} className="basic-file-window basic-media-window">
-    <div className="window-toolbar"><span>{entry.mime}</span><span className="toolbar-spacer" />{kind === 'video' && videoStudioEnabled && <button disabled={openingStudio} onClick={() => void openStudioWindow()}><ExternalLink /> Edit in Video Studio</button>}<a className="button" href={contentUrl(entry.id)}><Download /> Download</a></div>
+    <div className="window-toolbar"><span>{entry.mime}</span><span className="toolbar-spacer" />{kind === 'video' && videoStudioEnabled && <button disabled={openingStudio} onClick={() => void openStudioWindow()}><ExternalLink /> Edit in Video Studio</button>}<a className="button" href={contentUrl(entry.id)} download={entry.name}><Download /> Download</a></div>
     {error && <div className="banner error basic-file-error" role="alert"><span>{error}</span></div>}
     {playbackMessage && <div className="basic-file-loading" role="status"><span className="spinner" /> {playbackMessage}</div>}
     {kind === 'image' ? <div className="basic-media-stage image"><button className="image-nav previous" disabled={images.length < 2} aria-label="Previous image" title="Previous image (Left Arrow)" onClick={() => navigate(-1)}><ChevronLeft /></button><img src={source} alt={entry.name} onError={() => setError('The image could not be displayed.')} /><button className="image-nav next" disabled={images.length < 2} aria-label="Next image" title="Next image (Right Arrow)" onClick={() => navigate(1)}><ChevronRight /></button></div> : <div className="basic-video-player">

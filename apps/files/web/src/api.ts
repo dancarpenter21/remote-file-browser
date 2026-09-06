@@ -73,6 +73,8 @@ export type LiveEvent =
   | { type: 'provenance'; change: ProvenanceChange }
   | { type: 'mediaSnapshot'; jobs: ConversionJob[] }
   | { type: 'mediaJob'; job: ConversionJob }
+  | { type: 'extractionSnapshot'; jobs: ExtractionJob[] }
+  | { type: 'extractionJob'; job: ExtractionJob }
 
 export class ApiFailure extends Error {
   constructor(public status: number, public code: string, message: string) { super(message) }
