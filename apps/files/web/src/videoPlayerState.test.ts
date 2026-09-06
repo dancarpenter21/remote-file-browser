@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createPlaybackFallbackGate, formatMediaTime, hlsRecoveryAction, shouldAutoLoop, stepFrameTime, validSegment } from './videoPlayerState'
+import { createPlaybackFallbackGate, formatMediaTime, hlsPlaybackEngine, hlsRecoveryAction, shouldAutoLoop, stepFrameTime, validSegment } from './videoPlayerState'
 
 describe('basic video player state', () => {
   it('starts compatibility fallback only once until reset', () => {
@@ -15,6 +15,13 @@ describe('basic video player state', () => {
     expect(hlsRecoveryAction('networkError', 1, 0)).toBe('fail')
     expect(hlsRecoveryAction('mediaError', 0, 0)).toBe('recover-media')
     expect(hlsRecoveryAction('mediaError', 0, 1)).toBe('fail')
+  })
+
+  it('prefers hls.js for progressive playback and falls back to native HLS', () => {
+    expect(hlsPlaybackEngine(true, true)).toBe('hls.js')
+    expect(hlsPlaybackEngine(true, false)).toBe('hls.js')
+    expect(hlsPlaybackEngine(false, true)).toBe('native')
+    expect(hlsPlaybackEngine(false, false)).toBe('unsupported')
   })
 
   it('formats playback time and steps on the nominal frame grid', () => {

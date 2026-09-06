@@ -1,5 +1,13 @@
 export const DIRECT_PLAYBACK_TIMEOUT_MS = 5_000
 
+export type HlsPlaybackEngine = 'hls.js' | 'native' | 'unsupported'
+
+export function hlsPlaybackEngine(hlsJsSupported: boolean, nativeHlsSupported: boolean): HlsPlaybackEngine {
+  if (hlsJsSupported) return 'hls.js'
+  if (nativeHlsSupported) return 'native'
+  return 'unsupported'
+}
+
 export interface PlaybackFallbackGate {
   readonly started: boolean
   claim(): boolean

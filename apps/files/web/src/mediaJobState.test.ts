@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { progressPercent, upsertJob } from './mediaJobState'
+import { becamePlayable, progressPercent, upsertJob } from './mediaJobState'
 
 describe('media job state', () => {
   it('upserts, sorts, deduplicates, and limits conversion jobs', () => {
@@ -17,5 +17,11 @@ describe('media job state', () => {
     expect(progressPercent(undefined)).toBe(0)
     expect(progressPercent(0.426)).toBe(43)
     expect(progressPercent(2)).toBe(100)
+  })
+
+  it('detects only the transition to a playable conversion', () => {
+    expect(becamePlayable(undefined, false)).toBe(false)
+    expect(becamePlayable(false, true)).toBe(true)
+    expect(becamePlayable(true, true)).toBe(false)
   })
 })

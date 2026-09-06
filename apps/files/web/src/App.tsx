@@ -25,8 +25,8 @@ import { useUploadQueue, type UploadConflictChoice } from './UploadQueue'
 import { isExternalFileDrag, manifestFromDrop, manifestFromFiles } from './uploadIntake'
 import { conflictSummary, type UploadConflict } from './uploadPlanning'
 import { isExtractableArchive } from './archiveExtraction'
-import { createPlaybackFallbackGate, DIRECT_PLAYBACK_TIMEOUT_MS, formatMediaTime, hlsRecoveryAction, ignoresVideoShortcut, shouldAutoLoop, stepFrameTime, validSegment } from './videoPlayerState'
-import { progressPercent, upsertJob } from './mediaJobState'
+import { createPlaybackFallbackGate, DIRECT_PLAYBACK_TIMEOUT_MS, formatMediaTime, hlsPlaybackEngine, hlsRecoveryAction, ignoresVideoShortcut, shouldAutoLoop, stepFrameTime, validSegment } from './videoPlayerState'
+import { becamePlayable, progressPercent, upsertJob } from './mediaJobState'
 import { markdownSanitizeSchema, markdownUrlTransform, resolveMarkdownImageSource } from './markdownPreview'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
@@ -181,6 +181,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     return () => { active = false }
   }, [])
   const liveEventsSocket = useRef<WebSocket | null>(null)
+  const playableJobs = useRef<Record<string, boolean>>({})
   const liveState = useRef({ root, expanded })
   liveState.current = { root, expanded }
   const liveDirectorySubscription = Object.keys(expanded).sort().join(',')
@@ -273,8 +274,17 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
           if (event.type === 'resync') resync()
           else if (event.type === 'filesystem') schedule(event.directoryIds)
           else if (event.type === 'provenance') dispatchEvent(new CustomEvent<ProvenanceChange>('rfb:provenance-changed', { detail: event.change }))
-          else if (event.type === 'mediaSnapshot') setConversionJobs(event.jobs)
-          else if (event.type === 'mediaJob') setConversionJobs(jobs => upsertJob(jobs, event.job))
+          else if (event.type === 'mediaSnapshot') {
+            const refreshBrowserReady = event.jobs.some(job => becamePlayable(playableJobs.current[job.key], job.playable))
+            playableJobs.current = Object.fromEntries(event.jobs.map(job => [job.key, job.playable]))
+            setConversionJobs(event.jobs)
+            if (refreshBrowserReady) void refreshDirectories()
+          } else if (event.type === 'mediaJob') {
+            const refreshBrowserReady = becamePlayable(playableJobs.current[event.job.key], event.job.playable)
+            playableJobs.current[event.job.key] = event.job.playable
+            setConversionJobs(jobs => upsertJob(jobs, event.job))
+            if (refreshBrowserReady) void refreshDirectories()
+          }
         } catch { resync() }
       }
       connection.onclose = () => {
@@ -1330,30 +1340,31 @@ function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: 
     clearTimeout(readinessTimer.current); clearTimeout(stallTimer.current)
     hlsRef.current?.destroy(); hlsRef.current = null
     setPlaybackMessage('Starting converted video…')
-    if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = playlistUrl
-      video.play().catch(() => undefined)
-      return
-    }
-    if (!Hls.isSupported()) {
+    const playbackEngine = hlsPlaybackEngine(Hls.isSupported(), Boolean(video.canPlayType('application/vnd.apple.mpegurl')))
+    if (playbackEngine === 'unsupported') {
       setPlaybackMessage(''); setError('This browser cannot play HLS video.')
       return
     }
-    const hls = new Hls()
-    let networkRecoveries = 0
-    let mediaRecoveries = 0
-    hlsRef.current = hls
-    hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(playlistUrl))
-    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => undefined))
-    hls.on(Hls.Events.ERROR, (_event, data) => {
-      if (!data.fatal) return
-      const action = hlsRecoveryAction(data.type, networkRecoveries, mediaRecoveries)
-      if (action === 'retry-network') { networkRecoveries += 1; hls.startLoad(); return }
-      if (action === 'recover-media') { mediaRecoveries += 1; hls.recoverMediaError(); return }
-      hls.destroy(); hlsRef.current = null
-      if (!cancelled.current) { setPlaybackMessage(''); setError('The converted video stream could not be played.') }
-    })
-    hls.attachMedia(video)
+    if (playbackEngine === 'hls.js') {
+      const hls = new Hls()
+      let networkRecoveries = 0
+      let mediaRecoveries = 0
+      hlsRef.current = hls
+      hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(playlistUrl))
+      hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => undefined))
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (!data.fatal) return
+        const action = hlsRecoveryAction(data.type, networkRecoveries, mediaRecoveries)
+        if (action === 'retry-network') { networkRecoveries += 1; hls.startLoad(); return }
+        if (action === 'recover-media') { mediaRecoveries += 1; hls.recoverMediaError(); return }
+        hls.destroy(); hlsRef.current = null
+        if (!cancelled.current) { setPlaybackMessage(''); setError('The converted video stream could not be played.') }
+      })
+      hls.attachMedia(video)
+      return
+    }
+    video.src = playlistUrl
+    video.play().catch(() => undefined)
   }, [])
   useEffect(() => {
     if (kind === 'video' && usingFallback && hlsPlaylist) attachHls(hlsPlaylist)
