@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import Hls from 'hls.js'
 import ReactMarkdown from 'react-markdown'
 import rehypeSanitize from 'rehype-sanitize'
+import rehypeSlug from 'rehype-slug'
 import remarkGfm from 'remark-gfm'
 import {
   ArchiveRestore, Camera, Check, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
@@ -27,7 +28,7 @@ import { conflictSummary, type UploadConflict } from './uploadPlanning'
 import { isExtractableArchive } from './archiveExtraction'
 import { createPlaybackFallbackGate, DIRECT_PLAYBACK_TIMEOUT_MS, formatMediaTime, hlsPlaybackEngine, hlsRecoveryAction, ignoresVideoShortcut, shouldAutoLoop, stepFrameTime, validSegment } from './videoPlayerState'
 import { becamePlayable, progressPercent, upsertJob } from './mediaJobState'
-import { markdownSanitizeSchema, markdownUrlTransform, resolveMarkdownImageSource } from './markdownPreview'
+import { markdownHeadingElementId, markdownSanitizeSchema, markdownUrlTransform, resolveMarkdownImageSource, resolveMarkdownLinkTarget } from './markdownPreview'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type ConfirmOptions = { title?: string; confirmLabel?: string; danger?: boolean }
@@ -166,7 +167,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [extractionJobs, setExtractionJobs] = useState<ExtractionJob[]>([])
   const [folderMenu, setFolderMenu] = useState<{ directoryId: string; path: string; x: number; y: number } | null>(null)
   const [properties, setProperties] = useState<{ id: string; initial?: Entry } | null>(null)
-  const [openFile, setOpenFile] = useState<{ entry: Entry; kind: BasicFileKind } | null>(null)
+  const [openFile, setOpenFile] = useState<{ entry: Entry; kind: BasicFileKind; previewing?: boolean; fragment?: string } | null>(null)
   const [terminal, setTerminal] = useState<{ directoryId: string; hidden: boolean } | null>(null)
   const isMobile = useMobileMode()
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -408,6 +409,16 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     const kind = basicFileKind(entry)
     if (kind) { setOpenFile({ entry, kind }); return }
     startDownload(entry)
+  }
+  const openMarkdownLink = async (id: string, fragment: string) => {
+    const entry = await api.metadata(id)
+    if (entry.kind === 'directory') {
+      setOpenFile(null); await navigateGrid(entry); return
+    }
+    const kind = basicFileKind(entry)
+    if (!kind) { startDownload(entry); return }
+    setOpenFile({ entry, kind, previewing: kind === 'text' && isMarkdownFile(entry), fragment })
+    setSelected(new Set([entry.id])); setPrimary(entry)
   }
   const mutate = async (action: () => Promise<unknown>, dir = currentDir, replace?: () => Promise<unknown>) => {
     setError(''); try { await action(); await refresh(dir) } catch (e) {
@@ -672,7 +683,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     {folderMenu && <FolderContextMenu {...folderMenu} close={() => setFolderMenu(null)} createItem={createItem} paste={() => paste(folderMenu.directoryId, folderMenu.path)} hasClipboard={Boolean(clipboard)} showProperties={id => showProperties(id)} setError={setError} mobileControls={isMobile ? { hidden, toggleHidden: () => setHidden(value => !value), refresh: () => refresh(folderMenu.directoryId) } : undefined} />}
     {isMobile && mobileSelectionMenu && mobileSelectionEntry && <ContextMenu entry={mobileSelectionEntry} selectedEntries={previewEntries} x={innerWidth - 12} y={80} close={() => setMobileSelectionMenu(false)} open={() => activate(mobileSelectionEntry)} renameEntry={rename} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} />}
     {properties && <PropertiesDialog {...properties} onClose={() => setProperties(null)} />}
-    {openFile && <BasicFileWindow key={openFile.kind === 'image' ? 'image-viewer' : `${openFile.entry.id}:${openFile.entry.etag}`} {...openFile} images={viewerImages} onNavigate={entry => {
+    {openFile && <BasicFileWindow key={openFile.kind === 'image' ? 'image-viewer' : `${openFile.entry.id}:${openFile.entry.etag}`} {...openFile} images={viewerImages} onOpenLink={openMarkdownLink} onNavigate={entry => {
       setOpenFile({ entry, kind: 'image' }); setSelected(new Set([entry.id])); setPrimary(entry)
     }} onClose={() => setOpenFile(null)} onSaved={() => refresh(openFile.entry.parentId)} />}
     {uploadQueue.panel}
@@ -1206,12 +1217,12 @@ function ViewSelector({ view, setView }: { view: ViewMode; setView: (view: ViewM
   </div>
 }
 
-function BasicFileWindow({ entry, kind, images, onNavigate, onClose, onSaved }: { entry: Entry; kind: BasicFileKind; images: Entry[]; onNavigate: (entry: Entry) => void; onClose: () => void; onSaved: () => Promise<void> }) {
-  if (kind === 'text') return <TextFileWindow entry={entry} onClose={onClose} onSaved={onSaved} />
+function BasicFileWindow({ entry, kind, images, previewing, fragment, onOpenLink, onNavigate, onClose, onSaved }: { entry: Entry; kind: BasicFileKind; images: Entry[]; previewing?: boolean; fragment?: string; onOpenLink: (id: string, fragment: string) => Promise<void>; onNavigate: (entry: Entry) => void; onClose: () => void; onSaved: () => Promise<void> }) {
+  if (kind === 'text') return <TextFileWindow entry={entry} initialPreviewing={previewing} initialFragment={fragment} onOpenLink={onOpenLink} onClose={onClose} onSaved={onSaved} />
   return <MediaFileWindow entry={entry} kind={kind} images={images} onNavigate={onNavigate} onClose={onClose} />
 }
 
-function TextFileWindow({ entry, onClose, onSaved }: { entry: Entry; onClose: () => void; onSaved: () => Promise<void> }) {
+function TextFileWindow({ entry, initialPreviewing = false, initialFragment = '', onOpenLink, onClose, onSaved }: { entry: Entry; initialPreviewing?: boolean; initialFragment?: string; onOpenLink: (id: string, fragment: string) => Promise<void>; onClose: () => void; onSaved: () => Promise<void> }) {
   const confirmAction = useConfirm()
   const [file, setFile] = useState<DocumentFile>()
   const [content, setContent] = useState('')
@@ -1219,8 +1230,9 @@ function TextFileWindow({ entry, onClose, onSaved }: { entry: Entry; onClose: ()
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
-  const [previewing, setPreviewing] = useState(false)
+  const [previewing, setPreviewing] = useState(initialPreviewing)
   const [wordWrap, setWordWrap] = useState(() => localStorage.getItem('rfb-basic-text-word-wrap') !== 'false')
+  const previewRef = useRef<HTMLElement>(null)
   const markdown = isMarkdownFile(entry)
   const dirty = Boolean(file && content !== file.content)
 
@@ -1246,6 +1258,19 @@ function TextFileWindow({ entry, onClose, onSaved }: { entry: Entry; onClose: ()
     addEventListener('beforeunload', warn)
     return () => removeEventListener('beforeunload', warn)
   }, [dirty])
+
+  const scrollToMarkdownFragment = useCallback((fragment: string) => {
+    if (!fragment) { previewRef.current?.scrollTo({ top: 0 }); return }
+    const id = markdownHeadingElementId(fragment)
+    const heading = Array.from(previewRef.current?.querySelectorAll<HTMLElement>('[id]') ?? []).find(element => element.id === id)
+    heading?.scrollIntoView({ block: 'start' })
+  }, [])
+
+  useEffect(() => {
+    if (!previewing || loading) return
+    const frame = requestAnimationFrame(() => scrollToMarkdownFragment(initialFragment))
+    return () => cancelAnimationFrame(frame)
+  }, [initialFragment, loading, previewing, scrollToMarkdownFragment])
 
   const save = useCallback(async () => {
     if (!file || !dirty || saving) return
@@ -1273,6 +1298,17 @@ function TextFileWindow({ entry, onClose, onSaved }: { entry: Entry; onClose: ()
     onClose()
   }
 
+  const followMarkdownLink = async (event: React.MouseEvent<HTMLAnchorElement>, href?: string) => {
+    const target = resolveMarkdownLinkTarget(entry.id, href)
+    if (!target || target.kind === 'external') return
+    event.preventDefault()
+    if (target.kind === 'fragment') { scrollToMarkdownFragment(target.fragment); return }
+    if (dirty && !await confirmAction(`Your unsaved edits to ${entry.name} will be lost.`, { title: 'Discard unsaved changes?', confirmLabel: 'Discard', danger: true })) return
+    setError(''); setMessage('')
+    try { await onOpenLink(target.id, target.fragment) }
+    catch (reason) { setError(messageOf(reason)) }
+  }
+
   return <FloatingWindow title={`${entry.name} — Text`} onClose={() => void close()} className="basic-file-window basic-text-window">
     <div className="window-toolbar">
       <button className="primary compact" disabled={!dirty || saving || loading} title="Save (Ctrl/Cmd+S)" onClick={() => void save()}><Save /> {saving ? 'Saving…' : 'Save'}</button>
@@ -1282,11 +1318,17 @@ function TextFileWindow({ entry, onClose, onSaved }: { entry: Entry; onClose: ()
       <span className="toolbar-spacer" /><code title={entry.path}>{entry.path}</code>
     </div>
     {error && <div className="banner error basic-file-error" role="alert"><span>{error}</span></div>}
-    {loading ? <div className="basic-file-loading" role="status"><span className="spinner" /> Loading text…</div> : file ? previewing ? <article className={`basic-markdown-preview ${wordWrap ? 'word-wrap' : 'no-word-wrap'}`}><ReactMarkdown
+    {loading ? <div className="basic-file-loading" role="status"><span className="spinner" /> Loading text…</div> : file ? previewing ? <article ref={previewRef} className={`basic-markdown-preview ${wordWrap ? 'word-wrap' : 'no-word-wrap'}`}><ReactMarkdown
       remarkPlugins={[remarkGfm]}
-      rehypePlugins={[[rehypeSanitize, markdownSanitizeSchema]]}
+      rehypePlugins={[rehypeSlug, [rehypeSanitize, markdownSanitizeSchema]]}
       urlTransform={markdownUrlTransform}
-      components={{ img: ({ src, ...props }) => <img {...props} src={resolveMarkdownImageSource(entry.id, src)} /> }}
+      components={{
+        img: ({ src, ...props }) => <img {...props} src={resolveMarkdownImageSource(entry.id, src)} />,
+        a: ({ href, children, ...props }) => {
+          const target = resolveMarkdownLinkTarget(entry.id, href)
+          return <a {...props} href={href} target={target?.kind === 'external' ? '_blank' : undefined} rel={target?.kind === 'external' ? 'noopener noreferrer' : undefined} onClick={event => void followMarkdownLink(event, href)}>{children}</a>
+        },
+      }}
     >{content}</ReactMarkdown></article> : <textarea className="basic-text-editor" aria-label={`Edit ${entry.name}`} value={content} disabled={saving} spellCheck={false} wrap={wordWrap ? 'soft' : 'off'} onChange={event => { setContent(event.target.value); setMessage(''); setError('') }} /> : null}
   </FloatingWindow>
 }
