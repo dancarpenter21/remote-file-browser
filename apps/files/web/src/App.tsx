@@ -29,6 +29,7 @@ import { isExtractableArchive } from './archiveExtraction'
 import { createPlaybackFallbackGate, DIRECT_PLAYBACK_TIMEOUT_MS, formatMediaTime, hlsPlaybackEngine, hlsRecoveryAction, ignoresVideoShortcut, shouldAutoLoop, stepFrameTime, validSegment } from './videoPlayerState'
 import { becamePlayable, progressPercent, upsertJob } from './mediaJobState'
 import { markdownHeadingElementId, markdownSanitizeSchema, markdownUrlTransform, resolveMarkdownImageSource, resolveMarkdownLinkTarget } from './markdownPreview'
+import { retainActiveHiddenDirectory } from './hiddenNavigation'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type ConfirmOptions = { title?: string; confirmLabel?: string; danger?: boolean }
@@ -194,12 +195,26 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   }, [])
   const liveEventsSocket = useRef<WebSocket | null>(null)
   const playableJobs = useRef<Record<string, boolean>>({})
-  const liveState = useRef({ root, expanded })
-  liveState.current = { root, expanded }
+  const liveState = useRef({ root, expanded, columnPath })
+  liveState.current = { root, expanded, columnPath }
   const liveDirectorySubscription = Object.keys(expanded).sort().join(',')
 
-  const loadRoot = async () => { try { setRoot(await api.list('', hidden)); setExpanded({}); setSelected(new Set()); setPrimary(null); setColumnPath([]); setCurrentDir('') } catch (e) { setError(messageOf(e)) } }
-  useEffect(() => { loadRoot() }, [hidden])
+  useEffect(() => {
+    let active = true
+    const reloadNavigation = async () => {
+      try {
+        const directoryIds = ['', ...columnPath.map(entry => entry.id)]
+        const pages = await Promise.all(directoryIds.map(async directoryId =>
+          retainActiveHiddenDirectory(await api.list(directoryId, hidden), directoryId, columnPath, hidden)))
+        if (!active) return
+        setRoot(pages[0])
+        setExpanded(Object.fromEntries(directoryIds.slice(1).map((directoryId, index) => [directoryId, pages[index + 1]])))
+        setSelected(new Set()); setPrimary(null)
+      } catch (e) { if (active) setError(messageOf(e)) }
+    }
+    void reloadNavigation()
+    return () => { active = false }
+  }, [hidden])
   useEffect(() => { localStorage.setItem('rfb-view', view) }, [view])
   useEffect(() => { localStorage.setItem('rfb-hidden', String(hidden)) }, [hidden])
   useEffect(() => { localStorage.setItem('rfb-column-preview', String(showPreview)) }, [showPreview])
@@ -238,7 +253,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       await Promise.all(directoryIds.map(async id => {
         try {
           const previousPage = id === '' ? liveState.current.root : liveState.current.expanded[id]
-          const page = await api.list(id, hidden)
+          const path = liveState.current.columnPath
+          const page = retainActiveHiddenDirectory(await api.list(id, hidden), id, path, hidden)
           if (id === '') setRoot(page); else setExpanded(previous => ({ ...previous, [id]: page }))
           if (previousPage) {
             const updatedEntry = (entry: Entry) => {
@@ -319,7 +335,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
 
   const refresh = async (id = currentDir) => {
     try {
-      const page = await api.list(id, hidden)
+      const page = retainActiveHiddenDirectory(await api.list(id, hidden), id, columnPath, hidden)
       if (id === '') setRoot(page); else setExpanded(previous => ({ ...previous, [id]: page }))
     } catch (e) { setError(messageOf(e)) }
   }
@@ -370,7 +386,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const loadDirectory = async (entry: Entry) => {
     if (liveState.current.expanded[entry.id]) return true
     try {
-      const page = await api.list(entry.id, hidden)
+      const page = retainActiveHiddenDirectory(await api.list(entry.id, hidden), entry.id, columnPath, hidden)
       setExpanded(previous => ({ ...previous, [entry.id]: page }))
       return true
     } catch (e) { setError(messageOf(e)); return false }
@@ -383,7 +399,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       return [...parentPath, entry]
     })
     if (!expanded[entry.id]) {
-      try { const page = await api.list(entry.id, hidden); setExpanded(previous => ({ ...previous, [entry.id]: page })) }
+      try { const page = retainActiveHiddenDirectory(await api.list(entry.id, hidden), entry.id, columnPath, hidden); setExpanded(previous => ({ ...previous, [entry.id]: page })) }
       catch (e) { setError(messageOf(e)) }
     }
   }
@@ -391,7 +407,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     setSelected(new Set([entry.id])); setPrimary(entry); setCurrentDir(entry.id)
     setColumnPath(previous => [...previous.slice(0, columnIndex), entry])
     if (!expanded[entry.id]) {
-      try { const page = await api.list(entry.id, hidden); setExpanded(previous => ({ ...previous, [entry.id]: page })) }
+      try { const page = retainActiveHiddenDirectory(await api.list(entry.id, hidden), entry.id, columnPath, hidden); setExpanded(previous => ({ ...previous, [entry.id]: page })) }
       catch (e) { setError(messageOf(e)) }
     }
   }
@@ -448,7 +464,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     const pathIndex = columnPath.findIndex(item => item.id === entry.id)
     if (entry.kind === 'directory' && pathIndex >= 0) {
       try {
-        const page = await api.list(renamed.id, hidden)
+        const page = retainActiveHiddenDirectory(await api.list(renamed.id, hidden), renamed.id, columnPath, hidden)
         setExpanded(previous => { const next = { ...previous }; delete next[entry.id]; next[renamed.id] = page; return next })
         setColumnPath(previous => [...previous.slice(0, pathIndex), renamed]); setCurrentDir(renamed.id)
       } catch (e) { setError(messageOf(e)); setColumnPath(previous => previous.slice(0, pathIndex)); setCurrentDir(entry.parentId) }
