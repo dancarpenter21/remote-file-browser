@@ -98,7 +98,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .timeline-toolbar label { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 .timeline-toolbar input { width: 88px; accent-color: var(--accent); }
 .timeline-scroll { overflow-x: auto; padding-bottom: 4px; }
-.timeline-track { position: relative; min-width: 100%; height: 104px; background-color: #101319; background-repeat: repeat-x; background-position: center; background-size: auto 78px; cursor: ew-resize; touch-action: none; user-select: none; }
+.timeline-track { position: relative; min-width: 100%; height: 140px; background-color: #101319; background-repeat: repeat-x; background-position: center top 13px; background-size: auto 78px; cursor: ew-resize; touch-action: none; user-select: none; }
 .timeline-track.is-scrubbing { cursor: grabbing; }
 .timeline-track::before { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, transparent 49.8%, rgba(255,255,255,.035) 50%, transparent 50.2%); background-size: 10% 100%; pointer-events: none; }
 .timeline-frame-preview { position: fixed; z-index: 50; overflow: hidden; width: 176px; transform: translateX(-50%); background: #090b0f; border: 1px solid #3a414d; border-radius: 5px; box-shadow: 0 10px 28px rgba(0,0,0,.55); pointer-events: none; }
@@ -122,6 +122,11 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .highlight-handle::before { content: ""; position: absolute; top: 0; left: 1px; width: 7px; height: 7px; background: var(--accent-2); clip-path: polygon(0 0, 100% 0, 50% 100%); }
 .playhead { position: absolute; z-index: 8; top: 0; bottom: 0; width: 1px; background: #ff6666; pointer-events: none; }
 .playhead::before { content: ""; position: absolute; top: 0; left: -4px; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 6px solid #ff6666; }
+.crowd-gain-lane { position: absolute; z-index: 9; right: 0; bottom: 0; left: 0; height: 38px; background: rgba(8,10,14,.92); border-top: 1px solid #303641; cursor: crosshair; }
+.crowd-gain-label { position: absolute; z-index: 2; top: 4px; left: 7px; color: #68717d; font: 8px var(--mono); pointer-events: none; }
+.crowd-gain-lane svg { position: absolute; inset: 3px 0; width: 100%; height: calc(100% - 6px); overflow: visible; pointer-events: none; }
+.crowd-gain-lane polyline { fill: none; stroke: #ffbf69; stroke-width: .45; vector-effect: non-scaling-stroke; }
+.crowd-gain-point { position: absolute; z-index: 3; width: 10px; height: 10px; padding: 0; transform: translate(-50%, -50%); background: #ffbf69; border: 2px solid #111319; border-radius: 50%; cursor: move; }
 .edit-workflow { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding-top: 12px; }
 .workflow-step { min-width: 0; padding: 13px; background: #12151a; border: 1px solid var(--line); border-radius: 6px; }
 .workflow-step.highlight-step { border-top: 2px solid var(--accent-2); }
@@ -162,6 +167,10 @@ kbd { margin-left: 5px; padding: 1px 4px; color: #7d8693; background: #0e1014; b
 .file-button { display: block; padding: 8px; color: #b5bcc6; background: #1a1d24; border: 1px solid var(--line); border-radius: 5px; text-align: center; font-size: 10px; cursor: pointer; }
 .file-button input { display: none; }
 .asset-note { margin: 8px 0 0; color: #656e7b; font-size: 9px; text-align: center; }
+.automation-note { margin: 12px 0 5px; color: #858e9b; font: 9px var(--mono); }
+.crowd-point-editor { display: grid; grid-template-columns: 1fr 66px 58px 24px; align-items: center; gap: 5px; margin: 5px 0; color: #8d96a3; font-size: 9px; }
+.crowd-point-editor input { min-width: 0; padding: 4px; color: #d8dde4; background: #0e1014; border: 1px solid #313641; border-radius: 3px; font: 9px var(--mono); }
+.crowd-point-editor button { padding: 4px; color: #8b6570; background: transparent; cursor: pointer; }
 .output-panel > p { color: var(--muted); font-size: 11px; }
 .render-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .render-actions button { padding: 10px; color: #d7dbe1; background: #1a1d24; border: 1px solid var(--line); border-radius: 5px; cursor: pointer; }

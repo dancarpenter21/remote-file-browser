@@ -11,8 +11,9 @@ The application invokes these executables as separate processes and verifies the
 
 ## Stadium ambience
 
-“College Football Game.wav” by Freesound user timmyg62, sound 328623, was dedicated to the public domain under CC0 1.0. The bundled file is a loop-prepared derivative of Freesound's HQ preview.
+“large-crowd-medium-distance-stereo.wav” by Freesound user eguobyte, sound 360703, was dedicated to the public domain under CC0 1.0. The bundled file is a filtered, loop-prepared derivative of the original lossless recording. The source is a diffuse crowd of roughly one thousand people with almost no distinct dialogue, suitable for an auditorium or sports venue.
 
-- Source: https://freesound.org/people/timmyg62/sounds/328623/
+- Source: https://freesound.org/people/eguobyte/sounds/360703/
+- Lossless mirror: https://commons.wikimedia.org/wiki/File:360703_eguobyte_large-crowd-medium-distance-stereo.wav
 - CC0: https://creativecommons.org/publicdomain/zero/1.0/
 - Exact checksums and transformation details: `assets/audio/stadium-crowd-loop.json`

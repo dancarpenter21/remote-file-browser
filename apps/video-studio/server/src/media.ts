@@ -3,6 +3,7 @@ import path from "node:path";
 import {
   buildSetPtsFrameExpression,
   compileTimeline,
+  crowdGainAtFrame,
   effectiveHighlightRange,
   fpsString,
   frameToSeconds,
@@ -161,6 +162,29 @@ function buildTempoCommands(frameCount: number, fps: Rational, sections: SlowSec
   return `${commands.join("\n")}\n`;
 }
 
+function buildCrowdVolumeExpression(project: Project, highlight: { startFrame: number; endFrameExclusive: number }, timeline: ReturnType<typeof compileTimeline>): string {
+  if (project.audio.crowdMuted) return "0";
+  const sourcePoints = [...project.audio.crowdGainPoints].sort((a, b) => a.frame - b.frame);
+  if (sourcePoints.length === 0) return `pow(10\,${project.audio.crowdGainDb}/20)`;
+  const frames = new Set<number>([highlight.startFrame, highlight.endFrameExclusive - 1]);
+  for (const point of sourcePoints) {
+    if (point.frame > highlight.startFrame && point.frame < highlight.endFrameExclusive - 1) frames.add(point.frame);
+  }
+  const mapped = [...frames].sort((a, b) => a - b).map((frame) => ({
+    seconds: timeline.outputPositionBySourceFrame[frame - highlight.startFrame]! * project.source.fps.den / project.source.fps.num,
+    gainDb: crowdGainAtFrame(sourcePoints, project.audio.crowdGainDb, frame),
+  }));
+  let dbExpression = String(mapped[mapped.length - 1]!.gainDb);
+  for (let index = mapped.length - 2; index >= 0; index -= 1) {
+    const left = mapped[index]!;
+    const right = mapped[index + 1]!;
+    const span = Math.max(Number.EPSILON, right.seconds - left.seconds);
+    const value = `${left.gainDb}+(t-${left.seconds})/${span}*(${right.gainDb - left.gainDb})`;
+    dbExpression = `if(lt(t\,${right.seconds})\,${value}\,${dbExpression})`;
+  }
+  return `pow(10\,(${dbExpression})/20)`;
+}
+
 export interface RenderOptions {
   kind: "preview" | "export";
   signal?: AbortSignal;
@@ -197,11 +221,11 @@ export async function renderProject(project: Project, options: RenderOptions): P
   const sourceAudio = project.source.hasAudio && project.audio.useOriginalAudio
     ? `[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=start=${highlightStartSeconds.toFixed(9)}:end=${highlightEndSeconds.toFixed(9)},asetpts=PTS-STARTPTS,asendcmd=f='${escapeFilterPath(commandFile)}',atempo@tempo1=1,atempo@tempo2=1,atempo@tempo3=1,apad,atrim=duration=${timeline.durationSeconds.toFixed(9)},volume=${project.audio.sourceGainDb}dB[sourceaudio];`
     : `anullsrc=r=48000:cl=stereo,atrim=duration=${timeline.durationSeconds.toFixed(9)}[sourceaudio];`;
-  const crowdGain = project.audio.crowdMuted ? -60 : project.audio.crowdGainDb;
+  const crowdVolume = buildCrowdVolumeExpression(project, highlight, timeline);
   const filter = [
     `[0:v:0]${videoPrefix}trim=start_frame=${highlight.startFrame}:end_frame=${highlight.endFrameExclusive},setpts=N/(${fps}*TB),tpad=stop_mode=clone:stop_duration=${(2 * project.source.fps.den / project.source.fps.num).toFixed(12)},setpts='${ptsExpression}',${interpolation},tpad=stop_mode=clone:stop_duration=${(project.source.fps.den / project.source.fps.num).toFixed(12)},trim=end_frame=${timeline.outputFrameCount},setpts=N/(${fps}*TB),fps=fps=${fps}:round=near[video];`,
     sourceAudio,
-    `[1:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=duration=${timeline.durationSeconds.toFixed(9)},afade=t=in:d=0.25,afade=t=out:st=${Math.max(0, timeline.durationSeconds - 0.25).toFixed(9)}:d=0.25,volume=${crowdGain}dB[crowd];`,
+    `[1:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=duration=${timeline.durationSeconds.toFixed(9)},afade=t=in:d=0.25,afade=t=out:st=${Math.max(0, timeline.durationSeconds - 0.25).toFixed(9)}:d=0.25,volume='${crowdVolume}':eval=frame[crowd];`,
     `[sourceaudio][crowd]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95:level=disabled[audio]`,
   ].join("\n");
   await writeFile(filterFile, filter);
@@ -249,7 +273,12 @@ export async function normalizeCustomCrowd(project: Project, input: string): Pro
   await rename(partial, output);
 }
 
-export async function readMediaFile(project: Project, kind: "proxy" | "waveform" | "preview" | "export"): Promise<string> {
+export async function readMediaFile(project: Project, kind: "proxy" | "waveform" | "preview" | "export" | "crowd"): Promise<string> {
+  if (kind === "crowd") {
+    const filename = project.audio.crowdSource === "custom" ? projectFile(project.id, "custom-crowd.flac") : bundledCrowdPath;
+    await readFile(filename);
+    return filename;
+  }
   const filename = kind === "proxy" ? project.proxyFilename : kind === "waveform" ? project.waveformFilename : project[kind]?.filename;
   if (!filename) throw new Error(`${kind} is not available.`);
   await readFile(projectFile(project.id, filename));

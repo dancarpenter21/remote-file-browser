@@ -26,6 +26,15 @@ async function maxAudioVolume(file: string): Promise<number> {
   return Number(value);
 }
 
+async function meanAudioVolume(file: string, start: number, duration: number): Promise<number> {
+  const { stderr } = await runProcess(ffmpegPath, [
+    "-hide_banner", "-ss", String(start), "-t", String(duration), "-i", file, "-map", "0:a:0", "-af", "volumedetect", "-f", "null", "-",
+  ]);
+  const value = /mean_volume:\s*(-?[\d.]+) dB/.exec(stderr)?.[1];
+  if (!value) throw new Error(`Could not read mean audio volume.\n${stderr}`);
+  return Number(value);
+}
+
 describe("media pipeline", () => {
   let externalSource: string;
   let project: Project;
@@ -60,6 +69,13 @@ describe("media pipeline", () => {
       speed: 0.125,
       rampInFrames: ramp,
       rampOutFrames: ramp,
+    }, {
+      id: "slow-two",
+      startFrame: 65,
+      endFrameExclusive: 72,
+      speed: 0.5,
+      rampInFrames: 1,
+      rampOutFrames: 1,
     }];
     project.highlightRange = { startFrame: 30, endFrameExclusive: 75 };
     project.revision = 1;
@@ -113,5 +129,19 @@ describe("media pipeline", () => {
     const withoutOriginal = await renderProject(project, { kind: "preview" });
     const withoutOriginalVolume = await maxAudioVolume(projectFile(project.id, withoutOriginal.filename));
     expect(withOriginalVolume - withoutOriginalVolume).toBeGreaterThan(20);
+  }, 30_000);
+
+  it("applies source-frame crowd automation to the retimed output", async () => {
+    project.audio.useOriginalAudio = false;
+    project.audio.crowdMuted = false;
+    project.audio.crowdGainPoints = [
+      { id: "quiet", frame: project.highlightRange!.startFrame, gainDb: -45 },
+      { id: "loud", frame: project.highlightRange!.endFrameExclusive - 1, gainDb: -5 },
+    ];
+    const artifact = await renderProject(project, { kind: "preview" });
+    const file = projectFile(project.id, artifact.filename);
+    const early = await meanAudioVolume(file, 0.5, 0.5);
+    const late = await meanAudioVolume(file, artifact.durationSeconds - 0.8, 0.5);
+    expect(late - early).toBeGreaterThan(12);
   }, 30_000);
 });

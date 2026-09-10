@@ -1,13 +1,13 @@
 {
-  "title": "College Football Game.wav",
-  "author": "timmyg62",
-  "freesoundSoundId": 328623,
-  "sourcePage": "https://freesound.org/people/timmyg62/sounds/328623/",
-  "downloadedPreview": "https://cdn.freesound.org/previews/328/328623_5649321-hq.mp3",
+  "title": "large-crowd-medium-distance-stereo.wav",
+  "author": "eguobyte",
+  "freesoundSoundId": 360703,
+  "sourcePage": "https://freesound.org/people/eguobyte/sounds/360703/",
+  "downloadSource": "https://commons.wikimedia.org/wiki/File:360703_eguobyte_large-crowd-medium-distance-stereo.wav",
   "license": "CC0-1.0",
   "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
-  "sourceSha256": "532ddcf3a26904a772bd724a94305365ffadea63c48b99dc811500ee4f32340b",
-  "derivativeSha256": "47c83d23da391297c58ffd1918fef4afeb68eabc3cc2f3c3300a98f9336463da",
-  "transformation": "Trimmed a 1.5 second head and tail, crossfaded tail into head, concatenated the middle and seam, resampled to 48 kHz stereo, and encoded MP3 at 192 kb/s.",
-  "generatedWith": "ffmpeg version 7.0.2-static (bundled Linux x64 executable)"
+  "sourceSha256": "9821f013c7a752c809a1805aa9fc7a0ac17fd813b40e7d81ba3c286e2e8fd81f",
+  "derivativeSha256": "2f9abeaf06aa33b63c57fca3a7301328c51c2b7c92afdff453c62e310bcc6452",
+  "transformation": "Trimmed 1.5 seconds from the head and tail, crossfaded the tail into the head, limited the spectrum to 90 Hz–4.2 kHz to keep the bed diffuse, resampled to 48 kHz stereo, and encoded MP3 at 192 kb/s.",
+  "generatedWith": "ffmpeg version 8.0.1-static (bundled Linux x64 executable)"
 }

@@ -1,6 +1,6 @@
 # Video Studio
 
-Video Studio is the workspace video application. It imports a capability-scoped source from Files into app-owned project storage, provides frame-accurate slow-motion and stadium-ambience editing, and publishes completed exports beside the source without overwriting existing files.
+Video Studio is the workspace video application. It imports a capability-scoped source from Files into app-owned project storage, provides frame-accurate slow-motion and source-frame-linked stadium-ambience automation, and publishes completed exports beside the source without overwriting existing files.
 
 Delegated playback uses Files' persistent HLS cache, so opening the same source in Files and Video Studio reuses one browser-compatible conversion. The editor's 720p project proxy remains app-owned and separate because it serves timeline editing rather than ordinary playback.
 

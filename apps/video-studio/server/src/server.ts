@@ -12,6 +12,7 @@ import {
   renderRequestSchema,
   effectiveHighlightRange,
   validateHighlightRange,
+  validateCrowdGainPoints,
   validateSections,
   type Project,
 } from "@remote-workspace/video-shared";
@@ -455,6 +456,7 @@ export async function buildServer() {
     const nextHighlight = patch.highlightRange ?? effectiveHighlightRange(project.source.frameCount, project.highlightRange);
     validateSections(nextSections, project.source.frameCount);
     validateHighlightRange(nextHighlight, project.source.frameCount, nextSections);
+    validateCrowdGainPoints(patch.audio?.crowdGainPoints ?? project.audio.crowdGainPoints, project.source.frameCount);
     if (patch.sections) project.sections = [...patch.sections].sort((a, b) => a.startFrame - b.startFrame);
     if (patch.highlightRange) project.highlightRange = patch.highlightRange;
     if (patch.name !== undefined) project.name = patch.name;
@@ -531,13 +533,14 @@ export async function buildServer() {
     return reply.type("image/jpeg").header("Cache-Control", "private, max-age=31536000, immutable").send(jpeg);
   });
 
-  app.get<{ Params: { id: string; kind: "proxy" | "waveform" | "preview" | "export" } }>("/api/projects/:id/media/:kind", async (request, reply) => {
+  app.get<{ Params: { id: string; kind: "proxy" | "waveform" | "preview" | "export" | "crowd" } }>("/api/projects/:id/media/:kind", async (request, reply) => {
     const project = await readProject(request.params.id);
-    if (!["proxy", "waveform", "preview", "export"].includes(request.params.kind)) return reply.code(404).send();
+    if (!["proxy", "waveform", "preview", "export", "crowd"].includes(request.params.kind)) return reply.code(404).send();
     const file = await readMediaFile(project, request.params.kind);
     const isWaveform = request.params.kind === "waveform";
     const download = request.params.kind === "export" ? `${project.name.replaceAll(/[^a-z0-9_-]+/gi, "-") || "video"}-edited.mp4` : undefined;
-    return sendRangedFile(request.headers.range, file, reply, isWaveform ? "image/png" : "video/mp4", download);
+    const contentType = isWaveform ? "image/png" : request.params.kind === "crowd" ? (project.audio.crowdSource === "custom" ? "audio/flac" : "audio/mpeg") : "video/mp4";
+    return sendRangedFile(request.headers.range, file, reply, contentType, download);
   });
 
   try {

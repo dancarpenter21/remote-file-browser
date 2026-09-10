@@ -25,12 +25,19 @@ export const highlightRangeSchema = z.object({
   endFrameExclusive: z.number().int().positive(),
 });
 
+export const crowdGainPointSchema = z.object({
+  id: z.string().min(1),
+  frame: z.number().int().nonnegative(),
+  gainDb: z.number().min(-60).max(0),
+});
+
 export const audioSettingsSchema = z.object({
   useOriginalAudio: z.boolean().default(true),
   sourceGainDb: z.number().min(-60).max(6),
   crowdGainDb: z.number().min(-60).max(0),
   crowdMuted: z.boolean(),
   crowdSource: z.enum(["bundled", "custom"]),
+  crowdGainPoints: z.array(crowdGainPointSchema).default([]),
 });
 
 export const sourceMetadataSchema = z.object({
@@ -94,6 +101,7 @@ export type Rational = z.infer<typeof rationalSchema>;
 export type SlowSpeed = z.infer<typeof slowSpeedSchema>;
 export type SlowSection = z.infer<typeof slowSectionSchema>;
 export type HighlightRange = z.infer<typeof highlightRangeSchema>;
+export type CrowdGainPoint = z.infer<typeof crowdGainPointSchema>;
 export type AudioSettings = z.infer<typeof audioSettingsSchema>;
 export type SourceMetadata = z.infer<typeof sourceMetadataSchema>;
 export type Project = z.infer<typeof projectSchema>;

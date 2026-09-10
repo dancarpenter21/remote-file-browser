@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { formatFrameTime, fpsValue, highlightContainsSection, highlightIntersectsSection, type HighlightRange, type Rational, type SlowSection } from "@remote-workspace/video-shared";
+import { formatFrameTime, fpsValue, highlightContainsSection, highlightIntersectsSection, type CrowdGainPoint, type HighlightRange, type Rational, type SlowSection } from "@remote-workspace/video-shared";
 import { apiUrl } from "./urls.js";
 
 interface Props {
@@ -9,6 +9,7 @@ interface Props {
   currentFrame: number;
   highlightRange: HighlightRange;
   sections: SlowSection[];
+  crowdGainPoints: CrowdGainPoint[];
   waveformUrl?: string;
   disabled?: boolean;
   onSeek: (frame: number) => void;
@@ -17,6 +18,9 @@ interface Props {
   onHighlightCommit: (range: HighlightRange) => void;
   onSectionsChange: (sections: SlowSection[]) => void;
   onSectionsCommit: (sections: SlowSection[]) => void;
+  onCrowdGainPointsChange: (points: CrowdGainPoint[]) => void;
+  onCrowdGainPointsCommit: (points: CrowdGainPoint[]) => void;
+  onAddCrowdGainPoint: (frame: number) => void;
 }
 
 type Drag = { sectionId: string; edge: "start" | "end" | "rampIn" | "rampOut" };
@@ -35,6 +39,10 @@ export function Timeline(props: Props) {
   const [highlightDrag, setHighlightDrag] = useState<HighlightDrag>();
   const [scrubbing, setScrubbing] = useState(false);
   const [hoverPreview, setHoverPreview] = useState<HoverPreview>();
+  const [gainDragId, setGainDragId] = useState<string>();
+  const gainLaneRef = useRef<HTMLDivElement>(null);
+  const gainPointsRef = useRef(props.crowdGainPoints);
+  gainPointsRef.current = props.crowdGainPoints;
   const ordered = useMemo(() => [...props.sections].sort((a, b) => a.startFrame - b.startFrame), [props.sections]);
   const sectionsRef = useRef(props.sections);
   sectionsRef.current = props.sections;
@@ -159,6 +167,33 @@ export function Timeline(props: Props) {
   }, [drag, ordered, props]);
 
   useEffect(() => {
+    if (!gainDragId) return;
+    const move = (event: PointerEvent) => {
+      const lane = gainLaneRef.current;
+      if (!lane) return;
+      const rect = lane.getBoundingClientRect();
+      const gainDb = Math.round(Math.max(-60, Math.min(0, -60 * (event.clientY - rect.top) / rect.height)));
+      const requestedFrame = eventFrame(event.clientX);
+      const occupied = new Set(gainPointsRef.current.filter((point) => point.id !== gainDragId).map((point) => point.frame));
+      const current = gainPointsRef.current.find((point) => point.id === gainDragId)!;
+      const frame = occupied.has(requestedFrame) ? current.frame : requestedFrame;
+      const next = gainPointsRef.current.map((point) => point.id === gainDragId ? { ...point, frame, gainDb } : point).sort((a, b) => a.frame - b.frame);
+      gainPointsRef.current = next;
+      props.onCrowdGainPointsChange(next);
+    };
+    const up = () => {
+      props.onCrowdGainPointsCommit(gainPointsRef.current);
+      setGainDragId(undefined);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up, { once: true });
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+  }, [gainDragId, props]);
+
+  useEffect(() => {
     if (!scrubbing) return;
     let pendingClientX: number | undefined;
     let animationFrame: number | undefined;
@@ -195,6 +230,7 @@ export function Timeline(props: Props) {
         <span>{formatFrameTime(props.currentFrame, props.fps)}</span>
         <span className="frame-label">Frame {props.currentFrame.toLocaleString()} / {(props.frameCount - 1).toLocaleString()}</span>
         <button className="timeline-focus-button" disabled={highlightIsFull} onClick={() => { setFocused((value) => !value); setZoom(1); }}>{focused ? "Show full video" : "Focus highlight"}</button>
+        <button className="timeline-focus-button" disabled={props.disabled || props.crowdGainPoints.some((point) => point.frame === props.currentFrame)} onClick={() => props.onAddCrowdGainPoint(props.currentFrame)}>Add crowd point</button>
         <label>Zoom <input aria-label="Timeline zoom" type="range" min="1" max="12" step="1" value={zoom} onChange={(event) => setZoom(Number(event.target.value))} /></label>
       </div>
       <div className="timeline-scroll">
@@ -248,6 +284,11 @@ export function Timeline(props: Props) {
           <button className="highlight-handle start" aria-label="Move highlight start" disabled={props.disabled} style={{ left: `${framePercent(props.highlightRange.startFrame)}%` }} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); if (!props.disabled) setHighlightDrag("start"); }} />
           <button className="highlight-handle end" aria-label="Move highlight end" disabled={props.disabled} style={{ left: `${framePercent(props.highlightRange.endFrameExclusive)}%` }} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); if (!props.disabled) setHighlightDrag("end"); }} />
           {props.currentFrame >= viewRange.startFrame && props.currentFrame < viewRange.endFrameExclusive && <div className="playhead" style={{ left: `${framePercent(props.currentFrame)}%` }} />}
+          <div ref={gainLaneRef} className="crowd-gain-lane" onPointerDown={(event) => event.stopPropagation()}>
+            <span className="crowd-gain-label">CROWD</span>
+            <svg aria-hidden="true" preserveAspectRatio="none" viewBox="0 0 100 60"><polyline points={props.crowdGainPoints.filter((point) => point.frame >= viewRange.startFrame && point.frame < viewRange.endFrameExclusive).map((point) => `${framePercent(point.frame)},${-point.gainDb}`).join(" ")} /></svg>
+            {props.crowdGainPoints.map((point, index) => point.frame >= viewRange.startFrame && point.frame < viewRange.endFrameExclusive ? <button key={point.id} className="crowd-gain-point" aria-label={`Adjust crowd volume point ${index + 1}`} title={`${point.gainDb} dB at frame ${point.frame}`} disabled={props.disabled} style={{ left: `${framePercent(point.frame)}%`, top: `${(-point.gainDb / 60) * 100}%` }} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); if (!props.disabled) setGainDragId(point.id); }} /> : null)}
+          </div>
         </div>
       </div>
       {hoverPreview && (

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   compileHighlightTimeline,
+  crowdGainAtFrame,
   defaultRampFrames,
   effectiveHighlightRange,
   formatFrameTime,
@@ -8,6 +9,7 @@ import {
   highlightContainsSection,
   validateHighlightRange,
   type AudioSettings,
+  type CrowdGainPoint,
   type Project,
   type RenderJob,
   type SlowSection,
@@ -44,8 +46,11 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
   const [publishingExport, setPublishingExport] = useState(false);
   const [publishedExport, setPublishedExport] = useState<PublishedRemoteExport>();
   const videoRef = useRef<HTMLVideoElement>(null);
+  const crowdRef = useRef<HTMLAudioElement>(null);
   const projectRef = useRef(project);
-  const savingRef = useRef(false);
+  const saveChainRef = useRef<Promise<void>>(Promise.resolve());
+  const saveSequenceRef = useRef(0);
+  const pendingSavesRef = useRef(0);
   projectRef.current = project;
 
   const timeline = compileHighlightTimeline(project.source.frameCount, project.source.fps, sections, highlightRange);
@@ -119,8 +124,15 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
   }, [currentFrame, playing, project.source.fps]);
 
   useEffect(() => {
-    if (videoRef.current) videoRef.current.volume = playbackVolume;
-  }, [playbackVolume]);
+    const video = videoRef.current;
+    const crowd = crowdRef.current;
+    const sourceScale = audio.useOriginalAudio ? Math.min(1, 10 ** (audio.sourceGainDb / 20)) : 0;
+    if (video) video.volume = playbackVolume * sourceScale;
+    if (crowd) {
+      const gainDb = crowdGainAtFrame(audio.crowdGainPoints, audio.crowdGainDb, currentFrame);
+      crowd.volume = audio.crowdMuted ? 0 : Math.min(1, playbackVolume * 10 ** (gainDb / 20));
+    }
+  }, [audio, currentFrame, playbackVolume]);
 
   function stepFrame(amount: -1 | 1): void {
     videoRef.current?.pause();
@@ -129,14 +141,12 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
   }
 
   async function commit(nextSections = sections, nextAudio = audio, nextHighlight = highlightRange): Promise<boolean> {
-    if (savingRef.current) {
-      setError("Another edit is still being saved. Try again in a moment.");
-      return false;
-    }
-    savingRef.current = true;
+    const sequence = ++saveSequenceRef.current;
+    pendingSavesRef.current += 1;
     setSaving(true);
     setError(undefined);
-    try {
+    let succeeded = false;
+    const operation = saveChainRef.current.then(async () => {
       const currentProject = projectRef.current;
       const updated = await patchProject(currentProject.id, {
         expectedRevision: currentProject.revision,
@@ -145,25 +155,31 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
         highlightRange: nextHighlight,
       });
       projectRef.current = updated;
-      setProject(updated);
-      setSections(updated.sections);
-      setAudio(updated.audio);
-      setHighlightRange(effectiveHighlightRange(updated.source.frameCount, updated.highlightRange));
-      onProjectChange(updated);
-      return true;
-    } catch (cause) {
+      if (sequence === saveSequenceRef.current) {
+        setProject(updated);
+        setSections(updated.sections);
+        setAudio(updated.audio);
+        setHighlightRange(effectiveHighlightRange(updated.source.frameCount, updated.highlightRange));
+        onProjectChange(updated);
+      }
+      succeeded = true;
+    }).catch(async (cause) => {
       setError(cause instanceof Error ? cause.message : "Could not save edits.");
       const refreshed = await getProject(projectRef.current.id);
       projectRef.current = refreshed;
-      setProject(refreshed);
-      setSections(refreshed.sections);
-      setAudio(refreshed.audio);
-      setHighlightRange(effectiveHighlightRange(refreshed.source.frameCount, refreshed.highlightRange));
-      return false;
-    } finally {
-      savingRef.current = false;
-      setSaving(false);
-    }
+      if (sequence === saveSequenceRef.current) {
+        setProject(refreshed);
+        setSections(refreshed.sections);
+        setAudio(refreshed.audio);
+        setHighlightRange(effectiveHighlightRange(refreshed.source.frameCount, refreshed.highlightRange));
+      }
+    }).finally(() => {
+      pendingSavesRef.current -= 1;
+      if (pendingSavesRef.current === 0) setSaving(false);
+    });
+    saveChainRef.current = operation.then(() => undefined);
+    await operation;
+    return succeeded;
   }
 
   async function addSection(): Promise<void> {
@@ -229,8 +245,9 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
   async function startRender(kind: "preview" | "export"): Promise<void> {
     try {
       setError(undefined);
+      await saveChainRef.current;
       if (kind === "export") setPublishedExport(undefined);
-      setJob(await createRender(project.id, kind, project.revision));
+      setJob(await createRender(projectRef.current.id, kind, projectRef.current.revision));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not start render.");
     }
@@ -252,10 +269,18 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
             <video
               ref={videoRef}
               src={apiUrl(`/projects/${project.id}/media/proxy`)}
-              onPlay={() => setPlaying(true)}
-              onPause={() => setPlaying(false)}
+              onPlay={() => {
+                setPlaying(true);
+                const crowd = crowdRef.current;
+                if (crowd) {
+                  if (Number.isFinite(crowd.duration) && crowd.duration > 0) crowd.currentTime = videoRef.current!.currentTime % crowd.duration;
+                  void crowd.play().catch(() => undefined);
+                }
+              }}
+              onPause={() => { setPlaying(false); crowdRef.current?.pause(); }}
               onTimeUpdate={(event) => playing && setCurrentFrame(Math.min(project.source.frameCount - 1, Math.floor(event.currentTarget.currentTime * fpsValue(project.source.fps))))}
             />
+            <audio ref={crowdRef} src={apiUrl(`/projects/${project.id}/media/crowd`)} loop preload="auto" aria-hidden="true" />
             {!playing && !scrubbing && <img className="exact-frame" src={apiUrl(`/projects/${project.id}/frames/${currentFrame}`)} alt={`Exact source frame ${currentFrame}`} />}
           </div>
           <div className="transport">
@@ -277,6 +302,7 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
             currentFrame={currentFrame}
             highlightRange={highlightRange}
             sections={sections}
+            crowdGainPoints={audio.crowdGainPoints}
             waveformUrl={project.waveformFilename ? apiUrl(`/projects/${project.id}/media/waveform`) : undefined}
             disabled={saving}
             onSeek={(frame) => { setPlaying(false); videoRef.current?.pause(); setCurrentFrame(frame); }}
@@ -285,6 +311,14 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
             onHighlightCommit={(next) => void commit(sections, audio, next)}
             onSectionsChange={setSections}
             onSectionsCommit={(next) => void commit(next, audio)}
+            onCrowdGainPointsChange={(points) => setAudio({ ...audio, crowdGainPoints: points })}
+            onCrowdGainPointsCommit={(points) => { const next = { ...audio, crowdGainPoints: points }; setAudio(next); void commit(sections, next); }}
+            onAddCrowdGainPoint={(frame) => {
+              if (audio.crowdGainPoints.some((point) => point.frame === frame)) return;
+              const next = { ...audio, crowdGainPoints: [...audio.crowdGainPoints, { id: createSectionId(), frame, gainDb: crowdGainAtFrame(audio.crowdGainPoints, audio.crowdGainDb, frame) }].sort((a, b) => a.frame - b.frame) };
+              setAudio(next);
+              void commit(sections, next);
+            }}
           />
           <div className="edit-workflow">
             <section className="workflow-step highlight-step">
@@ -336,10 +370,19 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
             <span className="eyebrow">Sound</span><h2>Stadium mix</h2>
             <label className="check-row"><input type="checkbox" checked={audio.useOriginalAudio} disabled={!project.source.hasAudio} onChange={(event) => { const next = { ...audio, useOriginalAudio: event.target.checked }; setAudio(next); void commit(sections, next); }} /> Use original audio</label>
             <Gain label="Source" value={audio.sourceGainDb} min={-60} max={6} disabled={!project.source.hasAudio || !audio.useOriginalAudio} onChange={(value) => setAudio({ ...audio, sourceGainDb: value })} onCommit={() => void commit(sections, audio)} />
-            <Gain label="Crowd" value={audio.crowdGainDb} min={-60} max={0} disabled={audio.crowdMuted} onChange={(value) => setAudio({ ...audio, crowdGainDb: value })} onCommit={() => void commit(sections, audio)} />
+            <Gain label={audio.crowdGainPoints.length > 0 ? "Crowd · automated" : "Crowd"} value={audio.crowdGainDb} min={-60} max={0} disabled={audio.crowdMuted || audio.crowdGainPoints.length > 0} onChange={(value) => setAudio({ ...audio, crowdGainDb: value })} onCommit={() => void commit(sections, audio)} />
+            <p className="automation-note">Crowd envelope · {audio.crowdGainPoints.length} {audio.crowdGainPoints.length === 1 ? "point" : "points"}{audio.crowdGainPoints.length > 0 ? " · remove all points to restore the flat level" : ""}</p>
+            {audio.crowdGainPoints.map((point, index) => <CrowdPointEditor key={point.id} point={point} index={index} frameCount={project.source.frameCount} disabled={saving} onChange={(patch) => {
+              const points = audio.crowdGainPoints.map((item) => item.id === point.id ? { ...item, ...patch } : item).sort((a, b) => a.frame - b.frame);
+              setAudio({ ...audio, crowdGainPoints: points });
+            }} onCommit={() => void commit(sections, audio)} onRemove={() => {
+              const next = { ...audio, crowdGainPoints: audio.crowdGainPoints.filter((item) => item.id !== point.id) };
+              setAudio(next);
+              void commit(sections, next);
+            }} />)}
             <label className="check-row"><input type="checkbox" checked={audio.crowdMuted} onChange={(event) => { const next = { ...audio, crowdMuted: event.target.checked }; setAudio(next); void commit(sections, next); }} /> Mute crowd</label>
-            <label className="file-button">Use custom ambience<input type="file" accept="audio/*" onChange={async (event) => { const file = event.target.files?.[0]; if (!file) return; try { const updated = await uploadCrowd(project.id, file); setProject(updated); setAudio(updated.audio); onProjectChange(updated); } catch (cause) { setError(cause instanceof Error ? cause.message : "Upload failed."); } }} /></label>
-            <p className="asset-note">{audio.crowdSource === "bundled" ? "Energetic CC0 college football crowd" : "Custom project ambience"}</p>
+            <label className="file-button">Use custom ambience<input type="file" accept="audio/*" onChange={async (event) => { const file = event.target.files?.[0]; if (!file) return; try { await saveChainRef.current; const updated = await uploadCrowd(projectRef.current.id, file); projectRef.current = updated; setProject(updated); setAudio(updated.audio); crowdRef.current?.load(); onProjectChange(updated); } catch (cause) { setError(cause instanceof Error ? cause.message : "Upload failed."); } }} /></label>
+            <p className="asset-note">{audio.crowdSource === "bundled" ? "Neutral CC0 arena crowd wash" : "Custom project ambience"}</p>
           </section>
 
           <section className="panel-section output-panel">
@@ -377,4 +420,8 @@ function PlayPauseIcon({ playing }: { playing: boolean }) {
 
 function Gain({ label, value, min, max, disabled, onChange, onCommit }: { label: string; value: number; min: number; max: number; disabled?: boolean; onChange: (value: number) => void; onCommit: () => void }) {
   return <label className="gain-control"><span>{label}</span><output>{value <= -60 ? "−∞" : `${value} dB`}</output><input type="range" min={min} max={max} value={value} disabled={disabled} onChange={(event) => onChange(Number(event.target.value))} onPointerUp={onCommit} /></label>;
+}
+
+function CrowdPointEditor({ point, index, frameCount, disabled, onChange, onCommit, onRemove }: { point: CrowdGainPoint; index: number; frameCount: number; disabled: boolean; onChange: (patch: Partial<CrowdGainPoint>) => void; onCommit: () => void; onRemove: () => void }) {
+  return <div className="crowd-point-editor"><span>Point {index + 1}</span><input aria-label={`Crowd point ${index + 1} frame`} type="number" min="0" max={frameCount - 1} value={point.frame} disabled={disabled} onChange={(event) => onChange({ frame: Number(event.target.value) })} onBlur={onCommit} /><input aria-label={`Crowd point ${index + 1} gain`} type="number" min="-60" max="0" value={point.gainDb} disabled={disabled} onChange={(event) => onChange({ gainDb: Number(event.target.value) })} onBlur={onCommit} /><button aria-label={`Remove crowd point ${index + 1}`} disabled={disabled} onClick={onRemove}>×</button></div>;
 }

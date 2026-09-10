@@ -1,4 +1,4 @@
-import type { HighlightRange, Rational, SlowSection } from "./types.js";
+import type { CrowdGainPoint, HighlightRange, Rational, SlowSection } from "./types.js";
 
 export interface TimelineMap {
   frameExpansion: number[];
@@ -54,6 +54,30 @@ export function validateSections(sections: SlowSection[], frameCount: number): v
       throw new Error("Slow-motion ranges cannot overlap.");
     }
   }
+}
+
+export function validateCrowdGainPoints(points: CrowdGainPoint[], frameCount: number): void {
+  const ids = new Set<string>();
+  const frames = new Set<number>();
+  for (const point of points) {
+    if (point.frame >= frameCount) throw new Error("A crowd-volume point is outside the source timeline.");
+    if (ids.has(point.id)) throw new Error("Crowd-volume point IDs must be unique.");
+    if (frames.has(point.frame)) throw new Error("Only one crowd-volume point can occupy a frame.");
+    ids.add(point.id);
+    frames.add(point.frame);
+  }
+}
+
+export function crowdGainAtFrame(points: CrowdGainPoint[], fallbackGainDb: number, frame: number): number {
+  if (points.length === 0) return fallbackGainDb;
+  const ordered = [...points].sort((a, b) => a.frame - b.frame);
+  if (frame <= ordered[0]!.frame) return ordered[0]!.gainDb;
+  if (frame >= ordered[ordered.length - 1]!.frame) return ordered[ordered.length - 1]!.gainDb;
+  const rightIndex = ordered.findIndex((point) => point.frame >= frame);
+  const left = ordered[rightIndex - 1]!;
+  const right = ordered[rightIndex]!;
+  const progress = (frame - left.frame) / (right.frame - left.frame);
+  return left.gainDb + (right.gainDb - left.gainDb) * progress;
 }
 
 export function effectiveHighlightRange(frameCount: number, range?: HighlightRange): HighlightRange {

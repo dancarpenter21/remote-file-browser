@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSetPtsFrameExpression, compileHighlightTimeline, compileTimeline, defaultRampFrames, effectiveHighlightRange, localizeSectionsForHighlight, validateHighlightRange, validateSections } from "./timeline.js";
+import { buildSetPtsFrameExpression, compileHighlightTimeline, compileTimeline, crowdGainAtFrame, defaultRampFrames, effectiveHighlightRange, localizeSectionsForHighlight, validateCrowdGainPoints, validateHighlightRange, validateSections } from "./timeline.js";
 import { audioSettingsSchema, type SlowSection } from "./types.js";
 
 const fps = { num: 30, den: 1 };
@@ -56,6 +56,20 @@ describe("timeline compiler", () => {
   it("defaults highlights to the complete source", () => {
     expect(effectiveHighlightRange(90)).toEqual({ startFrame: 0, endFrameExclusive: 90 });
     expect(audioSettingsSchema.parse({ sourceGainDb: 0, crowdGainDb: -24, crowdMuted: false, crowdSource: "bundled" }).useOriginalAudio).toBe(true);
+    expect(audioSettingsSchema.parse({ sourceGainDb: 0, crowdGainDb: -24, crowdMuted: false, crowdSource: "bundled" }).crowdGainPoints).toEqual([]);
+  });
+
+  it("interpolates crowd gain in dB and holds the endpoint levels", () => {
+    const points = [{ id: "quiet", frame: 20, gainDb: -30 }, { id: "loud", frame: 40, gainDb: -10 }];
+    expect(crowdGainAtFrame(points, -24, 0)).toBe(-30);
+    expect(crowdGainAtFrame(points, -24, 30)).toBe(-20);
+    expect(crowdGainAtFrame(points, -24, 60)).toBe(-10);
+    expect(crowdGainAtFrame([], -24, 30)).toBe(-24);
+  });
+
+  it("rejects duplicate and out-of-range crowd points", () => {
+    expect(() => validateCrowdGainPoints([{ id: "a", frame: 10, gainDb: -20 }, { id: "b", frame: 10, gainDb: -10 }], 90)).toThrow("one");
+    expect(() => validateCrowdGainPoints([{ id: "a", frame: 90, gainDb: -20 }], 90)).toThrow("outside");
   });
 
   it("compiles only contained slow sections into highlight-local frames", () => {

@@ -67,6 +67,7 @@ export async function createProjectRecord(name: string, source: SourceMetadata, 
       crowdGainDb: -24,
       crowdMuted: false,
       crowdSource: "bundled",
+      crowdGainPoints: [],
     },
     integration,
   };
