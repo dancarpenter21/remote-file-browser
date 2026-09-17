@@ -13,6 +13,8 @@ Files is the only service with the `/fs-root` mount. Other apps receive short-li
 
 Both production and development require an environment file and local administrator and database secrets. Copy a template and edit the mounted path and numeric identity. For production, also set the hostname, ingress bind address, and certificate paths:
 
+Docker must be running, and the host account launching Compose must be allowed to access the Docker socket. On Linux, add the account to the `docker` group with `sudo usermod -aG docker "$USER"`, then start a new login session (or run `newgrp docker`) before using the commands below.
+
 ```sh
 cp .env.example .env
 mkdir -p secrets
