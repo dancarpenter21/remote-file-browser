@@ -66,7 +66,7 @@ Run individual web apps with `npm run dev:files`, `npm run dev:images`, `npm run
 
 `FILES_ROOT_PATH` must be an existing path visible to Docker. Compose bind-mounts it at `/fs-root` without creating a missing host directory. The service runs as `FILES_UID:FILES_GID`; Windows-mounted WSL filesystems do not reproduce all POSIX ownership and permission behavior.
 
-The application owns `.trash` and `.cache/remote-file-browser` inside the mounted root. Ordinary deletion moves entries to `.trash`; permanent deletion is available from Trash. Thumbnail and shared converted-video cache limits are controlled by `FILES_CACHE_MAX_BYTES` and `FILES_CACHE_MAX_AGE_DAYS`.
+The application owns `.trash` and `.cache/remote-file-browser` inside the mounted root. Ordinary deletion moves entries to `.trash`; permanent deletion is available from Trash. Thumbnail and shared converted-video cache limits are controlled by `FILES_CACHE_MAX_BYTES` and `FILES_CACHE_MAX_AGE_DAYS`. Cleanup runs at startup and hourly and can also be started from the Media jobs panel. The age setting is the base retention period: repeat video plays build a gradually decaying popularity score and can extend retention up to 12 times the base period, while the byte limit can still evict any inactive cached item.
 
 The authenticated terminal runs inside the read-only Files server container, not on the Docker host, but it can modify `/fs-root`. Disable it with `FILES_TERMINAL_ENABLED=false` when command execution is unnecessary. Rotate the administrator password by replacing `secrets/admin_password`; new login attempts read the new value without a restart.
 

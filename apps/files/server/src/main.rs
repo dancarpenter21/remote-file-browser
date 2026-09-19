@@ -52,6 +52,9 @@ const TERMINAL_DEFAULT_COLS: u16 = 80;
 const LIVE_MAX_WATCH_DIRECTORIES: usize = 1024;
 const APP_LAUNCH_TTL: Duration = Duration::from_secs(60);
 const APP_CAPABILITY_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+const CACHE_PLAY_DEBOUNCE: Duration = Duration::from_secs(6 * 60 * 60);
+const CACHE_POPULARITY_HALF_LIVES: f64 = 6.0;
+const CACHE_MAX_RETENTION_MULTIPLIER: f64 = 12.0;
 
 #[derive(Clone)]
 struct AppState {
@@ -176,6 +179,10 @@ struct CacheRecord {
     source_size: u64,
     source_modified_ns: u64,
     dimension: Option<u32>,
+    #[serde(default)]
+    popularity_score: f64,
+    #[serde(default)]
+    last_played_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Default, Serialize, utoipa::ToSchema)]
@@ -184,6 +191,17 @@ struct CacheCleanupReport {
     artifacts_removed: u64,
     records_removed: u64,
     bytes_reclaimed: u64,
+}
+
+#[derive(Clone, Default, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct CacheStatus {
+    bytes_used: u64,
+    artifact_count: u64,
+    max_bytes: u64,
+    base_retention_days: u64,
+    maximum_retention_days: u64,
+    popularity_half_life_days: u64,
 }
 
 #[derive(Clone)]
@@ -278,6 +296,8 @@ type ApiResult<T> = Result<T, ApiError>;
         media_info,
         start_hls,
         list_media_jobs,
+        cache_status,
+        clean_cache,
         hls_status,
         hls_file,
         start_media_extraction,
@@ -339,6 +359,8 @@ type ApiResult<T> = Result<T, ApiError>;
         MediaJob,
         MediaExtractionRequest,
         ExtractionJob,
+        CacheStatus,
+        CacheCleanupReport,
         Document,
         WriteDocument
     )),
@@ -405,18 +427,7 @@ async fn main() {
     fs::create_dir_all(cache.join("hls"))
         .await
         .expect("create media cache");
-    if let Err(error) = fs::remove_dir_all(cache.join("hls")).await
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(%error, "could not remove obsolete Files HLS cache");
-    }
-    let mut cache_index = load_cache_index(&cache).await;
-    cache_index
-        .records
-        .retain(|_, record| record.kind == "thumbnail");
-    persist_cache_index(&cache, &cache_index)
-        .await
-        .expect("remove obsolete media cache records");
+    let cache_index = load_cache_index(&cache).await;
     let provenance_api_token = read_optional_token_alias(
         "FILES_PROVENANCE_API_TOKEN_FILE",
         "RFB_PROVENANCE_API_TOKEN_FILE",
@@ -589,6 +600,8 @@ async fn main() {
         .route("/media/info", get(media_info))
         .route("/media/hls", post(start_hls))
         .route("/media/jobs", get(list_media_jobs))
+        .route("/media/cache", get(cache_status))
+        .route("/media/cache/cleanup", post(clean_cache))
         .route("/media/hls/{key}/status", get(hls_status))
         .route("/media/hls/{key}/{file}", get(hls_file))
         .route("/media/extractions", post(start_media_extraction))
@@ -3557,9 +3570,7 @@ async fn entry_from_path_with_provenance(
             .await?
             .contains_key(&id);
     let browser_ready = if kind == "file" && mime.starts_with("video/") {
-        let hls_key = find_cache_key(state, "hls", &id, &meta, None)
-            .await
-            .unwrap_or_else(|| hls_cache_key(&id, &meta));
+        let hls_key = hls_cache_key(&id, &meta);
         if playlist_state(&config.cache.join("hls").join(hls_key)).0 {
             true
         } else if let Some(ready) = state
@@ -4764,6 +4775,8 @@ async fn thumbnail(
             source_size: meta.len(),
             source_modified_ns: source_modified_ns(&meta),
             dimension: Some(dimension),
+            popularity_score: 0.0,
+            last_played_at: None,
         },
     )
     .await?;
@@ -4911,18 +4924,99 @@ fn playlist_state(directory: &Path) -> (bool, bool) {
     )
 }
 
-const HLS_CACHE_VERSION: &str = "ffmpeg-8.1.2-progressive-hls-v3-shared";
+const HLS_CACHE_VERSION: &str = "ffmpeg-8.1.2-x264-crf20-medium-progressive-hls-v4-shared";
+const HLS_X264_PRESET: &str = "medium";
+const HLS_X264_CRF: &str = "20";
+
+fn hls_cache_key_parts(
+    id: &str,
+    source_inode: u64,
+    source_size: u64,
+    source_modified_ns: u64,
+) -> String {
+    let fingerprint =
+        format!("{id}:{source_inode}:{source_size}:{source_modified_ns}:{HLS_CACHE_VERSION}");
+    blake3::hash(fingerprint.as_bytes()).to_hex().to_string()
+}
 
 fn hls_cache_key(id: &str, source_meta: &std::fs::Metadata) -> String {
-    let fingerprint = format!(
-        "{}:{}:{}:{}:{}",
+    hls_cache_key_parts(
         id,
         source_meta.ino(),
         source_meta.len(),
         source_modified_ns(source_meta),
-        HLS_CACHE_VERSION
-    );
-    blake3::hash(fingerprint.as_bytes()).to_hex().to_string()
+    )
+}
+
+fn current_hls_cache_record(record: &CacheRecord) -> bool {
+    record.kind != "hls"
+        || record.key
+            == hls_cache_key_parts(
+                &record.source_id,
+                record.source_inode,
+                record.source_size,
+                record.source_modified_ns,
+            )
+}
+
+fn decayed_popularity(record: &CacheRecord, now: DateTime<Utc>, base_age_days: u64) -> f64 {
+    let Some(last_played) = record.last_played_at else {
+        return 0.0;
+    };
+    let elapsed_seconds = (now - last_played)
+        .to_std()
+        .unwrap_or_default()
+        .as_secs_f64();
+    let half_life_seconds =
+        base_age_days.max(1) as f64 * 24.0 * 60.0 * 60.0 * CACHE_POPULARITY_HALF_LIVES;
+    record.popularity_score.max(0.0) * 2.0_f64.powf(-elapsed_seconds / half_life_seconds)
+}
+
+fn adaptive_retention(record: &CacheRecord, base_age_days: u64) -> Duration {
+    let base_seconds = base_age_days.saturating_mul(24 * 60 * 60);
+    if record.kind != "hls" || record.last_played_at.is_none() {
+        return Duration::from_secs(base_seconds);
+    }
+    let multiplier = record
+        .popularity_score
+        .max(1.0)
+        .powi(2)
+        .min(CACHE_MAX_RETENTION_MULTIPLIER);
+    Duration::from_secs((base_seconds as f64 * multiplier) as u64)
+}
+
+fn cache_play_debounced(record: &CacheRecord, now: DateTime<Utc>) -> bool {
+    record
+        .last_played_at
+        .is_some_and(|last| (now - last).to_std().unwrap_or_default() < CACHE_PLAY_DEBOUNCE)
+}
+
+async fn record_hls_play(state: &AppState, key: &str) -> ApiResult<()> {
+    let now = Utc::now();
+    let record_id = cache_record_id("hls", key);
+    if state
+        .cache_index
+        .read()
+        .await
+        .records
+        .get(&record_id)
+        .is_some_and(|record| cache_play_debounced(record, now))
+    {
+        return Ok(());
+    }
+    let _write = state.cache_write.lock().await;
+    let mut index = state.cache_index.read().await.clone();
+    let Some(record) = index.records.get_mut(&record_id) else {
+        return Ok(());
+    };
+    if cache_play_debounced(record, now) {
+        return Ok(());
+    }
+    record.popularity_score = decayed_popularity(record, now, state.config.cache_age_days) + 1.0;
+    record.last_played_at = Some(now);
+    persist_cache_index(&state.config.cache, &index).await?;
+    *state.cache_index.write().await = index;
+    Ok(())
 }
 
 fn cached_mode(directory: &Path) -> String {
@@ -5030,9 +5124,7 @@ async fn prepare_hls(
             "HLS conversion is available only for video files",
         ));
     }
-    let key = find_cache_key(state, "hls", id, &source_meta, None)
-        .await
-        .unwrap_or_else(|| hls_cache_key(id, &source_meta));
+    let key = hls_cache_key(id, &source_meta);
     let directory = state.config.cache.join("hls").join(&key);
     let playlist = directory.join("index.m3u8");
     let file_name = source
@@ -5052,6 +5144,8 @@ async fn prepare_hls(
                 source_size: source_meta.len(),
                 source_modified_ns: source_modified_ns(&source_meta),
                 dimension: None,
+                popularity_score: 0.0,
+                last_played_at: None,
             },
         )
         .await?;
@@ -5098,6 +5192,8 @@ async fn prepare_hls(
             source_size: source_meta.len(),
             source_modified_ns: source_modified_ns(&source_meta),
             dimension: None,
+            popularity_score: 0.0,
+            last_played_at: None,
         },
     )
     .await?;
@@ -5154,7 +5250,9 @@ async fn prepare_hls(
                     "-c:v",
                     "libx264",
                     "-preset",
-                    "veryfast",
+                    HLS_X264_PRESET,
+                    "-crf",
+                    HLS_X264_CRF,
                     "-pix_fmt",
                     "yuv420p",
                     "-force_key_frames",
@@ -5298,15 +5396,18 @@ async fn serve_hls_asset(
         .parse()
         .unwrap(),
     );
+    if file.ends_with(".ts")
+        && let Err(error) = record_hls_play(state, key).await
+    {
+        warn!(?error, key, "could not update adaptive cache popularity");
+    }
     Ok(response)
 }
 
 async fn hls_key_for_delegated_file(state: &AppState, file: &DelegatedFile) -> ApiResult<String> {
     let source = validate_delegated_file(state, file).await?;
     let meta = fs::metadata(&source).await?;
-    Ok(find_cache_key(state, "hls", &file.id, &meta, None)
-        .await
-        .unwrap_or_else(|| hls_cache_key(&file.id, &meta)))
+    Ok(hls_cache_key(&file.id, &meta))
 }
 
 fn require_video_studio_hls(capability: &AppCapability) -> ApiResult<()> {
@@ -5438,30 +5539,99 @@ async fn delegated_hls_file(
     serve_hls_asset(&state, &headers, &key, &file_name).await
 }
 
+async fn read_cache_status(state: &AppState) -> ApiResult<CacheStatus> {
+    let cache = state.config.cache.clone();
+    let (bytes_used, artifact_count) = tokio::task::spawn_blocking(move || {
+        let mut bytes = 0_u64;
+        let mut artifacts = 0_u64;
+        if let Ok(read) = std::fs::read_dir(cache.join("thumbnails")) {
+            for item in read.flatten() {
+                if let Ok(meta) = item.metadata()
+                    && meta.is_file()
+                {
+                    bytes = bytes.saturating_add(meta.len());
+                    artifacts += 1;
+                }
+            }
+        }
+        if let Ok(read) = std::fs::read_dir(cache.join("hls")) {
+            for item in read.flatten() {
+                if item.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    bytes = bytes.saturating_add(directory_stats(&item.path()).0);
+                    artifacts += 1;
+                }
+            }
+        }
+        (bytes, artifacts)
+    })
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(CacheStatus {
+        bytes_used,
+        artifact_count,
+        max_bytes: state.config.cache_max,
+        base_retention_days: state.config.cache_age_days,
+        maximum_retention_days: state
+            .config
+            .cache_age_days
+            .saturating_mul(CACHE_MAX_RETENTION_MULTIPLIER as u64),
+        popularity_half_life_days: state
+            .config
+            .cache_age_days
+            .saturating_mul(CACHE_POPULARITY_HALF_LIVES as u64),
+    })
+}
+
+#[utoipa::path(get, path = "/api/v1/media/cache", tag = "media", security(("sessionCookie" = [])), responses((status = 200, body = CacheStatus), (status = 401, body = Problem)))]
+async fn cache_status(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> ApiResult<Json<CacheStatus>> {
+    require_session(&state, &jar)?;
+    Ok(Json(read_cache_status(&state).await?))
+}
+
+async fn run_cache_cleanup(state: &AppState) -> ApiResult<CacheCleanupReport> {
+    let _ = state.live_events.send(LiveEvent::CacheCleanup {
+        state: "started".into(),
+        report: None,
+        error: None,
+    });
+    match cleanup_cache(state).await {
+        Ok(report) => {
+            let _ = state.live_events.send(LiveEvent::CacheCleanup {
+                state: "complete".into(),
+                report: Some(report.clone()),
+                error: None,
+            });
+            Ok(report)
+        }
+        Err(error) => {
+            let _ = state.live_events.send(LiveEvent::CacheCleanup {
+                state: "failed".into(),
+                report: None,
+                error: Some(error.2.clone()),
+            });
+            Err(error)
+        }
+    }
+}
+
+#[utoipa::path(post, path = "/api/v1/media/cache/cleanup", tag = "media", params(("x-csrf-token" = String, Header)), security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 200, body = CacheCleanupReport), (status = 401, body = Problem), (status = 403, body = Problem)))]
+async fn clean_cache(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> ApiResult<Json<CacheCleanupReport>> {
+    require_csrf(&state, &jar, &headers)?;
+    Ok(Json(run_cache_cleanup(&state).await?))
+}
+
 fn spawn_cache_cleanup(state: AppState) {
     tokio::spawn(async move {
         loop {
-            let _ = state.live_events.send(LiveEvent::CacheCleanup {
-                state: "started".into(),
-                report: None,
-                error: None,
-            });
-            match cleanup_cache(&state).await {
-                Ok(report) => {
-                    let _ = state.live_events.send(LiveEvent::CacheCleanup {
-                        state: "complete".into(),
-                        report: Some(report),
-                        error: None,
-                    });
-                }
-                Err(error) => {
-                    error!(?error, "cache cleanup failed");
-                    let _ = state.live_events.send(LiveEvent::CacheCleanup {
-                        state: "failed".into(),
-                        report: None,
-                        error: Some(error.2),
-                    });
-                }
+            if let Err(error) = run_cache_cleanup(&state).await {
+                error!(?error, "cache cleanup failed");
             }
             tokio::time::sleep(Duration::from_secs(60 * 60)).await;
         }
@@ -5525,7 +5695,8 @@ async fn reconcile_cache(
                             && meta.ino() == record.source_inode
                             && meta.len() == record.source_size
                             && source_modified_ns(&meta) == record.source_modified_ns
-                    });
+                    })
+                    && current_hls_cache_record(record);
                 let artifact_valid =
                     artifact.exists() && (record.kind != "hls" || playlist_state(&artifact).1);
                 (!source_valid || !artifact_valid).then_some((record_id.clone(), record.clone()))
@@ -5598,62 +5769,96 @@ async fn reconcile_cache(
 }
 
 async fn evict_cache(state: &AppState, active: HashSet<String>) -> ApiResult<(u64, u64)> {
-    let max_age = Duration::from_secs(state.config.cache_age_days * 24 * 60 * 60);
     let cache = state.config.cache.clone();
     let max_bytes = state.config.cache_max;
+    let base_age_days = state.config.cache_age_days;
+    let records = state.cache_index.read().await.clone().records;
     tokio::task::spawn_blocking(move || {
-        let mut units = Vec::<(PathBuf, u64, SystemTime, bool)>::new();
+        struct CacheUnit {
+            path: PathBuf,
+            size: u64,
+            access: SystemTime,
+            directory: bool,
+            retention: Duration,
+            popularity: f64,
+        }
+        let now = SystemTime::now();
+        let now_utc = DateTime::<Utc>::from(now);
+        let base_retention = Duration::from_secs(base_age_days.saturating_mul(24 * 60 * 60));
+        let mut units = Vec::<CacheUnit>::new();
+        let mut protected_bytes = 0_u64;
         if let Ok(read) = std::fs::read_dir(cache.join("thumbnails")) {
             for item in read.flatten() {
                 if let Ok(meta) = item.metadata()
                     && meta.is_file()
                 {
-                    units.push((
-                        item.path(),
-                        meta.len(),
-                        meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH),
-                        false,
-                    ));
+                    units.push(CacheUnit {
+                        path: item.path(),
+                        size: meta.len(),
+                        access: meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH),
+                        directory: false,
+                        retention: base_retention,
+                        popularity: 0.0,
+                    });
                 }
             }
         }
         if let Ok(read) = std::fs::read_dir(cache.join("hls")) {
             for item in read.flatten() {
                 let key = item.file_name().to_string_lossy().into_owned();
-                if item.file_type().is_ok_and(|kind| kind.is_dir()) && !active.contains(&key) {
+                if item.file_type().is_ok_and(|kind| kind.is_dir()) {
                     let (size, access) = directory_stats(&item.path());
-                    units.push((item.path(), size, access, true));
+                    if active.contains(&key) {
+                        protected_bytes = protected_bytes.saturating_add(size);
+                        continue;
+                    }
+                    let record = records.get(&cache_record_id("hls", &key));
+                    let access = record
+                        .and_then(|record| record.last_played_at)
+                        .map(SystemTime::from)
+                        .unwrap_or(access);
+                    units.push(CacheUnit {
+                        path: item.path(),
+                        size,
+                        access,
+                        directory: true,
+                        retention: record
+                            .map(|record| adaptive_retention(record, base_age_days))
+                            .unwrap_or(base_retention),
+                        popularity: record
+                            .map(|record| decayed_popularity(record, now_utc, base_age_days))
+                            .unwrap_or(0.0),
+                    });
                 }
             }
         }
-        let now = SystemTime::now();
         let mut removed_count = 0;
         let mut reclaimed = 0;
-        for (path, _, access, directory) in &units {
-            if now.duration_since(*access).unwrap_or_default() > max_age {
-                let bytes = units
-                    .iter()
-                    .find(|(candidate, _, _, _)| candidate == path)
-                    .map(|(_, size, _, _)| *size)
-                    .unwrap_or(0);
-                if remove_cache_artifact(path, *directory).is_ok() {
+        for unit in &units {
+            if now.duration_since(unit.access).unwrap_or_default() > unit.retention {
+                if remove_cache_artifact(&unit.path, unit.directory).is_ok() {
                     removed_count += 1;
-                    reclaimed += bytes;
+                    reclaimed += unit.size;
                 }
             }
         }
-        units.retain(|(path, _, _, _)| path.exists());
-        let mut total: u64 = units.iter().map(|(_, size, _, _)| *size).sum();
-        units.sort_by_key(|(_, _, access, _)| *access);
-        for (path, size, _, directory) in units {
+        units.retain(|unit| unit.path.exists());
+        let mut total = protected_bytes.saturating_add(units.iter().map(|unit| unit.size).sum());
+        units.sort_by(|left, right| {
+            left.popularity
+                .partial_cmp(&right.popularity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.access.cmp(&right.access))
+        });
+        for unit in units {
             if total <= max_bytes.saturating_mul(9) / 10 {
                 break;
             }
-            let removed = remove_cache_artifact(&path, directory);
+            let removed = remove_cache_artifact(&unit.path, unit.directory);
             if removed.is_ok() {
-                total = total.saturating_sub(size);
+                total = total.saturating_sub(unit.size);
                 removed_count += 1;
-                reclaimed += size;
+                reclaimed += unit.size;
             }
         }
         std::io::Result::Ok((removed_count, reclaimed))
@@ -6843,6 +7048,23 @@ mod tests {
         assert!(valid_hls_asset("segment-00042.ts"));
         assert!(!valid_hls_asset("segment-42.ts"));
         assert!(!valid_hls_asset("../index.m3u8"));
+        assert_eq!(HLS_X264_PRESET, "medium");
+        assert_eq!(HLS_X264_CRF, "20");
+
+        let mut record = CacheRecord {
+            kind: "hls".into(),
+            key: hls_cache_key_parts("video.divx", 42, 1_024, 7),
+            source_id: "video.divx".into(),
+            source_inode: 42,
+            source_size: 1_024,
+            source_modified_ns: 7,
+            dimension: None,
+            popularity_score: 0.0,
+            last_played_at: None,
+        };
+        assert!(current_hls_cache_record(&record));
+        record.key = "obsolete-profile-key".into();
+        assert!(!current_hls_cache_record(&record));
     }
 
     #[test]
@@ -6862,6 +7084,183 @@ mod tests {
         .unwrap();
         assert_eq!(playlist_state(cache.path()), (true, true));
     }
+
+    #[tokio::test]
+    async fn cache_reconciliation_keeps_only_the_current_hls_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        let mut records = Vec::new();
+        for (name, current) in [("current.mp4", true), ("obsolete.mp4", false)] {
+            let source = root.path().join(name);
+            std::fs::write(&source, b"video").unwrap();
+            let meta = std::fs::metadata(&source).unwrap();
+            let source_id = encode_path(OsStr::new(name));
+            let key = if current {
+                hls_cache_key(&source_id, &meta)
+            } else {
+                "obsolete-profile-key".into()
+            };
+            let directory = state.config.cache.join("hls").join(&key);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("segment-00000.ts"), b"segment").unwrap();
+            std::fs::write(
+                directory.join("index.m3u8"),
+                "#EXTM3U\n#EXTINF:4.0,\nsegment-00000.ts\n#EXT-X-ENDLIST\n",
+            )
+            .unwrap();
+            records.push(CacheRecord {
+                kind: "hls".into(),
+                key,
+                source_id,
+                source_inode: meta.ino(),
+                source_size: meta.len(),
+                source_modified_ns: source_modified_ns(&meta),
+                dimension: None,
+                popularity_score: 0.0,
+                last_played_at: None,
+            });
+        }
+        {
+            let mut index = state.cache_index.write().await;
+            for record in records {
+                index
+                    .records
+                    .insert(cache_record_id(&record.kind, &record.key), record);
+            }
+        }
+
+        let report = reconcile_cache(&state, &HashSet::new()).await.unwrap();
+
+        assert_eq!(report.records_removed, 1);
+        assert_eq!(report.artifacts_removed, 1);
+        let index = state.cache_index.read().await;
+        assert_eq!(index.records.len(), 1);
+        assert!(index.records.values().all(current_hls_cache_record));
+    }
+    #[test]
+    fn adaptive_cache_popularity_decays_and_extends_retention() {
+        let now = Utc::now();
+        let mut record = CacheRecord {
+            kind: "hls".into(),
+            key: "popular".into(),
+            source_id: "video.mp4".into(),
+            source_inode: 1,
+            source_size: 1,
+            source_modified_ns: 1,
+            dimension: None,
+            popularity_score: 2.0,
+            last_played_at: Some(now - chrono::Duration::days(180)),
+        };
+        assert!((decayed_popularity(&record, now, 30) - 1.0).abs() < 0.001);
+        record.last_played_at = Some(now);
+        for (score, days) in [(1.0, 30), (2.0, 120), (3.0, 270), (4.0, 360)] {
+            record.popularity_score = score;
+            assert_eq!(
+                adaptive_retention(&record, 30),
+                Duration::from_secs(days * 86_400)
+            );
+        }
+        assert_eq!(adaptive_retention(&record, 0), Duration::ZERO);
+        assert!(cache_play_debounced(
+            &record,
+            now + chrono::Duration::hours(1)
+        ));
+        assert!(!cache_play_debounced(
+            &record,
+            now + chrono::Duration::hours(6)
+        ));
+    }
+
+    #[tokio::test]
+    async fn segment_plays_are_persisted_once_per_debounce_window() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        let record = CacheRecord {
+            kind: "hls".into(),
+            key: "played".into(),
+            source_id: "video.mp4".into(),
+            source_inode: 1,
+            source_size: 1,
+            source_modified_ns: 1,
+            dimension: None,
+            popularity_score: 0.0,
+            last_played_at: None,
+        };
+        state
+            .cache_index
+            .write()
+            .await
+            .records
+            .insert(cache_record_id(&record.kind, &record.key), record);
+
+        record_hls_play(&state, "played").await.unwrap();
+        record_hls_play(&state, "played").await.unwrap();
+
+        let index = state.cache_index.read().await;
+        let record = &index.records["hls:played"];
+        assert_eq!(record.popularity_score, 1.0);
+        assert!(record.last_played_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn capacity_cleanup_prefers_cold_inactive_streams() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        let now = Utc::now();
+        for (key, popularity) in [("cold", 0.0), ("popular", 3.0)] {
+            let directory = state.config.cache.join("hls").join(key);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("segment-00000.ts"), vec![0_u8; 800]).unwrap();
+            let record = CacheRecord {
+                kind: "hls".into(),
+                key: key.into(),
+                source_id: format!("{key}.mp4"),
+                source_inode: 1,
+                source_size: 1,
+                source_modified_ns: 1,
+                dimension: None,
+                popularity_score: popularity,
+                last_played_at: (popularity > 0.0).then_some(now),
+            };
+            state
+                .cache_index
+                .write()
+                .await
+                .records
+                .insert(cache_record_id(&record.kind, &record.key), record);
+        }
+
+        let (removed, reclaimed) = evict_cache(&state, HashSet::new()).await.unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(reclaimed >= 800);
+        assert!(!state.config.cache.join("hls/cold").exists());
+        assert!(state.config.cache.join("hls/popular").exists());
+    }
+
+    #[tokio::test]
+    async fn cache_status_counts_thumbnail_and_stream_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        std::fs::write(
+            state.config.cache.join("thumbnails/one.webp"),
+            vec![0_u8; 10],
+        )
+        .unwrap();
+        let stream = state.config.cache.join("hls/stream");
+        std::fs::create_dir_all(&stream).unwrap();
+        std::fs::write(stream.join("segment-00000.ts"), vec![0_u8; 20]).unwrap();
+
+        let status = read_cache_status(&state).await.unwrap();
+
+        assert_eq!(status.bytes_used, 30);
+        assert_eq!(status.artifact_count, 2);
+        assert_eq!(status.max_bytes, 1_024);
+        assert_eq!(status.base_retention_days, 1);
+        assert_eq!(status.maximum_retention_days, 12);
+        assert_eq!(status.popularity_half_life_days, 6);
+    }
+
     #[test]
     fn live_watch_messages_and_events_target_loaded_directories() {
         assert!(matches!(
@@ -6945,6 +7344,8 @@ mod tests {
             source_size: meta.len(),
             source_modified_ns: source_modified_ns(&meta),
             dimension: Some(192),
+            popularity_score: 0.0,
+            last_played_at: None,
         };
         assert!(!cache_record_matches(
             &record,
@@ -6976,5 +7377,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy.records["thumbnail:legacy"].source_inode, 0);
+        assert_eq!(legacy.records["thumbnail:legacy"].popularity_score, 0.0);
+        assert!(legacy.records["thumbnail:legacy"].last_played_at.is_none());
     }
 }

@@ -74,6 +74,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .viewer-panel { min-width: 0; padding: 25px; border-right: 1px solid var(--line); }
 .viewer { position: relative; overflow: hidden; display: grid; place-items: center; aspect-ratio: 16 / 9; max-height: calc(100vh - 360px); min-height: 360px; background: #030405; border: 1px solid #20242c; border-radius: 6px; }
 .viewer video, .exact-frame { position: absolute; width: 100%; height: 100%; object-fit: contain; }
+.viewer video.actual-size, .viewer .exact-frame.actual-size { inset: 0; width: auto; height: auto; max-width: 100%; max-height: 100%; margin: auto; }
 .exact-frame { pointer-events: none; background: #030405; }
 .transport { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 54px; }
 .transport button, .workflow-step button, .render-actions button, .job-progress button { padding: 8px 11px; color: #abb2be; background: #181b21; border: 1px solid var(--line); border-radius: 5px; cursor: pointer; font-size: 11px; }
@@ -195,9 +196,11 @@ kbd { margin-left: 5px; padding: 1px 4px; color: #7d8693; background: #0e1014; b
 .player-header small { color: var(--muted); }
 .player-stage { min-height: 0; display: grid; place-items: center; }
 .player-stage video { width: 100%; height: 100%; background: #000; }
+.player-stage.actual-size video { width: auto; height: auto; max-width: 100%; max-height: 100%; }
 .player-tools { min-height: 70px; display: flex; align-items: center; flex-wrap: wrap; gap: 10px 24px; padding: 10px 16px; background: var(--panel); border-top: 1px solid var(--line); }
 .player-tools > div { display: flex; align-items: center; gap: 7px; }
 .player-tools button { padding: 6px 9px; color: #ddd; background: #20242a; border: 1px solid #3b414b; border-radius: 4px; }
+.video-size-toggle[aria-pressed="true"] { color: #fff; border-color: #77808f; background: #343942; }
 .player-tools code { color: #d4d8dd; }.player-tools small,.player-tools>span { color: var(--muted); font-size: 11px; }
 .concat-card { max-width: 680px; margin: 0 auto; padding: 22px; display: grid; gap: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 9px; }
 .concat-card ol { margin: 0; color: var(--muted); }.concat-card label { display: grid; gap: 7px; }.concat-card input { padding: 9px; color: #eee; background: #0f1115; border: 1px solid var(--line); border-radius: 5px; }

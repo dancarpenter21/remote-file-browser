@@ -40,6 +40,7 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
   const [playing, setPlaying] = useState(false);
   const [scrubbing, setScrubbing] = useState(false);
   const [playbackVolume, setPlaybackVolume] = useState(1);
+  const [fitVideo, setFitVideo] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
   const [job, setJob] = useState<RenderJob>();
@@ -68,6 +69,7 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
     setHighlightMarkOut(undefined);
     setMarkIn(undefined);
     setMarkOut(undefined);
+    setFitVideo(true);
   }, [initialProject]);
 
   useEffect(() => {
@@ -267,6 +269,7 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
         <section className="viewer-panel">
           <div className="viewer">
             <video
+              className={fitVideo ? undefined : "actual-size"}
               ref={videoRef}
               src={apiUrl(`/projects/${project.id}/media/proxy`)}
               onPlay={() => {
@@ -281,7 +284,7 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
               onTimeUpdate={(event) => playing && setCurrentFrame(Math.min(project.source.frameCount - 1, Math.floor(event.currentTarget.currentTime * fpsValue(project.source.fps))))}
             />
             <audio ref={crowdRef} src={apiUrl(`/projects/${project.id}/media/crowd`)} loop preload="auto" aria-hidden="true" />
-            {!playing && !scrubbing && <img className="exact-frame" src={apiUrl(`/projects/${project.id}/frames/${currentFrame}`)} alt={`Exact source frame ${currentFrame}`} />}
+            {!playing && !scrubbing && <img className={`exact-frame${fitVideo ? '' : ' actual-size'}`} src={apiUrl(`/projects/${project.id}/frames/${currentFrame}`)} alt={`Exact source frame ${currentFrame}`} />}
           </div>
           <div className="transport">
             <button className="frame-button" aria-label="Previous frame" title="Previous frame" onClick={() => stepFrame(-1)}><FrameStepIcon direction="previous" /></button>
@@ -289,6 +292,7 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
             <button className="frame-button" aria-label="Next frame" title="Next frame" onClick={() => stepFrame(1)}><FrameStepIcon direction="next" /></button>
             <span className="transport-time">{formatFrameTime(currentFrame, project.source.fps)}</span>
             <output className="transport-frame" aria-label={`Current frame ${currentFrame}`}>Frame {currentFrame.toLocaleString()}</output>
+            <button className="video-size-toggle" aria-pressed={!fitVideo} title={fitVideo ? "Show at actual pixel size when it fits" : "Fit video to the viewer"} onClick={() => setFitVideo(value => !value)}>{fitVideo ? "1:1" : "Fit"}</button>
             <label className="playback-volume" title="Preview volume">
               <svg aria-hidden="true" viewBox="0 0 24 24"><path className="volume-body" d="M4 9v6h4l5 4V5L8 9H4z" /><path className="volume-waves" d="M16.2 8.2a5.4 5.4 0 0 1 0 7.6m2.4-10a8.8 8.8 0 0 1 0 12.4" /></svg>
               <input aria-label="Preview volume" type="range" min="0" max="1" step="0.05" value={playbackVolume} onChange={(event) => setPlaybackVolume(Number(event.target.value))} />

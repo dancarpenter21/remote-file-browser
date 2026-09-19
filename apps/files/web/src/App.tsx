@@ -10,7 +10,7 @@ import {
   Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal,
   ExternalLink, Link2, Minus, Play, Plus, RefreshCw, Save, Scissors, Search, SquareTerminal, Trash2, Upload, WrapText, X,
 } from 'lucide-react'
-import { api, ApiFailure, contentUrl, type ConversionJob, type DocumentFile, Entry, EntryPage, type ExtractionJob, InstalledApp, LiveEvent, liveEventsUrl, liveFilesystemWatchMessage, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
+import { api, ApiFailure, type CacheCleanupEvent, type CacheStatus, contentUrl, type ConversionJob, type DocumentFile, Entry, EntryPage, type ExtractionJob, InstalledApp, LiveEvent, liveEventsUrl, liveFilesystemWatchMessage, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { deleteConfirmationMessage } from './deleteConfirmation'
 import { updateFinderPathForSelection } from './finderPath'
 import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState'
@@ -166,6 +166,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [error, setError] = useState('')
   const [conversionJobs, setConversionJobs] = useState<ConversionJob[]>([])
   const [extractionJobs, setExtractionJobs] = useState<ExtractionJob[]>([])
+  const [cacheStatus, setCacheStatus] = useState<CacheStatus | null>(null)
+  const [cacheCleanup, setCacheCleanup] = useState<CacheCleanupEvent | null>(null)
   const [folderMenu, setFolderMenu] = useState<{ directoryId: string; path: string; x: number; y: number } | null>(null)
   const [properties, setProperties] = useState<{ id: string; initial?: Entry } | null>(null)
   const [openFile, setOpenFile] = useState<{ entry: Entry; kind: BasicFileKind; previewing?: boolean; fragment?: string } | null>(null)
@@ -191,8 +193,19 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   useEffect(() => {
     let active = true
     api.apps().then(apps => { if (active) setInstalledApps(apps) }).catch(() => { if (active) setInstalledApps([]) })
+    api.cacheStatus().then(status => { if (active) setCacheStatus(status) }).catch(() => {})
     return () => { active = false }
   }, [])
+  const cleanCache = async () => {
+    setCacheCleanup({ type: 'cacheCleanup', state: 'started' })
+    try {
+      const report = await api.cleanCache()
+      setCacheCleanup({ type: 'cacheCleanup', state: 'complete', report })
+      setCacheStatus(await api.cacheStatus())
+    } catch (reason) {
+      setCacheCleanup({ type: 'cacheCleanup', state: 'failed', error: messageOf(reason) })
+    }
+  }
   const liveEventsSocket = useRef<WebSocket | null>(null)
   const playableJobs = useRef<Record<string, boolean>>({})
   const liveState = useRef({ root, expanded, columnPath })
@@ -316,6 +329,9 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
             setExtractionJobs(event.jobs)
           } else if (event.type === 'extractionJob') {
             setExtractionJobs(jobs => upsertJob(jobs, event.job))
+          } else if (event.type === 'cacheCleanup') {
+            setCacheCleanup(event)
+            if (event.state === 'complete') void api.cacheStatus().then(setCacheStatus).catch(() => {})
           }
         } catch { resync() }
       }
@@ -643,7 +659,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         <button className="nav-item active" onClick={() => { goToRoot(); setDrawerOpen(false) }}><Folder size={17} /> Files</button>
         <button className="nav-item" onClick={() => { void openTrash(); setDrawerOpen(false) }}><Trash2 size={17} /> Trash</button>
         {session.terminalEnabled && <button className={`nav-item ${terminal && !terminal.hidden ? 'active' : ''}`} aria-pressed={Boolean(terminal && !terminal.hidden)} onClick={() => { toggleTerminal(); setDrawerOpen(false) }}><SquareTerminal size={17} /> Terminal</button>}
-        <MediaJobs conversions={conversionJobs} extractions={extractionJobs} />
+        <MediaJobs conversions={conversionJobs} extractions={extractionJobs} cacheStatus={cacheStatus} cacheCleanup={cacheCleanup} cleanCache={cleanCache} />
         <div className="aside-note"><span>Signed in as</span><strong>{session.username}</strong>{isMobile && <button onClick={() => void logout()}><LogOut /> Sign out</button>}</div>
       </aside>
       <div className="content-stack">
@@ -707,11 +723,17 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   </div></InstalledAppsContext.Provider></ArchiveExtractionContext.Provider>
 }
 
-function MediaJobs({ conversions, extractions }: { conversions: ConversionJob[]; extractions: ExtractionJob[] }) {
+function MediaJobs({ conversions, extractions, cacheStatus, cacheCleanup, cleanCache }: { conversions: ConversionJob[]; extractions: ExtractionJob[]; cacheStatus: CacheStatus | null; cacheCleanup: CacheCleanupEvent | null; cleanCache: () => Promise<void> }) {
   const jobs = [...conversions, ...extractions].sort((left, right) => right.startedAt.localeCompare(left.startedAt)).slice(0, 20)
   const working = jobs.some(job => job.status === 'working')
+  const cleaning = cacheCleanup?.state === 'started'
+  const cleanupResult = cacheCleanup?.state === 'started' ? 'Cleaning cache…' : cacheCleanup?.state === 'complete'
+    ? cacheCleanup.report?.bytesReclaimed ? `${formatBytes(cacheCleanup.report.bytesReclaimed)} reclaimed` : 'Cache is within policy'
+    : cacheCleanup?.state === 'failed' ? cacheCleanup.error ?? 'Cache cleanup failed' : ''
   return <section className="conversion-jobs" aria-label="Media jobs">
-    <div className="conversion-jobs-heading"><Film /> Media jobs{working && <span className="conversion-pulse" aria-label="Media job active" />}</div>
+    <div className="conversion-jobs-heading"><Film /> Media jobs{working && <span className="conversion-pulse" aria-label="Media job active" />}<button className="cache-cleanup" disabled={cleaning} title="Clean media cache" aria-label="Clean media cache" onClick={() => void cleanCache()}><RefreshCw className={cleaning ? 'spinning' : ''} /></button></div>
+    {cacheStatus && <div className="cache-status"><strong>{formatBytes(cacheStatus.bytesUsed)} of {formatBytes(cacheStatus.maxBytes)}</strong><small>{cacheStatus.artifactCount} cached {cacheStatus.artifactCount === 1 ? 'item' : 'items'} · popular videos up to {cacheStatus.maximumRetentionDays} days</small></div>}
+    {cleanupResult && <small className={`cache-cleanup-result ${cacheCleanup?.state === 'failed' ? 'failed' : ''}`} role="status">{cleanupResult}</small>}
     <div className="conversion-job-list">
       {jobs.length === 0 ? <p>No media jobs yet.</p> : jobs.map(job => <article className={`conversion-job ${job.status}`} key={job.key} title={job.error}>
         <span className="conversion-status" />
@@ -1363,6 +1385,7 @@ function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: 
   const [playbackMessage, setPlaybackMessage] = useState('')
   const [usingFallback, setUsingFallback] = useState(false)
   const [hlsPlaylist, setHlsPlaylist] = useState('')
+  const [fitVideo, setFitVideo] = useState(true)
   const fallbackGate = useRef(createPlaybackFallbackGate())
   const cancelled = useRef(false)
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -1380,7 +1403,7 @@ function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: 
     cancelled.current = false
     fallbackGate.current.reset()
     clearTimeout(readinessTimer.current); clearTimeout(stallTimer.current); hlsRef.current?.destroy(); hlsRef.current = null
-    setError(''); setCurrentTime(0); setDuration(0); setFrameRate(undefined); setMarkIn(undefined); setMarkOut(undefined); setExtracting(false); setActionMessage(''); setPlaybackMessage(''); setUsingFallback(false); setHlsPlaylist('')
+    setError(''); setCurrentTime(0); setDuration(0); setFrameRate(undefined); setMarkIn(undefined); setMarkOut(undefined); setExtracting(false); setActionMessage(''); setPlaybackMessage(''); setUsingFallback(false); setHlsPlaylist(''); setFitVideo(true)
     if (kind === 'video') void api.mediaInfo(entry.id).then(info => {
       if (!cancelled.current) { setDuration(info.durationSeconds); setFrameRate(info.frameRate ?? undefined) }
     }).catch(reason => { if (!cancelled.current) setActionMessage(messageOf(reason)) })
@@ -1542,9 +1565,10 @@ function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: 
     {error && <div className="banner error basic-file-error" role="alert"><span>{error}</span></div>}
     {playbackMessage && <div className="basic-file-loading" role="status"><span className="spinner" /> {playbackMessage}</div>}
     {kind === 'image' ? <div className="basic-media-stage image"><button className="image-nav previous" disabled={images.length < 2} aria-label="Previous image" title="Previous image (Left Arrow)" onClick={() => navigate(-1)}><ChevronLeft /></button><img src={source} alt={entry.name} onError={() => setError('The image could not be displayed.')} /><button className="image-nav next" disabled={images.length < 2} aria-label="Next image" title="Next image (Right Arrow)" onClick={() => navigate(1)}><ChevronRight /></button></div> : <div className="basic-video-player">
-      <div className="basic-media-stage video"><video ref={videoRef} src={usingFallback ? undefined : source} controls autoPlay muted playsInline preload="metadata" loop={shouldAutoLoop(duration)} onError={() => void startPlaybackFallback()} onCanPlay={directPlaybackReady} onPlaying={directPlaybackReady} onWaiting={directPlaybackWaiting} onStalled={directPlaybackWaiting} onLoadedMetadata={event => { if (Number.isFinite(event.currentTarget.duration) && event.currentTarget.duration > 0) setDuration(event.currentTarget.duration) }} onTimeUpdate={event => setCurrentTime(event.currentTarget.currentTime)} onSeeked={event => setCurrentTime(event.currentTarget.currentTime)} /></div>
+      <div className={`basic-media-stage video${fitVideo ? '' : ' actual-size'}`}><video ref={videoRef} src={usingFallback ? undefined : source} controls autoPlay muted playsInline preload="metadata" loop={shouldAutoLoop(duration)} onError={() => void startPlaybackFallback()} onCanPlay={directPlaybackReady} onPlaying={directPlaybackReady} onWaiting={directPlaybackWaiting} onStalled={directPlaybackWaiting} onLoadedMetadata={event => { if (Number.isFinite(event.currentTarget.duration) && event.currentTarget.duration > 0) setDuration(event.currentTarget.duration) }} onTimeUpdate={event => setCurrentTime(event.currentTarget.currentTime)} onSeeked={event => setCurrentTime(event.currentTarget.currentTime)} /></div>
       <div className="basic-video-tools" aria-label="Video extraction controls">
         <div className="frame-controls"><button title="Previous frame (,)" aria-label="Previous frame" disabled={!frameRate} onClick={() => stepFrame(-1)}><ChevronLeft /></button><code>{formatMediaTime(currentTime)}</code><button title="Next frame (.)" aria-label="Next frame" disabled={!frameRate} onClick={() => stepFrame(1)}><ChevronRight /></button><span>{frameRate ? `${frameRate.toFixed(3)} fps` : 'FPS unavailable'}</span></div>
+        <button className="video-size-toggle" aria-pressed={!fitVideo} title={fitVideo ? 'Show at actual pixel size when it fits' : 'Fit video to the player'} onClick={() => setFitVideo(value => !value)}>{fitVideo ? '1:1' : 'Fit'}</button>
         <div className="marker-controls"><button title="Set In (I)" onClick={() => setMarkIn(currentTime)}>In</button><code>{markIn === undefined ? '--:--:--.---' : formatMediaTime(markIn)}</code><button title="Clear In" aria-label="Clear In" disabled={markIn === undefined} onClick={() => setMarkIn(undefined)}><X /></button><button title="Set Out (O)" onClick={() => setMarkOut(currentTime)}>Out</button><code>{markOut === undefined ? '--:--:--.---' : formatMediaTime(markOut)}</code><button title="Clear Out" aria-label="Clear Out" disabled={markOut === undefined} onClick={() => setMarkOut(undefined)}><X /></button></div>
         <div className="extract-controls"><button title="Extract frame (Shift+F)" disabled={extracting || !duration} onClick={extractFrame}><Camera /> Frame</button><button title="Extract segment (Shift+X)" disabled={extracting || !validSegment(markIn, markOut)} onClick={extractSegment}><Scissors /> Segment</button></div>
         {actionMessage && <div className="video-action-message" role="status">{actionMessage}</div>}

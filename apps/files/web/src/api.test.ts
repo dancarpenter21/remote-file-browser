@@ -97,3 +97,24 @@ describe('video extraction', () => {
     expect(fetchMock.mock.calls[1][0]).toBe(`/api/v1/media/hls/${job.key}/status`)
   })
 })
+
+describe('media cache', () => {
+  it('reads cache status and starts CSRF-protected cleanup', async () => {
+    const status = { bytesUsed: 1024, artifactCount: 2, maxBytes: 4096, baseRetentionDays: 30, maximumRetentionDays: 360, popularityHalfLifeDays: 180 }
+    const report = { artifactsRemoved: 1, recordsRemoved: 1, bytesReclaimed: 512 }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(status), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(report), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    setCsrf('csrf-token')
+
+    await expect(api.cacheStatus()).resolves.toEqual(status)
+    await expect(api.cleanCache()).resolves.toEqual(report)
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/media/cache')
+    const [path, init] = fetchMock.mock.calls[1]
+    expect(path).toBe('/api/v1/media/cache/cleanup')
+    expect(init.method).toBe('POST')
+    expect((init.headers as Headers).get('x-csrf-token')).toBe('csrf-token')
+  })
+})

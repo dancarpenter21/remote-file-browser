@@ -67,6 +67,21 @@ export type ExtractionJob = {
   error?: string
   result?: Entry
 }
+export type CacheStatus = {
+  bytesUsed: number
+  artifactCount: number
+  maxBytes: number
+  baseRetentionDays: number
+  maximumRetentionDays: number
+  popularityHalfLifeDays: number
+}
+export type CacheCleanupReport = { artifactsRemoved: number; recordsRemoved: number; bytesReclaimed: number }
+export type CacheCleanupEvent = {
+  type: 'cacheCleanup'
+  state: 'started' | 'complete' | 'failed'
+  report?: CacheCleanupReport
+  error?: string
+}
 export type LiveEvent =
   | { type: 'resync' }
   | { type: 'filesystem'; directoryIds: string[] }
@@ -75,6 +90,7 @@ export type LiveEvent =
   | { type: 'mediaJob'; job: ConversionJob }
   | { type: 'extractionSnapshot'; jobs: ExtractionJob[] }
   | { type: 'extractionJob'; job: ExtractionJob }
+  | CacheCleanupEvent
 
 export class ApiFailure extends Error {
   constructor(public status: number, public code: string, message: string) { super(message) }
@@ -164,6 +180,8 @@ export const api = {
   startHls: (id: string) => request<HlsJob>('/media/hls', { method: 'POST', body: JSON.stringify({ id }) }),
   hlsStatus: (key: string) => request<HlsJob>(`/media/hls/${encodeURIComponent(key)}/status`),
   conversionJobs: () => request<ConversionJob[]>('/media/jobs'),
+  cacheStatus: () => request<CacheStatus>('/media/cache'),
+  cleanCache: () => request<CacheCleanupReport>('/media/cache/cleanup', { method: 'POST' }),
   startExtraction: (input: { id: string; kind: 'frame'; time: number } | { id: string; kind: 'segment'; startTime: number; endTime: number }) =>
     request<ExtractionJob>('/media/extractions', { method: 'POST', body: JSON.stringify(input) }),
   extractionStatus: (key: string) => request<ExtractionJob>(`/media/extractions/${encodeURIComponent(key)}`),
