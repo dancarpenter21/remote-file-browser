@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createPlaybackFallbackGate, formatMediaTime, hlsPlaybackEngine, hlsRecoveryAction, shouldAutoLoop, stepFrameTime, validSegment } from './videoPlayerState'
+import { createPlaybackFallbackGate, formatMediaTime, hlsPlaybackEngine, hlsRecoveryAction, rememberNonzeroVolume, shouldAutoLoop, stepFrameTime, validSegment } from './videoPlayerState'
 
 describe('basic video player state', () => {
   it('starts compatibility fallback only once until reset', () => {
@@ -44,5 +44,11 @@ describe('basic video player state', () => {
     expect(shouldAutoLoop(40)).toBe(false)
     expect(shouldAutoLoop(0)).toBe(false)
     expect(shouldAutoLoop(Number.NaN)).toBe(false)
+  })
+
+  it('retains the last audible volume while muted or set to zero', () => {
+    expect(rememberNonzeroVolume(0.6, 0)).toBe(0.6)
+    expect(rememberNonzeroVolume(0.6, 0.25)).toBe(0.25)
+    expect(rememberNonzeroVolume(0, 0)).toBe(1)
   })
 })

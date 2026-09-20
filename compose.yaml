@@ -18,6 +18,8 @@ x-files-environment: &files-environment
   FILES_VIDEO_STUDIO_URL: /apps/video/
   FILES_TEXT_EDITOR_URL: /apps/text/
   FILES_IMAGE_TOOLS_URL: /apps/images/
+  FILES_ROKU_ENABLED: "${FILES_ROKU_ENABLED:-false}"
+  FILES_ROKU_STREAM_BASE_URL: "${FILES_ROKU_STREAM_BASE_URL:-}"
   RUST_LOG: "${RUST_LOG:-remote_file_browser=info,tower_http=info}"
 
 services:
@@ -40,7 +42,8 @@ services:
     networks: [default, provenance-api]
     depends_on:
       files-provenance: { condition: service_healthy }
-    expose: ["8080"]
+    expose: ["8080", "8081"]
+    ports: ["${FILES_ROKU_BIND_ADDRESS:-127.0.0.1}:${FILES_ROKU_PORT:-8081}:8081"]
     read_only: true
     tmpfs: ["/tmp:size=512m,mode=1777"]
     cap_drop: [ALL]

@@ -2,7 +2,7 @@
 
 Remote Workspace is a single-administrator, Dockerized workspace for files on a remote Linux host. The root Compose project runs four browser applications behind one authenticated HTTPS origin:
 
-- **Files** browses and manages the mounted filesystem, uploads files and folder trees through picker or desktop drag-and-drop with a cancellable progress queue, extracts ZIP and common tar archives from context menus, provides lightweight floating text, image, and muted video windows, extracts video frames and clips beside their source, loops videos shorter than 40 seconds, converts browser-incompatible videos for inline playback, shows conversion progress in the sidebar, and includes advanced Markdown and image tools, Trash, provenance, and terminal sessions.
+- **Files** browses and manages the mounted filesystem, uploads files and folder trees through picker or desktop drag-and-drop with a cancellable progress queue, extracts ZIP and common tar archives from context menus, keeps multiple lightweight floating text, image, and video viewers open at once, provides play and mute controls for minimized videos, casts videos to Roku with playback and TV-volume controls, extracts video frames and clips beside their source, loops videos shorter than 40 seconds, converts browser-incompatible videos for inline playback, shows conversion progress in the sidebar, and includes advanced Markdown and image tools, Trash, provenance, and terminal sessions.
 - **Text Editor** opens text and Markdown in a reusable tabbed window.
 - **Image Tools** opens image galleries in a reusable window with zoom, rotation, pixel measurement, and non-destructive markup copies.
 - **Video Studio** plays delegated videos through the same browser-compatible stream cache as Files, and imports video into isolated project storage for timeline editing and export.
@@ -40,6 +40,26 @@ docker compose --profile prod down
 ```
 
 Do not add `--volumes` unless provenance records and Video Studio projects may be permanently removed.
+
+## Roku casting
+
+Roku casting is optional and disabled by default. With the `zip` utility installed, enable developer mode on the Roku, package and upload the bundled receiver through the Roku development installer, and allow **Control by mobile apps** in the Roku network settings:
+
+```sh
+cd apps/roku-receiver
+zip -r /tmp/remote-workspace-roku.zip manifest source components
+```
+
+Set these values in `.env`, using the Docker host's LAN address (not `localhost`) in the stream URL:
+
+```dotenv
+FILES_ROKU_ENABLED=true
+FILES_ROKU_BIND_ADDRESS=0.0.0.0
+FILES_ROKU_PORT=8081
+FILES_ROKU_STREAM_BASE_URL=http://192.168.1.20:8081
+```
+
+Then rebuild with the normal production or development command above/below. Port 8081 is a dedicated, unauthenticated media listener protected by random, expiring cast URLs; expose it only to the trusted LAN and allow TCP 8081 through the host firewall. Device discovery uses SSDP multicast and Roku ECP on TCP 8060. The server and Roku must be on the same network, and multicast must be allowed; Docker Desktop/WSL networking may require host or firewall adjustments. The receiver occupies Roku's single sideloaded development-channel slot.
 
 ## Development
 

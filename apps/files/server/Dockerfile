@@ -38,5 +38,5 @@ COPY --from=rust-builder /src/target/release/remote-file-browser /usr/local/bin/
 RUN printf '#!/bin/sh\ncurl -fsS http://127.0.0.1:8080/healthz >/dev/null\n' > /usr/local/bin/rfb-healthcheck && chmod 0755 /usr/local/bin/rfb-healthcheck
 ENV PATH="/opt/ffmpeg/bin:${PATH}" LD_LIBRARY_PATH="/opt/ffmpeg/lib"
 WORKDIR /fs-root
-EXPOSE 8080
+EXPOSE 8080 8081
 ENTRYPOINT ["/usr/local/bin/remote-file-browser"]

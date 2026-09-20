@@ -53,6 +53,12 @@ export function shouldAutoLoop(duration: number): boolean {
   return Number.isFinite(duration) && duration > 0 && duration < 40
 }
 
+export function rememberNonzeroVolume(previous: number, current: number): number {
+  if (Number.isFinite(current) && current > 0) return Math.min(1, current)
+  if (Number.isFinite(previous) && previous > 0) return Math.min(1, previous)
+  return 1
+}
+
 export function ignoresVideoShortcut(target: EventTarget | null): boolean {
   return target instanceof Element && Boolean(target.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])'))
 }

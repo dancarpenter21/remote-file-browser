@@ -8,9 +8,9 @@ import remarkGfm from 'remark-gfm'
 import {
   ArchiveRestore, Camera, Check, ChevronLeft, ChevronRight, ClipboardPaste, Columns3, Copy, Download, Edit3, Eye, File, FileImage, FileText,
   Film, Folder, FolderOpen, Grid2X2, Info, LogOut, Maximize2, Menu, MoreHorizontal,
-  ExternalLink, Link2, Minus, Play, Plus, RefreshCw, Save, Scissors, Search, SquareTerminal, Trash2, Upload, WrapText, X,
+  Cast, ExternalLink, Link2, ListVideo, Minus, Pause, Play, Plus, RefreshCw, Save, Scissors, Search, Square, SquareTerminal, Trash2, Tv, Upload, Volume1, Volume2, VolumeX, WrapText, X,
 } from 'lucide-react'
-import { api, ApiFailure, type CacheCleanupEvent, type CacheStatus, contentUrl, type ConversionJob, type DocumentFile, Entry, EntryPage, type ExtractionJob, InstalledApp, LiveEvent, liveEventsUrl, liveFilesystemWatchMessage, mediaUrl, ProvenanceChange, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
+import { api, ApiFailure, type CacheCleanupEvent, type CacheStatus, contentUrl, type ConversionJob, type DocumentFile, Entry, EntryPage, type ExtractionJob, InstalledApp, LiveEvent, liveEventsUrl, liveFilesystemWatchMessage, mediaUrl, ProvenanceChange, type RokuCast, type RokuDevice, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { deleteConfirmationMessage } from './deleteConfirmation'
 import { updateFinderPathForSelection } from './finderPath'
 import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState'
@@ -26,10 +26,11 @@ import { useUploadQueue, type UploadConflictChoice } from './UploadQueue'
 import { isExternalFileDrag, manifestFromDrop, manifestFromFiles } from './uploadIntake'
 import { conflictSummary, type UploadConflict } from './uploadPlanning'
 import { isExtractableArchive } from './archiveExtraction'
-import { createPlaybackFallbackGate, DIRECT_PLAYBACK_TIMEOUT_MS, formatMediaTime, hlsPlaybackEngine, hlsRecoveryAction, ignoresVideoShortcut, shouldAutoLoop, stepFrameTime, validSegment } from './videoPlayerState'
+import { createPlaybackFallbackGate, DIRECT_PLAYBACK_TIMEOUT_MS, formatMediaTime, hlsPlaybackEngine, hlsRecoveryAction, ignoresVideoShortcut, rememberNonzeroVolume, shouldAutoLoop, stepFrameTime, validSegment } from './videoPlayerState'
 import { becamePlayable, progressPercent, upsertJob } from './mediaJobState'
 import { markdownHeadingElementId, markdownSanitizeSchema, markdownUrlTransform, resolveMarkdownImageSource, resolveMarkdownLinkTarget } from './markdownPreview'
 import { retainActiveHiddenDirectory } from './hiddenNavigation'
+import { activeViewer, focusViewer, minimizeViewer, navigateViewer, openOrFocusViewer, removeViewer, requestViewerClose, type FileViewer, type VideoPlaybackState } from './viewerState'
 
 type ViewMode = 'details' | 'small' | 'medium' | 'large'
 type ConfirmOptions = { title?: string; confirmLabel?: string; danger?: boolean }
@@ -45,6 +46,7 @@ const VideoStudioContext = createContext(false)
 const InstalledAppsContext = createContext<InstalledApp[]>([])
 const ArchiveExtractionContext = createContext<(entry: Entry) => Promise<void>>(async () => {})
 const CacheClearContext = createContext<(entry: Entry) => Promise<void>>(async () => {})
+const RokuCastContext = createContext<{ enabled: boolean; choose: (entry: Entry) => void }>({ enabled: false, choose: () => {} })
 type UploadConflictRequest = { conflicts: UploadConflict[]; resolve: (choice: UploadConflictChoice) => void }
 const UploadConflictContext = createContext<(conflicts: UploadConflict[]) => Promise<UploadConflictChoice>>(async () => 'cancel')
 
@@ -123,7 +125,7 @@ export default function App() {
   useEffect(() => { api.session().then(s => { setCsrf(s.csrfToken); setSession(s) }) }, [])
   if (!session) return <div className="center"><span className="spinner" /></div>
   if (!session.authenticated) return <Login onLogin={s => { setCsrf(s.csrfToken); setSession(s) }} />
-  return <ConfirmProvider><MergeProvider><UploadConflictProvider><PromptProvider><VideoStudioContext.Provider value={session.videoStudioEnabled}><FileManager session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false, terminalEnabled: false, videoStudioEnabled: false }) }} /></VideoStudioContext.Provider></PromptProvider></UploadConflictProvider></MergeProvider></ConfirmProvider>
+  return <ConfirmProvider><MergeProvider><UploadConflictProvider><PromptProvider><VideoStudioContext.Provider value={session.videoStudioEnabled}><FileManager session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false, terminalEnabled: false, videoStudioEnabled: false, rokuEnabled: false }) }} /></VideoStudioContext.Provider></PromptProvider></UploadConflictProvider></MergeProvider></ConfirmProvider>
 }
 
 function Login({ onLogin }: { onLogin: (session: Session) => void }) {
@@ -171,7 +173,11 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const [cacheCleanup, setCacheCleanup] = useState<CacheCleanupEvent | null>(null)
   const [folderMenu, setFolderMenu] = useState<{ directoryId: string; path: string; x: number; y: number } | null>(null)
   const [properties, setProperties] = useState<{ id: string; initial?: Entry } | null>(null)
-  const [openFile, setOpenFile] = useState<{ entry: Entry; kind: BasicFileKind; previewing?: boolean; fragment?: string } | null>(null)
+  const [fileViewers, setFileViewers] = useState<FileViewer[]>([])
+  const [rokuCasts, setRokuCasts] = useState<RokuCast[]>([])
+  const [rokuPicker, setRokuPicker] = useState<{ entry: Entry; devices: RokuDevice[]; loading: boolean } | null>(null)
+  const rokuPausedCasts = useRef(new Set<string>())
+  const nextViewerKey = useRef(0)
   const [terminal, setTerminal] = useState<{ directoryId: string; hidden: boolean } | null>(null)
   const isMobile = useMobileMode()
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -197,6 +203,21 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     api.cacheStatus().then(status => { if (active) setCacheStatus(status) }).catch(() => {})
     return () => { active = false }
   }, [])
+  useEffect(() => {
+    if (!session.rokuEnabled) return
+    let active = true
+    let timer: ReturnType<typeof setInterval>
+    const refreshCasts = () => api.rokuCasts().then(casts => { if (active) setRokuCasts(casts) }).catch(() => {})
+    void refreshCasts(); timer = setInterval(refreshCasts, 1500)
+    return () => { active = false; clearInterval(timer) }
+  }, [session.rokuEnabled])
+  useEffect(() => {
+    for (const cast of rokuCasts) {
+      if (cast.status !== 'playing' || rokuPausedCasts.current.has(cast.id)) continue
+      rokuPausedCasts.current.add(cast.id)
+      setFileViewers(viewers => viewers.map(viewer => viewer.kind === 'video' && viewer.entry.id === cast.sourceId ? { ...viewer, videoCommand: { sequence: (viewer.videoCommand?.sequence ?? 0) + 1, action: 'pause' } } : viewer))
+    }
+  }, [rokuCasts])
   const cleanCache = async () => {
     setCacheCleanup({ type: 'cacheCleanup', state: 'started' })
     try {
@@ -457,17 +478,20 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const activate = async (entry: Entry) => {
     if (entry.kind === 'directory') return navigateGrid(entry)
     const kind = basicFileKind(entry)
-    if (kind) { setOpenFile({ entry, kind }); return }
+    if (kind) {
+      setFileViewers(viewers => openOrFocusViewer(viewers, { key: `viewer-${++nextViewerKey.current}`, entry, kind }))
+      return
+    }
     startDownload(entry)
   }
   const openMarkdownLink = async (id: string, fragment: string) => {
     const entry = await api.metadata(id)
     if (entry.kind === 'directory') {
-      setOpenFile(null); await navigateGrid(entry); return
+      await navigateGrid(entry); return
     }
     const kind = basicFileKind(entry)
     if (!kind) { startDownload(entry); return }
-    setOpenFile({ entry, kind, previewing: kind === 'text' && isMarkdownFile(entry), fragment })
+    setFileViewers(viewers => openOrFocusViewer(viewers, { key: `viewer-${++nextViewerKey.current}`, entry, kind, previewing: kind === 'text' && isMarkdownFile(entry), fragment }))
     setSelected(new Set([entry.id])); setPrimary(entry)
   }
   const mutate = async (action: () => Promise<unknown>, dir = currentDir, replace?: () => Promise<unknown>) => {
@@ -650,9 +674,13 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   const visibleCount = gridRows.length
   const cutIds = new Set(clipboard?.operation === 'move' ? clipboard.ids : [])
   const previewEntries = Array.from(selected).map(id => findEntry(id, root, expanded)).filter((entry): entry is Entry => Boolean(entry))
-  const viewerImages = openFile?.kind === 'image'
-    ? ((openFile.entry.parentId === '' ? root : expanded[openFile.entry.parentId])?.entries.filter(entry => entry.mime.startsWith('image/')) ?? [openFile.entry])
-    : []
+  const currentViewer = activeViewer(fileViewers)
+  const focusFileViewer = (key: string) => setFileViewers(viewers => focusViewer(viewers, key))
+  const minimizeFileViewer = (key: string) => setFileViewers(viewers => minimizeViewer(viewers, key))
+  const requestFileViewerClose = (key: string) => setFileViewers(viewers => requestViewerClose(viewers, key))
+  const closeFileViewer = (key: string) => setFileViewers(viewers => removeViewer(viewers, key))
+  const commandVideo = (key: string, action: 'toggle-playback' | 'toggle-muted' | 'pause') => setFileViewers(viewers => viewers.map(viewer => viewer.key === key ? { ...viewer, videoCommand: { sequence: (viewer.videoCommand?.sequence ?? 0) + 1, action } } : viewer))
+  const updateVideoPlayback = (key: string, playback: VideoPlaybackState) => setFileViewers(viewers => viewers.map(viewer => viewer.key === key && (viewer.playback?.playing !== playback.playing || viewer.playback?.muted !== playback.muted) ? { ...viewer, playback } : viewer))
   const toggleTerminal = () => setTerminal(current => current ? { ...current, hidden: !current.hidden } : { directoryId: currentDir, hidden: false })
   const goToRoot = () => { setCurrentDir(''); setSelected(new Set()); setPrimary(null); setColumnPath([]); setMobileSelecting(false) }
   const goToParent = () => {
@@ -662,7 +690,17 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   }
   const openCurrentFolderMenu = () => setFolderMenu({ directoryId: currentDir, path: columnPath.at(-1)?.path ?? '/fs-root', x: innerWidth - 12, y: 80 })
   const mobileSelectionEntry = primary && selected.has(primary.id) ? primary : previewEntries[0]
-  return <ArchiveExtractionContext.Provider value={extractEntry}><CacheClearContext.Provider value={clearCachedMedia}><InstalledAppsContext.Provider value={installedApps}><div className={`app-shell ${isMobile ? 'mobile-mode' : ''}`}>
+  const chooseRoku = (entry: Entry) => {
+    setRokuPicker({ entry, devices: [], loading: true })
+    api.rokuDevices().then(devices => setRokuPicker(current => current?.entry.id === entry.id ? { ...current, devices, loading: false } : current)).catch(reason => { setRokuPicker(null); setError(messageOf(reason)) })
+  }
+  const startRokuCast = async (entry: Entry, device: RokuDevice) => {
+    try {
+      const cast = await api.startRokuCast(entry.id, device.id)
+      setRokuCasts(casts => [...casts.filter(item => item.deviceId !== cast.deviceId), cast]); setRokuPicker(null)
+    } catch (reason) { setError(messageOf(reason)) }
+  }
+  return <ArchiveExtractionContext.Provider value={extractEntry}><CacheClearContext.Provider value={clearCachedMedia}><RokuCastContext.Provider value={{ enabled: session.rokuEnabled, choose: chooseRoku }}><InstalledAppsContext.Provider value={installedApps}><div className={`app-shell ${isMobile ? 'mobile-mode' : ''}`}>
     <header className="topbar">
       {isMobile && <button className="icon-button mobile-menu-button" title="Open navigation" aria-label="Open navigation" aria-expanded={drawerOpen} onClick={() => setDrawerOpen(true)}><Menu size={20} /></button>}
       <div className="brand"><FolderOpen size={20} /><strong>Remote Files</strong><span>/fs-root</span></div>
@@ -678,6 +716,8 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
         <button className="nav-item" onClick={() => { void openTrash(); setDrawerOpen(false) }}><Trash2 size={17} /> Trash</button>
         {session.terminalEnabled && <button className={`nav-item ${terminal && !terminal.hidden ? 'active' : ''}`} aria-pressed={Boolean(terminal && !terminal.hidden)} onClick={() => { toggleTerminal(); setDrawerOpen(false) }}><SquareTerminal size={17} /> Terminal</button>}
         <MediaJobs conversions={conversionJobs} extractions={extractionJobs} cacheStatus={cacheStatus} cacheCleanup={cacheCleanup} cleanCache={cleanCache} />
+        {session.rokuEnabled && <RokuCasts casts={rokuCasts} update={cast => setRokuCasts(items => items.map(item => item.id === cast.id ? cast : item))} remove={id => setRokuCasts(items => items.filter(item => item.id !== id))} setError={setError} />}
+        <OpenViewers viewers={fileViewers} activeKey={currentViewer?.key} focus={key => { focusFileViewer(key); setDrawerOpen(false) }} close={requestFileViewerClose} commandVideo={commandVideo} />
         <div className="aside-note"><span>Signed in as</span><strong>{session.username}</strong>{isMobile && <button onClick={() => void logout()}><LogOut /> Sign out</button>}</div>
       </aside>
       <div className="content-stack">
@@ -733,12 +773,18 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     {folderMenu && <FolderContextMenu {...folderMenu} close={() => setFolderMenu(null)} createItem={createItem} paste={() => paste(folderMenu.directoryId, folderMenu.path)} hasClipboard={Boolean(clipboard)} showProperties={id => showProperties(id)} setError={setError} mobileControls={isMobile ? { hidden, toggleHidden: () => setHidden(value => !value), refresh: () => refresh(folderMenu.directoryId) } : undefined} />}
     {isMobile && mobileSelectionMenu && mobileSelectionEntry && <ContextMenu entry={mobileSelectionEntry} selectedEntries={previewEntries} x={innerWidth - 12} y={80} close={() => setMobileSelectionMenu(false)} open={() => activate(mobileSelectionEntry)} renameEntry={rename} deleteEntry={deleteEntry} stageClipboard={stageClipboard} pasteInto={entry => paste(entry.id, entry.path)} hasClipboard={Boolean(clipboard)} showProperties={entry => showProperties(entry.id, entry)} concatenateVideos={concatenateVideos} setError={setError} />}
     {properties && <PropertiesDialog {...properties} onClose={() => setProperties(null)} />}
-    {openFile && <BasicFileWindow key={openFile.kind === 'image' ? 'image-viewer' : `${openFile.entry.id}:${openFile.entry.etag}`} {...openFile} images={viewerImages} onOpenLink={openMarkdownLink} onNavigate={entry => {
-      setOpenFile({ entry, kind: 'image' }); setSelected(new Set([entry.id])); setPrimary(entry)
-    }} onClose={() => setOpenFile(null)} onSaved={() => refresh(openFile.entry.parentId)} />}
+    {rokuPicker && <RokuPicker {...rokuPicker} close={() => setRokuPicker(null)} choose={device => void startRokuCast(rokuPicker.entry, device)} />}
+    {fileViewers.map((viewer, index) => {
+      const images = viewer.kind === 'image'
+        ? ((viewer.entry.parentId === '' ? root : expanded[viewer.entry.parentId])?.entries.filter(entry => entry.mime.startsWith('image/')) ?? [viewer.entry])
+        : []
+      return <BasicFileWindow key={viewer.key} entry={viewer.entry} kind={viewer.kind} previewing={viewer.previewing} fragment={viewer.fragment} minimized={viewer.minimized} closeRequest={viewer.closeRequest} videoCommand={viewer.videoCommand} active={currentViewer?.key === viewer.key} cascadeIndex={index} images={images} onOpenLink={openMarkdownLink} onNavigate={entry => {
+        setFileViewers(viewers => navigateViewer(viewers, viewer.key, entry, 'image')); setSelected(new Set([entry.id])); setPrimary(entry)
+      }} onFocus={() => focusFileViewer(viewer.key)} onMinimize={() => minimizeFileViewer(viewer.key)} onOpenViewers={() => setDrawerOpen(true)} onClose={() => closeFileViewer(viewer.key)} onSaved={() => refresh(viewer.entry.parentId)} onPlaybackChange={playback => updateVideoPlayback(viewer.key, playback)} />
+    })}
     {uploadQueue.panel}
     <div id="window-tray" className="window-tray" role="region" aria-label="Minimized windows" />
-  </div></InstalledAppsContext.Provider></CacheClearContext.Provider></ArchiveExtractionContext.Provider>
+  </div></InstalledAppsContext.Provider></RokuCastContext.Provider></CacheClearContext.Provider></ArchiveExtractionContext.Provider>
 }
 
 function MediaJobs({ conversions, extractions, cacheStatus, cacheCleanup, cleanCache }: { conversions: ConversionJob[]; extractions: ExtractionJob[]; cacheStatus: CacheStatus | null; cacheCleanup: CacheCleanupEvent | null; cleanCache: () => Promise<void> }) {
@@ -758,6 +804,50 @@ function MediaJobs({ conversions, extractions, cacheStatus, cacheCleanup, cleanC
         <div><strong>{job.fileName}</strong>{'mode' in job
           ? <><small>{job.status === 'working' ? `${job.mode} · ${progressPercent(job.progress)}%` : `${job.mode} · ${job.status}`}</small>{job.status === 'working' && <progress max={1} value={job.progress ?? 0} />}</>
           : <small>{job.kind} extraction · {job.status}</small>}</div>
+      </article>)}
+    </div>
+  </section>
+}
+
+function RokuCasts({ casts, update, remove, setError }: { casts: RokuCast[]; update: (cast: RokuCast) => void; remove: (id: string) => void; setError: (message: string) => void }) {
+  const control = async (cast: RokuCast, action: 'play' | 'pause' | 'stop' | 'seek' | 'volumeUp' | 'volumeDown' | 'mute', positionSeconds?: number) => {
+    try { update(await api.controlRokuCast(cast.id, action, positionSeconds)) } catch (reason) { setError(messageOf(reason)) }
+  }
+  const stop = async (cast: RokuCast) => { try { await api.stopRokuCast(cast.id); remove(cast.id) } catch (reason) { setError(messageOf(reason)) } }
+  return <section className="roku-casts" aria-label="Roku playback">
+    <div className="open-viewers-heading"><Tv /> Roku playback <span>{casts.length}</span></div>
+    {casts.length === 0 ? <p>No active casts.</p> : casts.map(cast => <article className={`roku-cast ${cast.status}`} key={cast.id}>
+      <div><strong>{cast.fileName}</strong><small>{cast.deviceName} · {cast.status}{cast.progress != null && cast.status === 'preparing' ? ` ${Math.round(cast.progress * 100)}%` : ''}</small></div>
+      {cast.durationSeconds > 0 && <input aria-label={`Seek ${cast.fileName}`} type="range" min={0} max={cast.durationSeconds} value={Math.min(cast.positionSeconds, cast.durationSeconds)} onChange={event => void control(cast, 'seek', Number(event.currentTarget.value))} />}
+      <div className="roku-controls">
+        <button title={cast.status === 'playing' ? 'Pause on Roku' : 'Play on Roku'} aria-label={cast.status === 'playing' ? 'Pause on Roku' : 'Play on Roku'} onClick={() => void control(cast, cast.status === 'playing' ? 'pause' : 'play')}>{cast.status === 'playing' ? <Pause /> : <Play />}</button>
+        <button title="Stop casting" aria-label="Stop casting" onClick={() => void stop(cast)}><Square /></button>
+        {cast.isTv && <><button title="Volume down" aria-label="Roku volume down" onClick={() => void control(cast, 'volumeDown')}><Volume1 /></button><button title="Mute" aria-label="Mute Roku" onClick={() => void control(cast, 'mute')}><VolumeX /></button><button title="Volume up" aria-label="Roku volume up" onClick={() => void control(cast, 'volumeUp')}><Volume2 /></button></>}
+      </div>
+      {cast.error && <small className="failed">{cast.error}</small>}
+    </article>)}
+  </section>
+}
+
+function RokuPicker({ entry, devices, loading, close, choose }: { entry: Entry; devices: RokuDevice[]; loading: boolean; close: () => void; choose: (device: RokuDevice) => void }) {
+  return <div className="modal-backdrop" role="presentation" onPointerDown={close}><section className="confirm-dialog roku-picker" role="dialog" aria-modal="true" aria-labelledby="roku-picker-title" onPointerDown={event => event.stopPropagation()}>
+    <div className="confirm-mark"><Cast /></div><h2 id="roku-picker-title">Cast {entry.name}</h2>
+    {loading ? <p><span className="spinner" /> Looking for Roku devices…</p> : devices.length === 0 ? <p>No Roku devices were found. Make sure the TV and server are on the same network.</p> : <div className="roku-device-list">{devices.map(device => <button key={device.id} disabled={!device.receiverInstalled} onClick={() => choose(device)}><Tv /><span><strong>{device.name}</strong><small>{device.model}{device.receiverInstalled ? '' : ' · receiver not installed'}</small></span></button>)}</div>}
+    <div className="confirm-actions"><button onClick={close}>Cancel</button></div>
+  </section></div>
+}
+
+function OpenViewers({ viewers, activeKey, focus, close, commandVideo }: { viewers: FileViewer[]; activeKey?: string; focus: (key: string) => void; close: (key: string) => void; commandVideo: (key: string, action: 'toggle-playback' | 'toggle-muted' | 'pause') => void }) {
+  return <section className="open-viewers" aria-label="Open viewers">
+    <div className="open-viewers-heading"><ListVideo /> Open viewers <span>{viewers.length}</span></div>
+    <div className="open-viewer-list">
+      {viewers.length === 0 ? <p>No files open.</p> : [...viewers].reverse().map(viewer => <article className={`open-viewer ${activeKey === viewer.key ? 'active' : ''}`} key={viewer.key}>
+        <button className="open-viewer-focus" title={`${viewer.minimized ? 'Restore' : 'Focus'} ${viewer.entry.name}`} onClick={() => focus(viewer.key)}><FileGlyph entry={viewer.entry} /><span><strong>{viewer.entry.name}</strong><small>{viewer.minimized ? 'Minimized' : viewer.kind}</small></span></button>
+        {viewer.kind === 'video' && viewer.minimized && <div className="open-viewer-media" aria-label={`Playback controls for ${viewer.entry.name}`}>
+          <button aria-label={viewer.playback?.playing ? `Pause ${viewer.entry.name}` : `Play ${viewer.entry.name}`} title={viewer.playback?.playing ? 'Pause' : 'Play'} onClick={() => commandVideo(viewer.key, 'toggle-playback')}>{viewer.playback?.playing ? <Pause /> : <Play />}</button>
+          <button aria-label={viewer.playback?.muted === false ? `Mute ${viewer.entry.name}` : `Unmute ${viewer.entry.name}`} aria-pressed={viewer.playback?.muted !== false} title={viewer.playback?.muted === false ? 'Mute' : 'Unmute'} onClick={() => commandVideo(viewer.key, 'toggle-muted')}>{viewer.playback?.muted === false ? <Volume2 /> : <VolumeX />}</button>
+        </div>}
+        <button className="open-viewer-close" aria-label={`Close ${viewer.entry.name}`} title="Close" onClick={() => close(viewer.key)}><X /></button>
       </article>)}
     </div>
   </section>
@@ -1119,6 +1209,7 @@ function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, d
   const promptAction = usePrompt()
   const extractEntry = useContext(ArchiveExtractionContext)
   const clearCachedMedia = useContext(CacheClearContext)
+  const roku = useContext(RokuCastContext)
   const videoStudioEnabled = useContext(VideoStudioContext)
   const installedApps = useContext(InstalledAppsContext)
   const textEditor = installedApps.find(app => app.id === 'text-editor' && app.actions.some(action => action.id === 'open'))
@@ -1172,6 +1263,7 @@ function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, d
   }
   const extract = () => { close(); void extractEntry(entry) }
   const clearCache = () => { close(); void clearCachedMedia(entry) }
+  const castToRoku = () => { close(); roku.choose(entry) }
   const canConcatenate = selectedEntries.length >= 2 && selectedEntries.some(item => item.id === entry.id) && selectedEntries.every(item => item.kind === 'file' && item.mime.startsWith('video/'))
   const concatenate = () => { close(); void concatenateVideos(selectedEntries) }
   return <PositionedContextMenu x={x} y={y}>
@@ -1189,6 +1281,7 @@ function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, d
     {isExtractableArchive(entry) && <button role="menuitem" onClick={extract}><ArchiveRestore /> Extract</button>}
     {canConcatenate && <button role="menuitem" onClick={concatenate}><Film /> Concatenate videos</button>}
     {videoStudioEnabled && entry.kind === 'file' && entry.mime.startsWith('video/') && <button role="menuitem" onClick={editWithVfx}><ExternalLink /> Edit in Video Studio</button>}
+    {roku.enabled && entry.kind === 'file' && entry.mime.startsWith('video/') && <button role="menuitem" onClick={castToRoku}><Cast /> Cast to Roku</button>}
     {entry.kind === 'file' && (entry.mime.startsWith('image/') || entry.mime.startsWith('video/')) && <button role="menuitem" onClick={clearCache}><RefreshCw /> Clear cached media</button>}
     {entry.kind === 'file' && <button role="menuitem" onClick={() => void addProvenance()}><Link2 /> Add provenance URL</button>}
     {entry.kind === 'file' && entry.hasProvenance && <button role="menuitem" onClick={() => void copyProvenance()}><Copy /> Copy Provenance URL</button>}
@@ -1276,12 +1369,12 @@ function ViewSelector({ view, setView }: { view: ViewMode; setView: (view: ViewM
   </div>
 }
 
-function BasicFileWindow({ entry, kind, images, previewing, fragment, onOpenLink, onNavigate, onClose, onSaved }: { entry: Entry; kind: BasicFileKind; images: Entry[]; previewing?: boolean; fragment?: string; onOpenLink: (id: string, fragment: string) => Promise<void>; onNavigate: (entry: Entry) => void; onClose: () => void; onSaved: () => Promise<void> }) {
-  if (kind === 'text') return <TextFileWindow entry={entry} initialPreviewing={previewing} initialFragment={fragment} onOpenLink={onOpenLink} onClose={onClose} onSaved={onSaved} />
-  return <MediaFileWindow entry={entry} kind={kind} images={images} onNavigate={onNavigate} onClose={onClose} />
+function BasicFileWindow({ entry, kind, images, previewing, fragment, active, minimized, closeRequest, videoCommand, cascadeIndex, onOpenLink, onNavigate, onFocus, onMinimize, onOpenViewers, onClose, onSaved, onPlaybackChange }: { entry: Entry; kind: BasicFileKind; images: Entry[]; previewing?: boolean; fragment?: string; active: boolean; minimized: boolean; closeRequest: number; videoCommand?: FileViewer['videoCommand']; cascadeIndex: number; onOpenLink: (id: string, fragment: string) => Promise<void>; onNavigate: (entry: Entry) => void; onFocus: () => void; onMinimize: () => void; onOpenViewers: () => void; onClose: () => void; onSaved: () => Promise<void>; onPlaybackChange: (playback: VideoPlaybackState) => void }) {
+  if (kind === 'text') return <TextFileWindow entry={entry} active={active} minimized={minimized} closeRequest={closeRequest} cascadeIndex={cascadeIndex} initialPreviewing={previewing} initialFragment={fragment} onOpenLink={onOpenLink} onFocus={onFocus} onMinimize={onMinimize} onOpenViewers={onOpenViewers} onClose={onClose} onSaved={onSaved} />
+  return <MediaFileWindow entry={entry} kind={kind} images={images} active={active} minimized={minimized} closeRequest={closeRequest} videoCommand={videoCommand} cascadeIndex={cascadeIndex} onNavigate={onNavigate} onFocus={onFocus} onMinimize={onMinimize} onOpenViewers={onOpenViewers} onClose={onClose} onPlaybackChange={onPlaybackChange} />
 }
 
-function TextFileWindow({ entry, initialPreviewing = false, initialFragment = '', onOpenLink, onClose, onSaved }: { entry: Entry; initialPreviewing?: boolean; initialFragment?: string; onOpenLink: (id: string, fragment: string) => Promise<void>; onClose: () => void; onSaved: () => Promise<void> }) {
+function TextFileWindow({ entry, active, minimized, closeRequest, cascadeIndex, initialPreviewing = false, initialFragment = '', onOpenLink, onFocus, onMinimize, onOpenViewers, onClose, onSaved }: { entry: Entry; active: boolean; minimized: boolean; closeRequest: number; cascadeIndex: number; initialPreviewing?: boolean; initialFragment?: string; onOpenLink: (id: string, fragment: string) => Promise<void>; onFocus: () => void; onMinimize: () => void; onOpenViewers: () => void; onClose: () => void; onSaved: () => Promise<void> }) {
   const confirmAction = useConfirm()
   const [file, setFile] = useState<DocumentFile>()
   const [content, setContent] = useState('')
@@ -1330,6 +1423,9 @@ function TextFileWindow({ entry, initialPreviewing = false, initialFragment = ''
     const frame = requestAnimationFrame(() => scrollToMarkdownFragment(initialFragment))
     return () => cancelAnimationFrame(frame)
   }, [initialFragment, loading, previewing, scrollToMarkdownFragment])
+  useEffect(() => {
+    if (initialFragment && initialPreviewing) setPreviewing(true)
+  }, [initialFragment, initialPreviewing])
 
   const save = useCallback(async () => {
     if (!file || !dirty || saving) return
@@ -1343,13 +1439,14 @@ function TextFileWindow({ entry, initialPreviewing = false, initialFragment = ''
   }, [content, dirty, file, onSaved, saving])
 
   useEffect(() => {
+    if (!active || minimized) return
     const shortcut = (event: KeyboardEvent) => {
       if (!isSaveShortcut(event)) return
       event.preventDefault(); void save()
     }
     addEventListener('keydown', shortcut)
     return () => removeEventListener('keydown', shortcut)
-  }, [save])
+  }, [active, minimized, save])
 
   const close = async () => {
     if (saving) return
@@ -1357,18 +1454,24 @@ function TextFileWindow({ entry, initialPreviewing = false, initialFragment = ''
     onClose()
   }
 
+  const handledCloseRequest = useRef(closeRequest)
+  useEffect(() => {
+    if (closeRequest === handledCloseRequest.current) return
+    handledCloseRequest.current = closeRequest
+    void close()
+  }, [closeRequest])
+
   const followMarkdownLink = async (event: React.MouseEvent<HTMLAnchorElement>, href?: string) => {
     const target = resolveMarkdownLinkTarget(entry.id, href)
     if (!target || target.kind === 'external') return
     event.preventDefault()
     if (target.kind === 'fragment') { scrollToMarkdownFragment(target.fragment); return }
-    if (dirty && !await confirmAction(`Your unsaved edits to ${entry.name} will be lost.`, { title: 'Discard unsaved changes?', confirmLabel: 'Discard', danger: true })) return
     setError(''); setMessage('')
     try { await onOpenLink(target.id, target.fragment) }
     catch (reason) { setError(messageOf(reason)) }
   }
 
-  return <FloatingWindow title={`${entry.name} — Text`} onClose={() => void close()} className="basic-file-window basic-text-window">
+  return <FloatingWindow title={`${entry.name} — Text`} active={active} minimized={minimized} cascadeIndex={cascadeIndex} onFocus={onFocus} onMinimize={onMinimize} onOpenViewers={onOpenViewers} onClose={() => void close()} className="basic-file-window basic-text-window">
     <div className="window-toolbar">
       <button className="primary compact" disabled={!dirty || saving || loading} title="Save (Ctrl/Cmd+S)" onClick={() => void save()}><Save /> {saving ? 'Saving…' : 'Save'}</button>
       {markdown && <button className={previewing ? 'active' : ''} aria-pressed={previewing} disabled={loading} onClick={() => setPreviewing(value => !value)}>{previewing ? <Edit3 /> : <Eye />} {previewing ? 'Text' : 'Preview'}</button>}
@@ -1392,8 +1495,9 @@ function TextFileWindow({ entry, initialPreviewing = false, initialFragment = ''
   </FloatingWindow>
 }
 
-function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: Entry; kind: 'image' | 'video'; images: Entry[]; onNavigate: (entry: Entry) => void; onClose: () => void }) {
+function MediaFileWindow({ entry, kind, images, active, minimized, closeRequest, videoCommand, cascadeIndex, onNavigate, onFocus, onMinimize, onOpenViewers, onClose, onPlaybackChange }: { entry: Entry; kind: 'image' | 'video'; images: Entry[]; active: boolean; minimized: boolean; closeRequest: number; videoCommand?: FileViewer['videoCommand']; cascadeIndex: number; onNavigate: (entry: Entry) => void; onFocus: () => void; onMinimize: () => void; onOpenViewers: () => void; onClose: () => void; onPlaybackChange: (playback: VideoPlaybackState) => void }) {
   const videoStudioEnabled = useContext(VideoStudioContext)
+  const roku = useContext(RokuCastContext)
   const [error, setError] = useState('')
   const [openingStudio, setOpeningStudio] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
@@ -1410,6 +1514,11 @@ function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: 
   const fallbackGate = useRef(createPlaybackFallbackGate())
   const cancelled = useRef(false)
   const videoRef = useRef<HTMLVideoElement>(null)
+  const lastVolume = useRef(1)
+  const minimizedRef = useRef(minimized)
+  minimizedRef.current = minimized
+  const handledVideoCommand = useRef(videoCommand?.sequence ?? 0)
+  const handledCloseRequest = useRef(closeRequest)
   const hlsRef = useRef<Hls | null>(null)
   const readinessTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const stallTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
@@ -1435,12 +1544,43 @@ function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: 
   }, [entry.id, kind])
   useLayoutEffect(() => {
     if (kind !== 'video' || !videoRef.current) return
-    videoRef.current.volume = 0
+    videoRef.current.volume = lastVolume.current
     videoRef.current.muted = true
     videoRef.current.defaultMuted = true
+    onPlaybackChange({ playing: !videoRef.current.paused, muted: true })
   }, [entry.id, kind])
   useEffect(() => {
-    if (kind !== 'image') return
+    if (kind !== 'video' || minimizedRef.current) return
+    videoRef.current?.play().catch(() => undefined)
+  }, [entry.id, kind])
+  useEffect(() => {
+    if (kind !== 'video' || !minimized) return
+    videoRef.current?.pause()
+  }, [kind, minimized])
+  useEffect(() => {
+    if (kind !== 'video' || !videoCommand || videoCommand.sequence === handledVideoCommand.current) return
+    handledVideoCommand.current = videoCommand.sequence
+    const video = videoRef.current
+    if (!video) return
+    if (videoCommand.action === 'pause') { video.pause(); return }
+    if (videoCommand.action === 'toggle-muted') {
+      if (video.muted) {
+        if (video.volume <= 0) video.volume = rememberNonzeroVolume(lastVolume.current, video.volume)
+        video.muted = false
+      } else video.muted = true
+      onPlaybackChange({ playing: !video.paused, muted: video.muted })
+      return
+    }
+    if (video.paused) void video.play().catch(reason => setError(messageOf(reason)))
+    else video.pause()
+  }, [kind, onPlaybackChange, videoCommand])
+  useEffect(() => {
+    if (closeRequest === handledCloseRequest.current) return
+    handledCloseRequest.current = closeRequest
+    onClose()
+  }, [closeRequest, onClose])
+  useEffect(() => {
+    if (kind !== 'image' || !active || minimized) return
     const keyboard = (event: KeyboardEvent) => {
       if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
       event.preventDefault(); event.stopPropagation()
@@ -1448,7 +1588,7 @@ function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: 
     }
     addEventListener('keydown', keyboard, { capture: true })
     return () => removeEventListener('keydown', keyboard, { capture: true })
-  }, [kind, navigate])
+  }, [active, kind, minimized, navigate])
   const openStudioWindow = useCallback(async () => {
     setOpeningStudio(true)
     try {
@@ -1473,7 +1613,7 @@ function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: 
       let mediaRecoveries = 0
       hlsRef.current = hls
       hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(playlistUrl))
-      hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => undefined))
+      hls.on(Hls.Events.MANIFEST_PARSED, () => { if (!minimizedRef.current) video.play().catch(() => undefined) })
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (!data.fatal) return
         const action = hlsRecoveryAction(data.type, networkRecoveries, mediaRecoveries)
@@ -1486,7 +1626,7 @@ function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: 
       return
     }
     video.src = playlistUrl
-    video.play().catch(() => undefined)
+    if (!minimizedRef.current) video.play().catch(() => undefined)
   }, [])
   useEffect(() => {
     if (kind === 'video' && usingFallback && hlsPlaylist) attachHls(hlsPlaylist)
@@ -1513,7 +1653,7 @@ function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: 
     }
   }, [entry.id])
   useEffect(() => {
-    if (kind !== 'video') return
+    if (kind !== 'video' || !active || minimized) return
     if (!entry.browserReady) { void startPlaybackFallback(); return }
     readinessTimer.current = setTimeout(() => void startPlaybackFallback(), DIRECT_PLAYBACK_TIMEOUT_MS)
     return () => clearTimeout(readinessTimer.current)
@@ -1580,13 +1720,17 @@ function MediaFileWindow({ entry, kind, images, onNavigate, onClose }: { entry: 
     }
     addEventListener('keydown', keyboard)
     return () => removeEventListener('keydown', keyboard)
-  }, [currentTime, duration, extracting, frameRate, kind, markIn, markOut])
-  return <FloatingWindow title={`${entry.name} — ${kind === 'image' ? 'Image' : 'Video'}`} onClose={onClose} className="basic-file-window basic-media-window">
-    <div className="window-toolbar"><span>{entry.mime}</span><span className="toolbar-spacer" />{kind === 'video' && videoStudioEnabled && <button disabled={openingStudio} onClick={() => void openStudioWindow()}><ExternalLink /> Edit in Video Studio</button>}<a className="button" href={contentUrl(entry.id)} download={entry.name}><Download /> Download</a></div>
+  }, [active, currentTime, duration, extracting, frameRate, kind, markIn, markOut, minimized])
+  const trayControls = kind === 'video' ? <div className="window-tray-media" aria-label={`Playback controls for ${entry.name}`}>
+    <button aria-label={videoRef.current?.paused === false ? `Pause ${entry.name}` : `Play ${entry.name}`} title={videoRef.current?.paused === false ? 'Pause' : 'Play'} onClick={() => videoRef.current?.paused ? void videoRef.current.play().catch(reason => setError(messageOf(reason))) : videoRef.current?.pause()}>{videoRef.current?.paused === false ? <Pause /> : <Play />}</button>
+    <button aria-label={videoRef.current?.muted === false ? `Mute ${entry.name}` : `Unmute ${entry.name}`} aria-pressed={videoRef.current?.muted !== false} title={videoRef.current?.muted === false ? 'Mute' : 'Unmute'} onClick={() => { const video = videoRef.current; if (!video) return; if (video.muted && video.volume <= 0) video.volume = rememberNonzeroVolume(lastVolume.current, video.volume); video.muted = !video.muted; onPlaybackChange({ playing: !video.paused, muted: video.muted }) }}>{videoRef.current?.muted === false ? <Volume2 /> : <VolumeX />}</button>
+  </div> : undefined
+  return <FloatingWindow title={`${entry.name} — ${kind === 'image' ? 'Image' : 'Video'}`} active={active} minimized={minimized} cascadeIndex={cascadeIndex} onFocus={onFocus} onMinimize={onMinimize} onOpenViewers={onOpenViewers} trayControls={trayControls} onClose={onClose} className="basic-file-window basic-media-window">
+    <div className="window-toolbar"><span>{entry.mime}</span><span className="toolbar-spacer" />{kind === 'video' && roku.enabled && <button onClick={() => roku.choose(entry)}><Cast /> Cast</button>}{kind === 'video' && videoStudioEnabled && <button disabled={openingStudio} onClick={() => void openStudioWindow()}><ExternalLink /> Edit in Video Studio</button>}<a className="button" href={contentUrl(entry.id)} download={entry.name}><Download /> Download</a></div>
     {error && <div className="banner error basic-file-error" role="alert"><span>{error}</span></div>}
     {playbackMessage && <div className="basic-file-loading" role="status"><span className="spinner" /> {playbackMessage}</div>}
     {kind === 'image' ? <div className="basic-media-stage image"><button className="image-nav previous" disabled={images.length < 2} aria-label="Previous image" title="Previous image (Left Arrow)" onClick={() => navigate(-1)}><ChevronLeft /></button><img src={source} alt={entry.name} onError={() => setError('The image could not be displayed.')} /><button className="image-nav next" disabled={images.length < 2} aria-label="Next image" title="Next image (Right Arrow)" onClick={() => navigate(1)}><ChevronRight /></button></div> : <div className="basic-video-player">
-      <div className={`basic-media-stage video${fitVideo ? '' : ' actual-size'}`}><video ref={videoRef} src={usingFallback ? undefined : source} controls autoPlay muted playsInline preload="metadata" loop={shouldAutoLoop(duration)} onError={() => void startPlaybackFallback()} onCanPlay={directPlaybackReady} onPlaying={directPlaybackReady} onWaiting={directPlaybackWaiting} onStalled={directPlaybackWaiting} onLoadedMetadata={event => { if (Number.isFinite(event.currentTarget.duration) && event.currentTarget.duration > 0) setDuration(event.currentTarget.duration) }} onTimeUpdate={event => setCurrentTime(event.currentTarget.currentTime)} onSeeked={event => setCurrentTime(event.currentTarget.currentTime)} /></div>
+      <div className={`basic-media-stage video${fitVideo ? '' : ' actual-size'}`}><video ref={videoRef} src={usingFallback ? undefined : source} controls playsInline preload="metadata" loop={shouldAutoLoop(duration)} onError={() => void startPlaybackFallback()} onCanPlay={directPlaybackReady} onPlaying={event => { directPlaybackReady(); onPlaybackChange({ playing: true, muted: event.currentTarget.muted }) }} onPlay={event => onPlaybackChange({ playing: true, muted: event.currentTarget.muted })} onPause={event => onPlaybackChange({ playing: false, muted: event.currentTarget.muted })} onVolumeChange={event => { lastVolume.current = rememberNonzeroVolume(lastVolume.current, event.currentTarget.volume); onPlaybackChange({ playing: !event.currentTarget.paused, muted: event.currentTarget.muted }) }} onWaiting={directPlaybackWaiting} onStalled={directPlaybackWaiting} onLoadedMetadata={event => { if (Number.isFinite(event.currentTarget.duration) && event.currentTarget.duration > 0) setDuration(event.currentTarget.duration) }} onTimeUpdate={event => setCurrentTime(event.currentTarget.currentTime)} onSeeked={event => setCurrentTime(event.currentTarget.currentTime)} /></div>
       <div className="basic-video-tools" aria-label="Video extraction controls">
         <div className="frame-controls"><button title="Previous frame (,)" aria-label="Previous frame" disabled={!frameRate} onClick={() => stepFrame(-1)}><ChevronLeft /></button><code>{formatMediaTime(currentTime)}</code><button title="Next frame (.)" aria-label="Next frame" disabled={!frameRate} onClick={() => stepFrame(1)}><ChevronRight /></button><span>{frameRate ? `${frameRate.toFixed(3)} fps` : 'FPS unavailable'}</span></div>
         <button className="video-size-toggle" aria-pressed={!fitVideo} title={fitVideo ? 'Show at actual pixel size when it fits' : 'Fit video to the player'} onClick={() => setFitVideo(value => !value)}>{fitVideo ? '1:1' : 'Fit'}</button>
@@ -1621,28 +1765,34 @@ function TrashWindow({ items, onClose, onChanged, onRestored, setError }: { item
   </FloatingWindow>
 }
 
-function FloatingWindow({ title, onClose, className = '', size, restoreKey, children }: { title: string; onClose: () => void; className?: string; size?: { width: number; height: number }; restoreKey?: number; children: React.ReactNode }) {
-  const [position, setPosition] = useState(() => ({ x: Math.max(20, innerWidth * .12), y: 90 }))
-  const [minimized, setMinimized] = useState(false)
+function FloatingWindow({ title, onClose, className = '', size, restoreKey, active = false, minimized: controlledMinimized, cascadeIndex = 0, onFocus, onMinimize, onOpenViewers, trayControls, children }: { title: string; onClose: () => void; className?: string; size?: { width: number; height: number }; restoreKey?: number; active?: boolean; minimized?: boolean; cascadeIndex?: number; onFocus?: () => void; onMinimize?: () => void; onOpenViewers?: () => void; trayControls?: React.ReactNode; children: React.ReactNode }) {
+  const [position, setPosition] = useState(() => ({ x: Math.max(20, innerWidth * .12) + cascadeIndex % 8 * 24, y: 90 + cascadeIndex % 8 * 20 }))
+  const [localMinimized, setLocalMinimized] = useState(false)
+  const minimized = controlledMinimized ?? localMinimized
   const drag = useRef<{ x: number; y: number } | null>(null)
   const moved = useRef(false)
   useEffect(() => {
     if (!size || moved.current) return
     setPosition({ x: Math.max(10, (innerWidth - size.width) / 2), y: Math.max(10, (innerHeight - size.height) / 2) })
   }, [size?.height, size?.width])
-  useEffect(() => { if (restoreKey !== undefined) setMinimized(false) }, [restoreKey])
+  useEffect(() => { if (restoreKey !== undefined) setLocalMinimized(false) }, [restoreKey])
   const toggleMinimized = (event?: React.MouseEvent) => {
     event?.preventDefault(); event?.stopPropagation()
-    setMinimized(value => !value)
+    if (minimized) {
+      if (controlledMinimized === undefined) setLocalMinimized(false)
+      onFocus?.()
+    } else if (controlledMinimized === undefined) setLocalMinimized(true)
+    else onMinimize?.()
   }
   const tray = minimized ? document.getElementById('window-tray') : null
   return <>
-    <div className={`floating ${minimized ? 'stashed' : ''} ${className}`} style={{ left: position.x, top: position.y, width: size?.width, height: size?.height }} aria-hidden={minimized}>
-      <div className="window-title" onDoubleClick={() => toggleMinimized()} onPointerDown={e => { moved.current = true; drag.current = { x: e.clientX - position.x, y: e.clientY - position.y }; e.currentTarget.setPointerCapture(e.pointerId) }} onPointerMove={e => { if (drag.current) setPosition({ x: Math.max(0, e.clientX - drag.current.x), y: Math.max(0, e.clientY - drag.current.y) }) }} onPointerUp={() => { drag.current = null }}><span>{title}</span><div className="window-actions"><button type="button" aria-label={`Minimize ${title}`} title="Minimize to tray" onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={toggleMinimized}><Minus /></button><button type="button" aria-label={`Close ${title}`} title="Close" onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={onClose}><X /></button></div></div>
+    <div className={`floating ${active ? 'active' : ''} ${minimized ? 'stashed' : ''} ${className}`} style={{ left: position.x, top: position.y, width: size?.width, height: size?.height }} aria-hidden={minimized} onPointerDown={onFocus}>
+      <div className="window-title" onDoubleClick={() => toggleMinimized()} onPointerDown={e => { moved.current = true; drag.current = { x: e.clientX - position.x, y: e.clientY - position.y }; e.currentTarget.setPointerCapture(e.pointerId) }} onPointerMove={e => { if (drag.current) setPosition({ x: Math.max(0, e.clientX - drag.current.x), y: Math.max(0, e.clientY - drag.current.y) }) }} onPointerUp={() => { drag.current = null }}><span>{title}</span><div className="window-actions">{onOpenViewers && <button type="button" className="window-viewers" aria-label="Open viewer list" title="Open viewers" onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={onOpenViewers}><ListVideo /></button>}<button type="button" className="window-minimize" aria-label={`Minimize ${title}`} title="Minimize to tray" onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={toggleMinimized}><Minus /></button><button type="button" className="window-close" aria-label={`Close ${title}`} title="Close" onPointerDown={e => e.stopPropagation()} onDoubleClick={e => e.stopPropagation()} onClick={onClose}><X /></button></div></div>
       {children}
     </div>
     {tray && createPortal(<div className="window-tray-item">
       <button type="button" className="window-tray-restore" title={`Restore ${title}`} onClick={toggleMinimized}><Maximize2 /><span>{title}</span></button>
+      {trayControls}
       <button type="button" className="window-tray-close" aria-label={`Close ${title}`} title={`Close ${title}`} onClick={onClose}><X /></button>
     </div>, tray)}
   </>

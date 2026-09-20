@@ -42,6 +42,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 mod archive;
+mod roku;
 
 const SESSION_COOKIE: &str = "rfb_session";
 const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
@@ -75,6 +76,10 @@ struct AppState {
     media_jobs: Arc<DashMap<String, MediaJob>>,
     hls_start: Arc<Mutex<()>>,
     extraction_jobs: Arc<DashMap<String, ExtractionJob>>,
+    roku_devices: Arc<DashMap<String, roku::RokuDeviceRecord>>,
+    roku_casts: Arc<DashMap<Uuid, roku::RokuCastRecord>>,
+    roku_tokens: Arc<DashMap<String, roku::RokuStreamToken>>,
+    roku_http: reqwest::Client,
 }
 
 struct Config {
@@ -94,6 +99,8 @@ struct Config {
     terminal_max_sessions: usize,
     provenance_api_url: String,
     app_urls: HashMap<String, String>,
+    roku_enabled: bool,
+    roku_stream_base_url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -332,6 +339,11 @@ type ApiResult<T> = Result<T, ApiError>;
         auth_check,
         create_terminal_ticket,
         terminal_websocket
+        ,roku::discover_devices
+        ,roku::list_casts
+        ,roku::start_cast
+        ,roku::control_cast
+        ,roku::stop_cast
     ),
     components(schemas(
         Problem,
@@ -368,6 +380,10 @@ type ApiResult<T> = Result<T, ApiError>;
         CacheCleanupReport,
         Document,
         WriteDocument
+        ,roku::RokuDevice
+        ,roku::RokuCast
+        ,roku::StartCastRequest
+        ,roku::CastControlRequest
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -379,6 +395,7 @@ type ApiResult<T> = Result<T, ApiError>;
         (name = "trash", description = "Recoverable deletion"),
         (name = "media", description = "Previews and browser-compatible playback"),
         (name = "terminal", description = "Authenticated interactive container terminal"),
+        (name = "roku", description = "LAN Roku discovery and video casting"),
         (name = "system", description = "Service health")
     )
 )]
@@ -514,6 +531,10 @@ async fn main() {
         .trim_end_matches('/')
         .to_string(),
         app_urls,
+        roku_enabled: env_bool_alias("FILES_ROKU_ENABLED", "RFB_ROKU_ENABLED", false),
+        roku_stream_base_url: env_alias("FILES_ROKU_STREAM_BASE_URL", "RFB_ROKU_STREAM_BASE_URL")
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim_end_matches('/').to_string()),
     };
     let terminal_max_sessions = config.terminal_max_sessions;
     let provenance = ProvenanceClient::http(config.provenance_api_url.clone());
@@ -537,6 +558,10 @@ async fn main() {
         media_jobs: Arc::new(DashMap::new()),
         hls_start: Arc::new(Mutex::new(())),
         extraction_jobs: Arc::new(DashMap::new()),
+        roku_devices: Arc::new(DashMap::new()),
+        roku_casts: Arc::new(DashMap::new()),
+        roku_tokens: Arc::new(DashMap::new()),
+        roku_http: reqwest::Client::builder().timeout(Duration::from_secs(3)).build().expect("roku HTTP client"),
     };
 
     migrate_provenance_json(&state)
@@ -614,6 +639,11 @@ async fn main() {
         .route("/media/extractions/{key}", get(media_extraction_status))
         .route("/terminal/tickets", post(create_terminal_ticket))
         .route("/terminal/ws", get(terminal_websocket));
+    let api = api
+        .route("/roku/devices", get(roku::discover_devices))
+        .route("/roku/casts", get(roku::list_casts).post(roku::start_cast))
+        .route("/roku/casts/{id}/control", post(roku::control_cast))
+        .route("/roku/casts/{id}", delete(roku::stop_cast));
 
     let app = Router::new()
         .route("/healthz", get(health))
@@ -621,8 +651,14 @@ async fn main() {
         .merge(SwaggerUi::new("/api/docs").url("/api/openapi.json", ApiDoc::openapi()))
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .with_state(state.clone());
 
+    let cast_state = state.clone();
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:8081").await.expect("bind Roku stream listener");
+        info!(address = %listener.local_addr().unwrap(), "Roku cast stream listener started");
+        axum::serve(listener, roku::stream_router(cast_state)).await.expect("serve Roku streams");
+    });
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     info!(address = %listener.local_addr().unwrap(), "remote file browser backend started");
     axum::serve(listener, app).await.unwrap();
@@ -694,6 +730,7 @@ struct SessionResponse {
     csrf_token: Option<String>,
     terminal_enabled: bool,
     video_studio_enabled: bool,
+    roku_enabled: bool,
 }
 
 #[utoipa::path(post, path = "/api/v1/auth/login", tag = "authentication", request_body = LoginRequest, responses((status = 200, body = SessionResponse), (status = 401, body = Problem), (status = 429, body = Problem)))]
@@ -773,6 +810,7 @@ async fn login(
             csrf_token: Some(csrf),
             terminal_enabled: state.config.terminal_enabled,
             video_studio_enabled: state.config.app_urls.contains_key("video-studio"),
+            roku_enabled: state.config.roku_enabled && state.config.roku_stream_base_url.is_some(),
         }),
     ))
 }
@@ -786,6 +824,7 @@ async fn session_info(State(state): State<AppState>, jar: CookieJar) -> Json<Ses
             csrf_token: Some(session.csrf),
             terminal_enabled: state.config.terminal_enabled,
             video_studio_enabled: state.config.app_urls.contains_key("video-studio"),
+            roku_enabled: state.config.roku_enabled && state.config.roku_stream_base_url.is_some(),
         }),
         Err(_) => Json(SessionResponse {
             authenticated: false,
@@ -793,6 +832,7 @@ async fn session_info(State(state): State<AppState>, jar: CookieJar) -> Json<Ses
             csrf_token: None,
             terminal_enabled: state.config.terminal_enabled,
             video_studio_enabled: state.config.app_urls.contains_key("video-studio"),
+            roku_enabled: state.config.roku_enabled && state.config.roku_stream_base_url.is_some(),
         }),
     }
 }
@@ -6109,6 +6149,8 @@ mod tests {
                 terminal_max_sessions: 2,
                 provenance_api_url: "http://provenance-api.invalid".into(),
                 app_urls: HashMap::new(),
+                roku_enabled: false,
+                roku_stream_base_url: None,
             }),
             sessions: Arc::new(DashMap::new()),
             login_attempts: Arc::new(DashMap::new()),
@@ -6126,6 +6168,10 @@ mod tests {
             media_jobs: Arc::new(DashMap::new()),
             hls_start: Arc::new(Mutex::new(())),
             extraction_jobs: Arc::new(DashMap::new()),
+            roku_devices: Arc::new(DashMap::new()),
+            roku_casts: Arc::new(DashMap::new()),
+            roku_tokens: Arc::new(DashMap::new()),
+            roku_http: reqwest::Client::new(),
         }
     }
 
@@ -6779,6 +6825,10 @@ mod tests {
             ("/api/v1/media/extractions/{key}", &["get"][..]),
             ("/api/v1/terminal/tickets", &["post"][..]),
             ("/api/v1/terminal/ws", &["get"][..]),
+            ("/api/v1/roku/devices", &["get"][..]),
+            ("/api/v1/roku/casts", &["get", "post"][..]),
+            ("/api/v1/roku/casts/{id}/control", &["post"][..]),
+            ("/api/v1/roku/casts/{id}", &["delete"][..]),
         ] {
             let operations = paths
                 .get(path)

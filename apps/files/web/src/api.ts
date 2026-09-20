@@ -23,7 +23,13 @@ export type Entry = {
 }
 
 export type EntryPage = { entries: Entry[]; total: number; nextOffset?: number | null }
-export type Session = { authenticated: boolean; username?: string; csrfToken?: string; terminalEnabled: boolean; videoStudioEnabled: boolean }
+export type Session = { authenticated: boolean; username?: string; csrfToken?: string; terminalEnabled: boolean; videoStudioEnabled: boolean; rokuEnabled: boolean }
+export type RokuDevice = { id: string; name: string; model: string; isTv: boolean; receiverInstalled: boolean }
+export type RokuCast = {
+  id: string; deviceId: string; deviceName: string; sourceId: string; fileName: string; isTv: boolean
+  status: 'preparing' | 'playing' | 'paused' | 'buffering' | 'stopped' | 'failed'
+  progress?: number; positionSeconds: number; durationSeconds: number; error?: string; createdAt: string
+}
 export type InstalledAppAction = { id: string; label: string; accepts: string[]; minFiles: number; maxFiles: number }
 export type InstalledApp = { id: string; name: string; launchUrl: string; actions: InstalledAppAction[] }
 export type AppLaunch = { launchUrl: string; expiresAt: string }
@@ -193,6 +199,12 @@ export const api = {
   purge: (id: string) => request<void>(`/trash/${id}`, { method: 'DELETE' }),
   emptyTrash: () => request<void>('/trash', { method: 'DELETE' }),
   terminalTicket: (directoryId: string) => request<{ ticket: string }>('/terminal/tickets', { method: 'POST', body: JSON.stringify({ directoryId }) }),
+  rokuDevices: () => request<RokuDevice[]>('/roku/devices'),
+  rokuCasts: () => request<RokuCast[]>('/roku/casts'),
+  startRokuCast: (sourceId: string, deviceId: string) => request<RokuCast>('/roku/casts', { method: 'POST', body: JSON.stringify({ sourceId, deviceId }) }),
+  controlRokuCast: (id: string, action: 'play' | 'pause' | 'stop' | 'seek' | 'volumeUp' | 'volumeDown' | 'mute', positionSeconds?: number) =>
+    request<RokuCast>(`/roku/casts/${encodeURIComponent(id)}/control`, { method: 'POST', body: JSON.stringify({ action, positionSeconds }) }),
+  stopRokuCast: (id: string) => request<void>(`/roku/casts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 }
 
 export const contentUrl = (id: string) => `/api/v1/fs/content?id=${encodeURIComponent(id)}`
