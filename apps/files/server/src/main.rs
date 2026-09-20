@@ -166,6 +166,8 @@ struct TerminalTicket {
 #[serde(rename_all = "camelCase")]
 struct CacheIndex {
     records: HashMap<String, CacheRecord>,
+    #[serde(default)]
+    generations: HashMap<String, u64>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -179,6 +181,8 @@ struct CacheRecord {
     source_size: u64,
     source_modified_ns: u64,
     dimension: Option<u32>,
+    #[serde(default)]
+    cache_generation: u64,
     #[serde(default)]
     popularity_score: f64,
     #[serde(default)]
@@ -298,6 +302,7 @@ type ApiResult<T> = Result<T, ApiError>;
         list_media_jobs,
         cache_status,
         clean_cache,
+        clear_file_cache,
         hls_status,
         hls_file,
         start_media_extraction,
@@ -602,6 +607,7 @@ async fn main() {
         .route("/media/jobs", get(list_media_jobs))
         .route("/media/cache", get(cache_status))
         .route("/media/cache/cleanup", post(clean_cache))
+        .route("/media/cache/files", delete(clear_file_cache))
         .route("/media/hls/{key}/status", get(hls_status))
         .route("/media/hls/{key}/{file}", get(hls_file))
         .route("/media/extractions", post(start_media_extraction))
@@ -1938,6 +1944,7 @@ struct Entry {
     etag: String,
     has_provenance: bool,
     browser_ready: bool,
+    cache_version: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     child_file_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2505,6 +2512,7 @@ fn cache_record_matches(
     id: &str,
     meta: &std::fs::Metadata,
     dimension: Option<u32>,
+    cache_generation: u64,
 ) -> bool {
     record.kind == kind
         && record.source_id == id
@@ -2512,6 +2520,11 @@ fn cache_record_matches(
         && record.source_size == meta.len()
         && record.source_modified_ns == source_modified_ns(meta)
         && record.dimension == dimension
+        && record.cache_generation == cache_generation
+}
+
+fn cache_generation(index: &CacheIndex, id: &str) -> u64 {
+    index.generations.get(id).copied().unwrap_or_default()
 }
 
 async fn find_cache_key(
@@ -2520,6 +2533,7 @@ async fn find_cache_key(
     id: &str,
     meta: &std::fs::Metadata,
     dimension: Option<u32>,
+    generation: u64,
 ) -> Option<String> {
     state
         .cache_index
@@ -2527,7 +2541,7 @@ async fn find_cache_key(
         .await
         .records
         .values()
-        .find(|record| cache_record_matches(record, kind, id, meta, dimension))
+        .find(|record| cache_record_matches(record, kind, id, meta, dimension, generation))
         .map(|record| record.key.clone())
 }
 
@@ -3562,6 +3576,10 @@ async fn entry_from_path_with_provenance(
     };
     let etag = metadata_etag(&meta);
     let id = encode_path(relative.as_os_str());
+    let cache_version = {
+        let index = state.cache_index.read().await;
+        cache_generation(&index, &id)
+    };
     let has_provenance = kind == "file"
         && query_provenance
         && state
@@ -3570,7 +3588,7 @@ async fn entry_from_path_with_provenance(
             .await?
             .contains_key(&id);
     let browser_ready = if kind == "file" && mime.starts_with("video/") {
-        let hls_key = hls_cache_key(&id, &meta);
+        let hls_key = hls_cache_key(&id, &meta, cache_version);
         if playlist_state(&config.cache.join("hls").join(hls_key)).0 {
             true
         } else if let Some(ready) = state
@@ -3615,6 +3633,7 @@ async fn entry_from_path_with_provenance(
         etag,
         has_provenance,
         browser_ready,
+        cache_version,
         child_file_count: None,
         child_directory_count: None,
     })
@@ -4686,10 +4705,15 @@ struct PreviewQuery {
     size: Option<String>,
 }
 
-fn thumbnail_cache_key(id: &str, meta: &std::fs::Metadata, dimension: u32) -> String {
+fn thumbnail_cache_key(
+    id: &str,
+    meta: &std::fs::Metadata,
+    dimension: u32,
+    cache_generation: u64,
+) -> String {
     blake3::hash(
         format!(
-            "{}:{}:{}:{}:{dimension}",
+            "{}:{}:{}:{}:{dimension}:{cache_generation}",
             id,
             meta.ino(),
             meta.len(),
@@ -4722,9 +4746,20 @@ async fn thumbnail(
         Some("large") => 384,
         _ => 192,
     };
-    let key = find_cache_key(&state, "thumbnail", &query.id, &meta, Some(dimension))
-        .await
-        .unwrap_or_else(|| thumbnail_cache_key(&query.id, &meta, dimension));
+    let cache_generation = {
+        let index = state.cache_index.read().await;
+        cache_generation(&index, &query.id)
+    };
+    let key = find_cache_key(
+        &state,
+        "thumbnail",
+        &query.id,
+        &meta,
+        Some(dimension),
+        cache_generation,
+    )
+    .await
+    .unwrap_or_else(|| thumbnail_cache_key(&query.id, &meta, dimension, cache_generation));
     let output = state
         .config
         .cache
@@ -4775,6 +4810,7 @@ async fn thumbnail(
             source_size: meta.len(),
             source_modified_ns: source_modified_ns(&meta),
             dimension: Some(dimension),
+            cache_generation,
             popularity_score: 0.0,
             last_played_at: None,
         },
@@ -4933,18 +4969,21 @@ fn hls_cache_key_parts(
     source_inode: u64,
     source_size: u64,
     source_modified_ns: u64,
+    cache_generation: u64,
 ) -> String {
-    let fingerprint =
-        format!("{id}:{source_inode}:{source_size}:{source_modified_ns}:{HLS_CACHE_VERSION}");
+    let fingerprint = format!(
+        "{id}:{source_inode}:{source_size}:{source_modified_ns}:{cache_generation}:{HLS_CACHE_VERSION}"
+    );
     blake3::hash(fingerprint.as_bytes()).to_hex().to_string()
 }
 
-fn hls_cache_key(id: &str, source_meta: &std::fs::Metadata) -> String {
+fn hls_cache_key(id: &str, source_meta: &std::fs::Metadata, cache_generation: u64) -> String {
     hls_cache_key_parts(
         id,
         source_meta.ino(),
         source_meta.len(),
         source_modified_ns(source_meta),
+        cache_generation,
     )
 }
 
@@ -4956,6 +4995,7 @@ fn current_hls_cache_record(record: &CacheRecord) -> bool {
                 record.source_inode,
                 record.source_size,
                 record.source_modified_ns,
+                record.cache_generation,
             )
 }
 
@@ -5124,7 +5164,11 @@ async fn prepare_hls(
             "HLS conversion is available only for video files",
         ));
     }
-    let key = hls_cache_key(id, &source_meta);
+    let cache_generation = {
+        let index = state.cache_index.read().await;
+        cache_generation(&index, id)
+    };
+    let key = hls_cache_key(id, &source_meta, cache_generation);
     let directory = state.config.cache.join("hls").join(&key);
     let playlist = directory.join("index.m3u8");
     let file_name = source
@@ -5144,6 +5188,7 @@ async fn prepare_hls(
                 source_size: source_meta.len(),
                 source_modified_ns: source_modified_ns(&source_meta),
                 dimension: None,
+                cache_generation,
                 popularity_score: 0.0,
                 last_played_at: None,
             },
@@ -5192,6 +5237,7 @@ async fn prepare_hls(
             source_size: source_meta.len(),
             source_modified_ns: source_modified_ns(&source_meta),
             dimension: None,
+            cache_generation,
             popularity_score: 0.0,
             last_played_at: None,
         },
@@ -5407,7 +5453,11 @@ async fn serve_hls_asset(
 async fn hls_key_for_delegated_file(state: &AppState, file: &DelegatedFile) -> ApiResult<String> {
     let source = validate_delegated_file(state, file).await?;
     let meta = fs::metadata(&source).await?;
-    Ok(hls_cache_key(&file.id, &meta))
+    let generation = {
+        let index = state.cache_index.read().await;
+        cache_generation(&index, &file.id)
+    };
+    Ok(hls_cache_key(&file.id, &meta, generation))
 }
 
 fn require_video_studio_hls(capability: &AppCapability) -> ApiResult<()> {
@@ -5625,6 +5675,113 @@ async fn clean_cache(
 ) -> ApiResult<Json<CacheCleanupReport>> {
     require_csrf(&state, &jar, &headers)?;
     Ok(Json(run_cache_cleanup(&state).await?))
+}
+
+async fn force_clear_file_cache(state: &AppState, id: &str) -> ApiResult<CacheCleanupReport> {
+    let _cleanup = state.cache_cleanup.lock().await;
+    let _start = state.hls_start.lock().await;
+    if state
+        .media_jobs
+        .iter()
+        .any(|job| job.source_id == id && job.status == "working")
+    {
+        return Err(ApiError::conflict(
+            "cache_busy",
+            "The file is currently being converted; try again when conversion finishes",
+        ));
+    }
+
+    let _write = state.cache_write.lock().await;
+    let mut index = state.cache_index.read().await.clone();
+    let removed = index
+        .records
+        .iter()
+        .filter(|(_, record)| record.source_id == id)
+        .map(|(record_id, record)| (record_id.clone(), record.clone()))
+        .collect::<Vec<_>>();
+    let mut report = CacheCleanupReport::default();
+    for (record_id, record) in &removed {
+        let artifact = cache_artifact_path(&state.config.cache, record);
+        let exists = fs::metadata(&artifact).await.is_ok();
+        if exists {
+            let bytes = if record.kind == "hls" {
+                let artifact = artifact.clone();
+                tokio::task::spawn_blocking(move || directory_stats(&artifact).0)
+                    .await
+                    .map_err(ApiError::internal)?
+            } else {
+                fs::metadata(&artifact)
+                    .await
+                    .map(|meta| meta.len())
+                    .unwrap_or(0)
+            };
+            if record.kind == "hls" {
+                fs::remove_dir_all(&artifact).await?;
+            } else {
+                fs::remove_file(&artifact).await?;
+            }
+            report.artifacts_removed += 1;
+            report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(bytes);
+        }
+        index.records.remove(record_id);
+        report.records_removed += 1;
+    }
+    let generation = index.generations.entry(id.to_string()).or_default();
+    *generation = generation.saturating_add(1);
+    persist_cache_index(&state.config.cache, &index).await?;
+    *state.cache_index.write().await = index;
+    state
+        .direct_playable
+        .retain(|key, _| !key.starts_with(&format!("{id}:")));
+    Ok(report)
+}
+
+#[utoipa::path(delete, path = "/api/v1/media/cache/files", tag = "media", params(("id" = String, Query), ("x-csrf-token" = String, Header)), security(("sessionCookie" = [], "csrfToken" = [])), responses((status = 200, body = CacheCleanupReport), (status = 400, body = Problem), (status = 401, body = Problem), (status = 403, body = Problem), (status = 404, body = Problem), (status = 409, body = Problem)))]
+async fn clear_file_cache(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Query(query): Query<IdQuery>,
+) -> ApiResult<Json<CacheCleanupReport>> {
+    require_csrf(&state, &jar, &headers)?;
+    let source = resolve_existing(&state.config, &query.id).await?;
+    if !fs::metadata(&source).await?.is_file() {
+        return Err(ApiError::bad(
+            "not_file",
+            "Cached media can only be cleared for a regular file",
+        ));
+    }
+    let _ = state.live_events.send(LiveEvent::CacheCleanup {
+        state: "started".into(),
+        report: None,
+        error: None,
+    });
+    match force_clear_file_cache(&state, &query.id).await {
+        Ok(report) => {
+            let _ = state.live_events.send(LiveEvent::CacheCleanup {
+                state: "complete".into(),
+                report: Some(report.clone()),
+                error: None,
+            });
+            let parent_id = source
+                .parent()
+                .and_then(|parent| parent.strip_prefix(&state.config.root).ok())
+                .map(|parent| encode_path(parent.as_os_str()))
+                .unwrap_or_default();
+            let _ = state.live_events.send(LiveEvent::Filesystem {
+                directory_ids: vec![parent_id],
+            });
+            Ok(Json(report))
+        }
+        Err(error) => {
+            let _ = state.live_events.send(LiveEvent::CacheCleanup {
+                state: "failed".into(),
+                report: None,
+                error: Some(error.2.clone()),
+            });
+            Err(error)
+        }
+    }
 }
 
 fn spawn_cache_cleanup(state: AppState) {
@@ -7053,12 +7210,13 @@ mod tests {
 
         let mut record = CacheRecord {
             kind: "hls".into(),
-            key: hls_cache_key_parts("video.divx", 42, 1_024, 7),
+            key: hls_cache_key_parts("video.divx", 42, 1_024, 7, 0),
             source_id: "video.divx".into(),
             source_inode: 42,
             source_size: 1_024,
             source_modified_ns: 7,
             dimension: None,
+            cache_generation: 0,
             popularity_score: 0.0,
             last_played_at: None,
         };
@@ -7096,7 +7254,7 @@ mod tests {
             let meta = std::fs::metadata(&source).unwrap();
             let source_id = encode_path(OsStr::new(name));
             let key = if current {
-                hls_cache_key(&source_id, &meta)
+                hls_cache_key(&source_id, &meta, 0)
             } else {
                 "obsolete-profile-key".into()
             };
@@ -7116,6 +7274,7 @@ mod tests {
                 source_size: meta.len(),
                 source_modified_ns: source_modified_ns(&meta),
                 dimension: None,
+                cache_generation: 0,
                 popularity_score: 0.0,
                 last_played_at: None,
             });
@@ -7148,6 +7307,7 @@ mod tests {
             source_size: 1,
             source_modified_ns: 1,
             dimension: None,
+            cache_generation: 0,
             popularity_score: 2.0,
             last_played_at: Some(now - chrono::Duration::days(180)),
         };
@@ -7183,6 +7343,7 @@ mod tests {
             source_size: 1,
             source_modified_ns: 1,
             dimension: None,
+            cache_generation: 0,
             popularity_score: 0.0,
             last_played_at: None,
         };
@@ -7219,6 +7380,7 @@ mod tests {
                 source_size: 1,
                 source_modified_ns: 1,
                 dimension: None,
+                cache_generation: 0,
                 popularity_score: popularity,
                 last_played_at: (popularity > 0.0).then_some(now),
             };
@@ -7259,6 +7421,123 @@ mod tests {
         assert_eq!(status.base_retention_days, 1);
         assert_eq!(status.maximum_retention_days, 12);
         assert_eq!(status.popularity_half_life_days, 6);
+    }
+
+    #[tokio::test]
+    async fn force_clear_file_cache_removes_only_target_artifacts_and_advances_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        let source_id = "broken.divx";
+        let other_id = "other.mp4";
+        let source = root.path().join(source_id);
+        std::fs::write(&source, b"video").unwrap();
+        let meta = std::fs::metadata(&source).unwrap();
+        let thumbnail = CacheRecord {
+            kind: "thumbnail".into(),
+            key: "target-thumbnail".into(),
+            source_id: source_id.into(),
+            source_inode: meta.ino(),
+            source_size: meta.len(),
+            source_modified_ns: source_modified_ns(&meta),
+            dimension: Some(192),
+            cache_generation: 0,
+            popularity_score: 0.0,
+            last_played_at: None,
+        };
+        let hls = CacheRecord {
+            kind: "hls".into(),
+            key: hls_cache_key(source_id, &meta, 0),
+            source_id: source_id.into(),
+            source_inode: meta.ino(),
+            source_size: meta.len(),
+            source_modified_ns: source_modified_ns(&meta),
+            dimension: None,
+            cache_generation: 0,
+            popularity_score: 0.0,
+            last_played_at: None,
+        };
+        let other = CacheRecord {
+            kind: "thumbnail".into(),
+            key: "other-thumbnail".into(),
+            source_id: other_id.into(),
+            source_inode: 1,
+            source_size: 1,
+            source_modified_ns: 1,
+            dimension: Some(192),
+            cache_generation: 0,
+            popularity_score: 0.0,
+            last_played_at: None,
+        };
+        std::fs::write(
+            cache_artifact_path(&state.config.cache, &thumbnail),
+            vec![0_u8; 10],
+        )
+        .unwrap();
+        let hls_directory = cache_artifact_path(&state.config.cache, &hls);
+        std::fs::create_dir_all(&hls_directory).unwrap();
+        std::fs::write(hls_directory.join("segment-00000.ts"), vec![0_u8; 20]).unwrap();
+        std::fs::write(cache_artifact_path(&state.config.cache, &other), b"other").unwrap();
+        {
+            let mut index = state.cache_index.write().await;
+            for record in [&thumbnail, &hls, &other] {
+                index
+                    .records
+                    .insert(cache_record_id(&record.kind, &record.key), record.clone());
+            }
+        }
+        state
+            .direct_playable
+            .insert(browser_compatibility_cache_key(source_id, "etag"), false);
+
+        let report = force_clear_file_cache(&state, source_id).await.unwrap();
+
+        assert_eq!(report.artifacts_removed, 2);
+        assert_eq!(report.records_removed, 2);
+        assert_eq!(report.bytes_reclaimed, 30);
+        assert!(!cache_artifact_path(&state.config.cache, &thumbnail).exists());
+        assert!(!hls_directory.exists());
+        assert!(cache_artifact_path(&state.config.cache, &other).exists());
+        assert!(
+            !state
+                .direct_playable
+                .contains_key(&browser_compatibility_cache_key(source_id, "etag"))
+        );
+        let index = state.cache_index.read().await;
+        assert_eq!(cache_generation(&index, source_id), 1);
+        assert_eq!(index.records.len(), 1);
+        assert_ne!(
+            hls_cache_key(source_id, &meta, 0),
+            hls_cache_key(source_id, &meta, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn force_clear_file_cache_rejects_active_conversion_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), None);
+        state.media_jobs.insert(
+            "working".into(),
+            MediaJob {
+                key: "working".into(),
+                file_name: "broken.divx".into(),
+                status: "working".into(),
+                playable: false,
+                mode: "full".into(),
+                started_at: Utc::now(),
+                progress: Some(0.0),
+                error: None,
+                source_id: "broken.divx".into(),
+            },
+        );
+
+        let error = match force_clear_file_cache(&state, "broken.divx").await {
+            Err(error) => error,
+            Ok(_) => panic!("active conversion cache purge unexpectedly succeeded"),
+        };
+
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(error.1, "cache_busy");
+        assert!(state.cache_index.read().await.generations.is_empty());
     }
 
     #[test]
@@ -7344,6 +7623,7 @@ mod tests {
             source_size: meta.len(),
             source_modified_ns: source_modified_ns(&meta),
             dimension: Some(192),
+            cache_generation: 0,
             popularity_score: 0.0,
             last_played_at: None,
         };
@@ -7352,7 +7632,8 @@ mod tests {
             "thumbnail",
             "image.png",
             &meta,
-            Some(192)
+            Some(192),
+            0
         ));
         record.source_inode = meta.ino();
         assert!(cache_record_matches(
@@ -7360,7 +7641,8 @@ mod tests {
             "thumbnail",
             "image.png",
             &meta,
-            Some(192)
+            Some(192),
+            0
         ));
 
         let legacy: CacheIndex = serde_json::from_value(serde_json::json!({
@@ -7377,6 +7659,8 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy.records["thumbnail:legacy"].source_inode, 0);
+        assert_eq!(legacy.records["thumbnail:legacy"].cache_generation, 0);
+        assert!(legacy.generations.is_empty());
         assert_eq!(legacy.records["thumbnail:legacy"].popularity_score, 0.0);
         assert!(legacy.records["thumbnail:legacy"].last_played_at.is_none());
     }

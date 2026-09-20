@@ -44,6 +44,7 @@ const PromptContext = createContext<(options: PromptOptions) => Promise<string |
 const VideoStudioContext = createContext(false)
 const InstalledAppsContext = createContext<InstalledApp[]>([])
 const ArchiveExtractionContext = createContext<(entry: Entry) => Promise<void>>(async () => {})
+const CacheClearContext = createContext<(entry: Entry) => Promise<void>>(async () => {})
 type UploadConflictRequest = { conflicts: UploadConflict[]; resolve: (choice: UploadConflictChoice) => void }
 const UploadConflictContext = createContext<(conflicts: UploadConflict[]) => Promise<UploadConflictChoice>>(async () => 'cancel')
 
@@ -355,6 +356,23 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
       if (id === '') setRoot(page); else setExpanded(previous => ({ ...previous, [id]: page }))
     } catch (e) { setError(messageOf(e)) }
   }
+  const clearCachedMedia = async (entry: Entry) => {
+    const confirmed = await confirmAction(
+      `Delete generated previews and converted playback for “${entry.name}”? They will be regenerated the next time the file is previewed or played.`,
+      { title: 'Clear cached media?', confirmLabel: 'Clear cache' },
+    )
+    if (!confirmed) return
+    setCacheCleanup({ type: 'cacheCleanup', state: 'started' })
+    try {
+      const report = await api.clearFileCache(entry.id)
+      setCacheCleanup({ type: 'cacheCleanup', state: 'complete', report })
+      await Promise.all([refresh(entry.parentId), api.cacheStatus().then(setCacheStatus)])
+    } catch (reason) {
+      const message = messageOf(reason)
+      setCacheCleanup({ type: 'cacheCleanup', state: 'failed', error: message })
+      setError(message)
+    }
+  }
   const uploadQueue = useUploadQueue(chooseUploadConflicts, async ids => {
     await Promise.all([...ids].map(id => refresh(id)))
   })
@@ -644,7 +662,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
   }
   const openCurrentFolderMenu = () => setFolderMenu({ directoryId: currentDir, path: columnPath.at(-1)?.path ?? '/fs-root', x: innerWidth - 12, y: 80 })
   const mobileSelectionEntry = primary && selected.has(primary.id) ? primary : previewEntries[0]
-  return <ArchiveExtractionContext.Provider value={extractEntry}><InstalledAppsContext.Provider value={installedApps}><div className={`app-shell ${isMobile ? 'mobile-mode' : ''}`}>
+  return <ArchiveExtractionContext.Provider value={extractEntry}><CacheClearContext.Provider value={clearCachedMedia}><InstalledAppsContext.Provider value={installedApps}><div className={`app-shell ${isMobile ? 'mobile-mode' : ''}`}>
     <header className="topbar">
       {isMobile && <button className="icon-button mobile-menu-button" title="Open navigation" aria-label="Open navigation" aria-expanded={drawerOpen} onClick={() => setDrawerOpen(true)}><Menu size={20} /></button>}
       <div className="brand"><FolderOpen size={20} /><strong>Remote Files</strong><span>/fs-root</span></div>
@@ -720,7 +738,7 @@ function FileManager({ session, onLogout }: { session: Session; onLogout: () => 
     }} onClose={() => setOpenFile(null)} onSaved={() => refresh(openFile.entry.parentId)} />}
     {uploadQueue.panel}
     <div id="window-tray" className="window-tray" role="region" aria-label="Minimized windows" />
-  </div></InstalledAppsContext.Provider></ArchiveExtractionContext.Provider>
+  </div></InstalledAppsContext.Provider></CacheClearContext.Provider></ArchiveExtractionContext.Provider>
 }
 
 function MediaJobs({ conversions, extractions, cacheStatus, cacheCleanup, cleanCache }: { conversions: ConversionJob[]; extractions: ExtractionJob[]; cacheStatus: CacheStatus | null; cacheCleanup: CacheCleanupEvent | null; cleanCache: () => Promise<void> }) {
@@ -923,7 +941,7 @@ function ColumnPreview({ entries, primary }: { entries: Entry[]; primary: Entry 
   const entry = primary && entries.some(item => item.id === primary.id) ? primary : entries[0]
   return <aside className="column-preview">
     <div className="preview-hero">
-      {entry.mime.startsWith('image/') || entry.mime.startsWith('video/') ? <img src={thumbnailUrl(entry.id, 'large', entry.etag)} alt="" /> : entry.mime.startsWith('audio/') ? <audio key={`${entry.id}:${entry.etag}`} src={mediaUrl(entry.id, entry.etag)} controls preload="metadata" /> : <FileGlyph entry={entry} />}
+      {entry.mime.startsWith('image/') || entry.mime.startsWith('video/') ? <img src={thumbnailUrl(entry.id, 'large', entry.etag, entry.cacheVersion)} alt="" /> : entry.mime.startsWith('audio/') ? <audio key={`${entry.id}:${entry.etag}`} src={mediaUrl(entry.id, entry.etag)} controls preload="metadata" /> : <FileGlyph entry={entry} />}
       <strong title={entry.name}>{entry.name}</strong><span>{entry.kind === 'directory' ? 'Folder' : entry.mime}</span>
     </div>
     <dl className="preview-metadata"><dt>Size</dt><dd>{formatBytes(entry.size)}</dd><dt>Permissions</dt><dd><code>{entry.permissions} {entry.mode.toString(8)}</code></dd><dt>Owner</dt><dd>{entry.uid}:{entry.gid}</dd><dt>Modified</dt><dd>{formatDate(entry.modifiedAt)}</dd><dt>Created</dt><dd>{formatDate(entry.createdAt)}</dd><dt>Accessed</dt><dd>{formatDate(entry.accessedAt)}</dd></dl>
@@ -1027,7 +1045,7 @@ function FileList({ rows, view, selected, cutIds, setSelected, setPrimary, activ
   return <div className={`preview-list ${view}`}>
     {rows.map(({ entry, depth }, index) => <div className={`preview-card ${selected.has(entry.id) ? 'selected' : ''} ${cutIds.has(entry.id) ? 'cut' : ''} ${dropTarget === entry.id ? 'drop-target' : ''}`} data-upload-directory-id={entry.kind === 'directory' ? entry.id : undefined} data-upload-directory-path={entry.kind === 'directory' ? entry.path : undefined} style={{ marginLeft: depth * 18 }} key={entry.id} onClick={event => selectEntry(entry, index, event)} onDoubleClick={() => activate(entry)} onContextMenu={event => showMenu(event, entry)} {...dragProps(entry)}>
       <button className="card-menu" aria-label={`Actions for ${entry.name}`} onClick={event => showMenu(event, entry)}><MoreHorizontal /></button>
-      {entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : entry.mime.startsWith('image/') || (view !== 'small' && entry.mime.startsWith('video/')) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view, entry.etag)} loading="lazy" /><FileBadges entry={entry} /></button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
+      {entry.kind === 'directory' ? <button className="preview-image folder-preview" tabIndex={-1}><Folder /></button> : entry.mime.startsWith('image/') || (view !== 'small' && entry.mime.startsWith('video/')) ? <button className="preview-image" tabIndex={-1}><img src={thumbnailUrl(entry.id, view, entry.etag, entry.cacheVersion)} loading="lazy" /><FileBadges entry={entry} /></button> : <button className="preview-image" tabIndex={-1}><FileGlyph entry={entry} /></button>}
       <button className="filename" tabIndex={-1} title={entry.name}>{entry.name}</button>
       {view !== 'small' && <small>{formatBytes(entry.size)}</small>}
     </div>)}
@@ -1100,6 +1118,7 @@ function PositionedContextMenu({ x, y, children }: { x: number; y: number; child
 function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, deleteEntry, stageClipboard, pasteInto, hasClipboard, showProperties, concatenateVideos, setError }: { entry: Entry; selectedEntries: Entry[]; x: number; y: number; close: () => void; open: () => void; renameEntry: (entry: Entry) => Promise<void>; deleteEntry: (entry: Entry) => Promise<void>; stageClipboard: (operation: ClipboardOperation, entry: Entry) => void; pasteInto: (entry: Entry) => Promise<void>; hasClipboard: boolean; showProperties: (entry: Entry) => void; concatenateVideos: (entries: Entry[]) => Promise<void>; setError: (message: string) => void }) {
   const promptAction = usePrompt()
   const extractEntry = useContext(ArchiveExtractionContext)
+  const clearCachedMedia = useContext(CacheClearContext)
   const videoStudioEnabled = useContext(VideoStudioContext)
   const installedApps = useContext(InstalledAppsContext)
   const textEditor = installedApps.find(app => app.id === 'text-editor' && app.actions.some(action => action.id === 'open'))
@@ -1152,6 +1171,7 @@ function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, d
     void launchReusableImageTools(imageTools.launchUrl, () => api.launchApp(imageTools.id, 'open', [entry.id])).catch(error => setError(messageOf(error)))
   }
   const extract = () => { close(); void extractEntry(entry) }
+  const clearCache = () => { close(); void clearCachedMedia(entry) }
   const canConcatenate = selectedEntries.length >= 2 && selectedEntries.some(item => item.id === entry.id) && selectedEntries.every(item => item.kind === 'file' && item.mime.startsWith('video/'))
   const concatenate = () => { close(); void concatenateVideos(selectedEntries) }
   return <PositionedContextMenu x={x} y={y}>
@@ -1169,6 +1189,7 @@ function ContextMenu({ entry, selectedEntries, x, y, close, open, renameEntry, d
     {isExtractableArchive(entry) && <button role="menuitem" onClick={extract}><ArchiveRestore /> Extract</button>}
     {canConcatenate && <button role="menuitem" onClick={concatenate}><Film /> Concatenate videos</button>}
     {videoStudioEnabled && entry.kind === 'file' && entry.mime.startsWith('video/') && <button role="menuitem" onClick={editWithVfx}><ExternalLink /> Edit in Video Studio</button>}
+    {entry.kind === 'file' && (entry.mime.startsWith('image/') || entry.mime.startsWith('video/')) && <button role="menuitem" onClick={clearCache}><RefreshCw /> Clear cached media</button>}
     {entry.kind === 'file' && <button role="menuitem" onClick={() => void addProvenance()}><Link2 /> Add provenance URL</button>}
     {entry.kind === 'file' && entry.hasProvenance && <button role="menuitem" onClick={() => void copyProvenance()}><Copy /> Copy Provenance URL</button>}
     <button role="menuitem" className="danger" onClick={remove}><Trash2 /> Delete</button>

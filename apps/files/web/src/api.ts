@@ -17,6 +17,7 @@ export type Entry = {
   etag: string
   hasProvenance: boolean
   browserReady: boolean
+  cacheVersion: number
   childFileCount?: number
   childDirectoryCount?: number
 }
@@ -182,6 +183,7 @@ export const api = {
   conversionJobs: () => request<ConversionJob[]>('/media/jobs'),
   cacheStatus: () => request<CacheStatus>('/media/cache'),
   cleanCache: () => request<CacheCleanupReport>('/media/cache/cleanup', { method: 'POST' }),
+  clearFileCache: (id: string) => request<CacheCleanupReport>(`/media/cache/files?id=${encodeURIComponent(id)}`, { method: 'DELETE' }),
   startExtraction: (input: { id: string; kind: 'frame'; time: number } | { id: string; kind: 'segment'; startTime: number; endTime: number }) =>
     request<ExtractionJob>('/media/extractions', { method: 'POST', body: JSON.stringify(input) }),
   extractionStatus: (key: string) => request<ExtractionJob>(`/media/extractions/${encodeURIComponent(key)}`),
@@ -195,7 +197,7 @@ export const api = {
 
 export const contentUrl = (id: string) => `/api/v1/fs/content?id=${encodeURIComponent(id)}`
 export const mediaUrl = (id: string, version: string) => `/api/v1/media/file?id=${encodeURIComponent(id)}&v=${encodeURIComponent(version)}`
-export const thumbnailUrl = (id: string, size: string, version: string) => `/api/v1/previews/thumbnail?id=${encodeURIComponent(id)}&size=${size}&v=${encodeURIComponent(version)}`
+export const thumbnailUrl = (id: string, size: string, version: string, cacheVersion = 0) => `/api/v1/previews/thumbnail?id=${encodeURIComponent(id)}&size=${size}&v=${encodeURIComponent(version)}&cache=${cacheVersion}`
 export const liveEventsUrl = () => `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/v1/events`
 export const liveFilesystemWatchMessage = (directoryIds: string[]) => JSON.stringify({
   type: 'watchFilesystem',

@@ -11,7 +11,7 @@ Files is the only service with the `/fs-root` mount. Other apps receive short-li
 
 ## Initial setup
 
-Both production and development require an environment file and local administrator and database secrets. Copy a template and edit the mounted path and numeric identity. For production, also set the hostname, ingress bind address, and certificate paths:
+Both production and development require an environment file and local administrator and database secrets. Copy a template and edit the mounted path and numeric identity. `FILES_UID:FILES_GID` must identify the host account that owns the secret files and needs access to the mounted filesystem; both Files and its provenance service run with that identity so file-backed Compose secrets remain readable without relaxing their permissions. For production, also set the hostname, ingress bind address, and certificate paths:
 
 Docker must be running, and the host account launching Compose must be allowed to access the Docker socket. On Linux, add the account to the `docker` group with `sudo usermod -aG docker "$USER"`, then start a new login session (or run `newgrp docker`) before using the commands below.
 
@@ -66,7 +66,7 @@ Run individual web apps with `npm run dev:files`, `npm run dev:images`, `npm run
 
 `FILES_ROOT_PATH` must be an existing path visible to Docker. Compose bind-mounts it at `/fs-root` without creating a missing host directory. The service runs as `FILES_UID:FILES_GID`; Windows-mounted WSL filesystems do not reproduce all POSIX ownership and permission behavior.
 
-The application owns `.trash` and `.cache/remote-file-browser` inside the mounted root. Ordinary deletion moves entries to `.trash`; permanent deletion is available from Trash. Thumbnail and shared converted-video cache limits are controlled by `FILES_CACHE_MAX_BYTES` and `FILES_CACHE_MAX_AGE_DAYS`. Cleanup runs at startup and hourly and can also be started from the Media jobs panel. The age setting is the base retention period: repeat video plays build a gradually decaying popularity score and can extend retention up to 12 times the base period, while the byte limit can still evict any inactive cached item.
+The application owns `.trash` and `.cache/remote-file-browser` inside the mounted root. Ordinary deletion moves entries to `.trash`; permanent deletion is available from Trash. Thumbnail and shared converted-video cache limits are controlled by `FILES_CACHE_MAX_BYTES` and `FILES_CACHE_MAX_AGE_DAYS`. Cleanup runs at startup and hourly and can also be started from the Media jobs panel. To recover a bad preview or conversion, use **Clear cached media** from an image or video file’s actions menu; it removes only that file’s generated artifacts and they are rebuilt on demand. The age setting is the base retention period: repeat video plays build a gradually decaying popularity score and can extend retention up to 12 times the base period, while the byte limit can still evict any inactive cached item.
 
 The authenticated terminal runs inside the read-only Files server container, not on the Docker host, but it can modify `/fs-root`. Disable it with `FILES_TERMINAL_ENABLED=false` when command execution is unnecessary. Rotate the administrator password by replacing `secrets/admin_password`; new login attempts read the new value without a restart.
 

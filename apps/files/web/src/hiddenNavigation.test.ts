@@ -4,7 +4,7 @@ import { retainActiveHiddenDirectory } from './hiddenNavigation'
 
 const entry = (id: string, parentId: string, name: string, kind: Entry['kind'] = 'directory'): Entry => ({
   id, parentId, name, kind, path: `/fs-root/${name}`, size: 0, mode: 0o755, permissions: 'rwxr-xr-x', uid: 1000, gid: 1000,
-  mime: kind === 'directory' ? 'inode/directory' : 'text/plain', etag: id, hasProvenance: false, browserReady: false,
+  mime: kind === 'directory' ? 'inode/directory' : 'text/plain', etag: id, hasProvenance: false, browserReady: false, cacheVersion: 0,
 })
 const page = (...entries: Entry[]): EntryPage => ({ entries, total: entries.length, nextOffset: null })
 

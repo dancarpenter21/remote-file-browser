@@ -15,15 +15,16 @@ describe('preview URLs', () => {
     })
   })
 
-  it('remain stable for the same file version and change with its etag', () => {
+  it('remain stable for the same file version and change with its etag or cache generation', () => {
     expect(mediaUrl('folder/image.png', 'etag-one')).toBe(mediaUrl('folder/image.png', 'etag-one'))
     expect(mediaUrl('folder/image.png', 'etag-one')).not.toBe(mediaUrl('folder/image.png', 'etag-two'))
     expect(thumbnailUrl('folder/image.png', 'large', 'etag-one')).not.toBe(thumbnailUrl('folder/image.png', 'large', 'etag-two'))
+    expect(thumbnailUrl('folder/image.png', 'large', 'etag-one', 0)).not.toBe(thumbnailUrl('folder/image.png', 'large', 'etag-one', 1))
   })
 
   it('encodes file ids and versions as query values', () => {
     expect(thumbnailUrl('folder/a & b.png', 'large', '"inode size"')).toBe(
-      '/api/v1/previews/thumbnail?id=folder%2Fa%20%26%20b.png&size=large&v=%22inode%20size%22',
+      '/api/v1/previews/thumbnail?id=folder%2Fa%20%26%20b.png&size=large&v=%22inode%20size%22&cache=0',
     )
   })
 })
@@ -99,22 +100,28 @@ describe('video extraction', () => {
 })
 
 describe('media cache', () => {
-  it('reads cache status and starts CSRF-protected cleanup', async () => {
+  it('reads cache status and starts CSRF-protected cleanup or per-file purge', async () => {
     const status = { bytesUsed: 1024, artifactCount: 2, maxBytes: 4096, baseRetentionDays: 30, maximumRetentionDays: 360, popularityHalfLifeDays: 180 }
     const report = { artifactsRemoved: 1, recordsRemoved: 1, bytesReclaimed: 512 }
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify(status), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(report), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify(report), { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
     setCsrf('csrf-token')
 
     await expect(api.cacheStatus()).resolves.toEqual(status)
     await expect(api.cleanCache()).resolves.toEqual(report)
+    await expect(api.clearFileCache('folder/legacy clip.divx')).resolves.toEqual(report)
 
     expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/media/cache')
     const [path, init] = fetchMock.mock.calls[1]
     expect(path).toBe('/api/v1/media/cache/cleanup')
     expect(init.method).toBe('POST')
     expect((init.headers as Headers).get('x-csrf-token')).toBe('csrf-token')
+    const [clearPath, clearInit] = fetchMock.mock.calls[2]
+    expect(clearPath).toBe('/api/v1/media/cache/files?id=folder%2Flegacy%20clip.divx')
+    expect(clearInit.method).toBe('DELETE')
+    expect((clearInit.headers as Headers).get('x-csrf-token')).toBe('csrf-token')
   })
 })

@@ -3,7 +3,7 @@ import type { Entry } from './api'
 import { conflictSummary, planUpload } from './uploadPlanning'
 
 const entry = (name: string, kind: Entry['kind'], id = name): Entry => ({
-  id, parentId: '', path: `/fs-root/${name}`, name, kind, size: 0, mode: 0, permissions: '', uid: 0, gid: 0, mime: '', etag: '', hasProvenance: false, browserReady: false,
+  id, parentId: '', path: `/fs-root/${name}`, name, kind, size: 0, mode: 0, permissions: '', uid: 0, gid: 0, mime: '', etag: '', hasProvenance: false, browserReady: false, cacheVersion: 0,
 })
 const localFile = (name: string, path: string[]) => ({ file: { name, size: 1 } as File, path })
 

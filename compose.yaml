@@ -1,5 +1,7 @@
 name: remote-workspace
 
+x-files-user: &files-user "${FILES_UID:-${RFB_UID:-1000}}:${FILES_GID:-${RFB_GID:-1000}}"
+
 x-files-environment: &files-environment
   RFB_ROOT: /fs-root
   RFB_ADMIN_USERNAME: "${FILES_ADMIN_USERNAME:-${RFB_ADMIN_USERNAME:-admin}}"
@@ -26,7 +28,7 @@ services:
       args:
         FFMPEG_VERSION: "8.1.2"
         FFMPEG_SHA256: "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
-    user: "${FILES_UID:-${RFB_UID:-1000}}:${FILES_GID:-${RFB_GID:-1000}}"
+    user: *files-user
     working_dir: /fs-root
     environment: *files-environment
     volumes:
@@ -54,6 +56,7 @@ services:
   files-provenance:
     image: remote-workspace-files-provenance
     build: { context: ./apps/files/provenance }
+    user: *files-user
     environment:
       PROVENANCE_DB_HOST: provenance-db
       PROVENANCE_DB_NAME: rfb_provenance
