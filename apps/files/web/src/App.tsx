@@ -12,7 +12,7 @@ import {
 } from 'lucide-react'
 import { api, ApiFailure, type CacheCleanupEvent, type CacheStatus, contentUrl, type ConversionJob, type DocumentFile, Entry, EntryPage, type ExtractionJob, InstalledApp, LiveEvent, liveEventsUrl, liveFilesystemWatchMessage, mediaUrl, ProvenanceChange, type RokuCast, type RokuDevice, Session, setCsrf, thumbnailUrl, TrashEntry } from './api'
 import { deleteConfirmationMessage } from './deleteConfirmation'
-import { updateFinderPathForSelection } from './finderPath'
+import { columnScrollLeft, updateFinderPathForSelection } from './finderPath'
 import { applyProvenanceToEntry, applyProvenanceToPage } from './provenanceState'
 import { fitContextMenuToViewport } from './contextMenuPosition'
 import { isAdjacentColumnMove, moveConfirmationMessage, springLoadedPath } from './columnDrag'
@@ -882,6 +882,7 @@ function ColumnBrowser({ root, path, pages, filter, selected, cutIds, primary, d
   const edgeFrame = useRef<number | undefined>(undefined)
   const scroller = useRef<HTMLDivElement>(null)
   const columnRefs = useRef<Array<HTMLDivElement | null>>([])
+  const previousColumnCount = useRef(columns.length)
   const cancelSpringOpen = (targetId?: string) => {
     if (targetId && hoverTarget.current !== targetId) return
     clearTimeout(hoverTimer.current); hoverTimer.current = undefined; hoverTarget.current = null
@@ -905,10 +906,18 @@ function ColumnBrowser({ root, path, pages, filter, selected, cutIds, primary, d
   const resetDragVisuals = () => {
     dragSession.current += 1; cancelSpringOpen(); setEdgeScroll(0); setDropTarget(null); setDragPath(null)
   }
-  useEffect(() => {
-    setActiveColumn(Math.min(visiblePath.length, columns.length - 1))
-    requestAnimationFrame(() => scroller.current?.scrollTo({ left: scroller.current.scrollWidth, behavior: 'smooth' }))
-  }, [visiblePath.length])
+  useLayoutEffect(() => {
+    const previousCount = previousColumnCount.current
+    const nextCount = columns.length
+    previousColumnCount.current = nextCount
+    if (nextCount === previousCount) return
+    setActiveColumn(current => nextCount > previousCount ? nextCount - 1 : Math.min(current, nextCount - 1))
+    const container = scroller.current
+    const lastColumn = columnRefs.current[nextCount - 1]
+    if (!container || !lastColumn) return
+    const right = lastColumn.getBoundingClientRect().right - container.getBoundingClientRect().left + container.scrollLeft
+    container.scrollLeft = columnScrollLeft(previousCount, nextCount, container.scrollLeft, container.clientWidth, container.scrollWidth, right)
+  }, [columns.length])
   useEffect(() => () => {
     clearTimeout(hoverTimer.current)
     if (edgeFrame.current !== undefined) cancelAnimationFrame(edgeFrame.current)
