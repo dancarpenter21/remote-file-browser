@@ -9,6 +9,17 @@ Remote Workspace is a single-administrator, Dockerized workspace for files on a 
 
 Files is the only service with the `/fs-root` mount. Other apps receive short-lived, single-use capabilities for selected files. Capabilities are session- and version-bound and grant only the reads or output operations declared by the app action.
 
+## Markdown media previews
+
+The Files Markdown preview renders image embeds and inline video players for `.mp4`, `.m4v`, `.webm`, and `.mov` files. Use image syntax for videos too, and wrap paths containing spaces in angle brackets:
+
+```markdown
+![Video caption](<./clips/example video.mp4>)
+![Image caption](<./images/example image.png>)
+```
+
+Relative paths resolve from the Markdown file's directory. Videos have playback controls, load metadata initially, and do not autoplay. Playback requires a browser-supported codec; Markdown embeds do not automatically convert videos. Production permits media from this app; external media remains subject to its Content Security Policy.
+
 ## Initial setup
 
 Both production and development require an environment file and local administrator and database secrets. Copy a template and edit the mounted path and numeric identity. `FILES_UID:FILES_GID` must identify the host account that owns the secret files and needs access to the mounted filesystem; both Files and its provenance service run with that identity so file-backed Compose secrets remain readable without relaxing their permissions. For production, also set the hostname, ingress bind address, and certificate paths:

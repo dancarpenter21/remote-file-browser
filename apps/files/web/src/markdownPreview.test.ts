@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { markdownHeadingElementId, markdownUrlTransform, resolveMarkdownImageSource, resolveMarkdownLinkTarget } from './markdownPreview'
+import { isMarkdownVideoSource, markdownHeadingElementId, markdownUrlTransform, resolveMarkdownImageSource, resolveMarkdownLinkTarget } from './markdownPreview'
 
 const id = (path: string) => Buffer.from(path).toString('base64url')
 
@@ -53,5 +53,25 @@ describe('Markdown preview links', () => {
 
   it('maps fragments to the sanitized heading id prefix', () => {
     expect(markdownHeadingElementId('#first%20steps')).toBe('user-content-first steps')
+  })
+})
+
+
+describe('Markdown preview videos', () => {
+  it.each(['clip.mp4', 'clip.m4v', 'clip.webm', 'clip.mov', 'clip.MP4?download=1#t=2', 'clips/my video.mp4#t=2'])('recognizes %s as video', source => {
+    expect(isMarkdownVideoSource(source)).toBe(true)
+  })
+
+  it.each([undefined, '', 'image.png', 'image.gif', 'image.png?name=clip.mp4', 'image.jpg#clip.mp4', 'clip.mp4.png'])('does not treat %s as video', source => {
+    expect(isMarkdownVideoSource(source)).toBe(false)
+  })
+
+  it('resolves video paths with spaces and preserves playback fragments', () => {
+    expect(resolveMarkdownImageSource(id('notes/readme.md'), 'clips/my%20video.mp4?download=1#t=2')).toBe(
+      `/api/v1/media/file?id=${id('notes/clips/my video.mp4')}#t=2`,
+    )
+    expect(resolveMarkdownImageSource(id('notes/drafts/readme.md'), '../my video.mp4')).toBe(
+      `/api/v1/media/file?id=${id('notes/my video.mp4')}`,
+    )
   })
 })

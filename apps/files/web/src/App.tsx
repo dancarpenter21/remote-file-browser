@@ -28,7 +28,7 @@ import { conflictSummary, type UploadConflict } from './uploadPlanning'
 import { isExtractableArchive } from './archiveExtraction'
 import { createPlaybackFallbackGate, DIRECT_PLAYBACK_TIMEOUT_MS, formatMediaTime, hlsPlaybackEngine, hlsRecoveryAction, ignoresVideoShortcut, rememberNonzeroVolume, shouldAutoLoop, stepFrameTime, validSegment } from './videoPlayerState'
 import { becamePlayable, progressPercent, upsertJob } from './mediaJobState'
-import { markdownHeadingElementId, markdownSanitizeSchema, markdownUrlTransform, resolveMarkdownImageSource, resolveMarkdownLinkTarget } from './markdownPreview'
+import { isMarkdownVideoSource, markdownHeadingElementId, markdownSanitizeSchema, markdownUrlTransform, resolveMarkdownImageSource, resolveMarkdownLinkTarget } from './markdownPreview'
 import { retainActiveHiddenDirectory } from './hiddenNavigation'
 import { activeViewer, focusViewer, minimizeViewer, navigateViewer, openOrFocusViewer, removeViewer, requestViewerClose, type FileViewer, type VideoPlaybackState } from './viewerState'
 
@@ -1494,7 +1494,9 @@ function TextFileWindow({ entry, active, minimized, closeRequest, cascadeIndex, 
       rehypePlugins={[rehypeSlug, [rehypeSanitize, markdownSanitizeSchema]]}
       urlTransform={markdownUrlTransform}
       components={{
-        img: ({ src, ...props }) => <img {...props} src={resolveMarkdownImageSource(entry.id, src)} />,
+        img: ({ src, alt, title, ...props }) => isMarkdownVideoSource(src)
+          ? <video controls playsInline preload="metadata" src={resolveMarkdownImageSource(entry.id, src)} aria-label={alt || title || 'Embedded video'} title={title} />
+          : <img {...props} src={resolveMarkdownImageSource(entry.id, src)} alt={alt} title={title} />,
         a: ({ href, children, ...props }) => {
           const target = resolveMarkdownLinkTarget(entry.id, href)
           return <a {...props} href={href} target={target?.kind === 'external' ? '_blank' : undefined} rel={target?.kind === 'external' ? 'noopener noreferrer' : undefined} onClick={event => void followMarkdownLink(event, href)}>{children}</a>

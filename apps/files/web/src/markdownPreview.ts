@@ -22,6 +22,10 @@ export function markdownUrlTransform(url: string, key: string) {
   return defaultUrlTransform(url)
 }
 
+export function isMarkdownVideoSource(source?: string): boolean {
+  return Boolean(source && /\.(?:mp4|m4v|webm|mov)$/i.test(source.split(/[?#]/, 1)[0]))
+}
+
 export function resolveMarkdownImageSource(documentId: string, source?: string) {
   if (!source || source.startsWith('#') || source.startsWith('//') || urlScheme.test(source)) return source
 
