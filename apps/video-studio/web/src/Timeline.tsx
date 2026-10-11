@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { formatFrameTime, fpsValue, highlightContainsSection, highlightIntersectsSection, type CrowdGainPoint, type HighlightRange, type Rational, type SlowSection } from "@remote-workspace/video-shared";
+import { draggedBoundary, frameAtPosition, moveHighlightBoundary } from "./highlightControls.js";
 import { apiUrl } from "./urls.js";
 
 interface Props {
@@ -8,6 +9,8 @@ interface Props {
   fps: Rational;
   currentFrame: number;
   highlightRange: HighlightRange;
+  draftStartFrame?: number;
+  draftLastFrame?: number;
   sections: SlowSection[];
   crowdGainPoints: CrowdGainPoint[];
   waveformUrl?: string;
@@ -24,7 +27,7 @@ interface Props {
 }
 
 type Drag = { sectionId: string; edge: "start" | "end" | "rampIn" | "rampOut" };
-type HighlightDrag = "start" | "end";
+type HighlightDrag = { edge: "start" | "end"; range: HighlightRange; original: HighlightRange; originX: number; originFrame: number; width: number; previewFrame: number };
 type HoverPreview = { frame: number; left: number; top: number };
 
 export function Timeline(props: Props) {
@@ -33,7 +36,11 @@ export function Timeline(props: Props) {
   const pendingPreviewFrameRef = useRef<number | undefined>(undefined);
   const previewSeekTimerRef = useRef<number | undefined>(undefined);
   const lastPreviewSeekRef = useRef(0);
-  const [zoom, setZoom] = useState(1);
+  const [zoom, setZoom] = useState(0);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [viewport, setViewport] = useState({ width: 1, left: 0 });
+  const pendingAnchorRef = useRef<{ frame: number; pixel: number } | undefined>(undefined);
+  const [dragNotice, setDragNotice] = useState("");
   const [focused, setFocused] = useState(false);
   const [drag, setDrag] = useState<Drag>();
   const [highlightDrag, setHighlightDrag] = useState<HighlightDrag>();
@@ -52,7 +59,7 @@ export function Timeline(props: Props) {
   const highlightRef = useRef(props.highlightRange);
   highlightCallbacksRef.current = { onChange: props.onHighlightChange, onCommit: props.onHighlightCommit };
   highlightRef.current = props.highlightRange;
-  const viewRange = useMemo(() => {
+  const focusRange = useMemo(() => {
     if (!focused) return { startFrame: 0, endFrameExclusive: props.frameCount };
     const length = props.highlightRange.endFrameExclusive - props.highlightRange.startFrame;
     const context = Math.max(1, Math.round(length * 0.05));
@@ -61,12 +68,64 @@ export function Timeline(props: Props) {
       endFrameExclusive: Math.min(props.frameCount, props.highlightRange.endFrameExclusive + context),
     };
   }, [focused, props.frameCount, props.highlightRange]);
+  const viewRange = highlightDrag?.range ?? focusRange;
   const viewFrameCount = viewRange.endFrameExclusive - viewRange.startFrame;
+  const maxZoom = Math.max(1, viewFrameCount * 8 / viewport.width);
+  const zoomFactor = Math.pow(maxZoom, zoom / 100);
+  const trackWidth = highlightDrag?.width ?? Math.max(viewport.width, viewport.width * zoomFactor);
+  const pixelsPerFrame = trackWidth / viewFrameCount;
+
+  useEffect(() => {
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    const update = () => setViewport({ width: Math.max(1, scroll.clientWidth), left: scroll.scrollLeft });
+    const observer = new ResizeObserver(update);
+    observer.observe(scroll);
+    update();
+    return () => observer.disconnect();
+  }, []);
+
+  useLayoutEffect(() => {
+    const anchor = pendingAnchorRef.current;
+    const scroll = scrollRef.current;
+    if (anchor && scroll) {
+      scroll.scrollLeft = (anchor.frame - viewRange.startFrame) * pixelsPerFrame - anchor.pixel;
+      setViewport({ width: Math.max(1, scroll.clientWidth), left: scroll.scrollLeft });
+      pendingAnchorRef.current = undefined;
+    }
+  }, [zoom, focused, viewRange.startFrame, viewRange.endFrameExclusive, pixelsPerFrame]);
+
+  function changeZoom(next: number): void {
+    const pixel = (props.currentFrame - viewRange.startFrame) * pixelsPerFrame - viewport.left;
+    pendingAnchorRef.current = pixel >= 0 && pixel <= viewport.width
+      ? { frame: props.currentFrame, pixel }
+      : { frame: viewRange.startFrame + (viewport.left + viewport.width / 2) / pixelsPerFrame, pixel: viewport.width / 2 };
+    setZoom(next);
+  }
+
+  function zoomToBoundary(frame: number): void {
+    pendingAnchorRef.current = { frame, pixel: viewport.width / 2 };
+    setFocused(false);
+    setZoom(100);
+    props.onSeek(frame);
+    // Also center when the zoom is already at its maximum.
+    if (!focused && zoom === 100 && scrollRef.current) {
+      scrollRef.current.scrollLeft = (frame - viewRange.startFrame) * pixelsPerFrame - viewport.width / 2;
+      pendingAnchorRef.current = undefined;
+      setViewport({ width: viewport.width, left: scrollRef.current.scrollLeft });
+    }
+  }
+
+  const tickStep = pixelsPerFrame >= 8 ? 1 : Math.max(1, Math.ceil(90 / pixelsPerFrame / fpsValue(props.fps))) * fpsValue(props.fps);
+  const firstVisible = viewRange.startFrame + viewport.left / pixelsPerFrame;
+  const lastVisible = Math.min(viewRange.endFrameExclusive - 1, firstVisible + viewport.width / pixelsPerFrame);
+  const ticks: number[] = [];
+  for (let tick = Math.ceil(firstVisible / tickStep) * tickStep; tick <= lastVisible; tick += tickStep) ticks.push(Math.round(tick));
   const highlightIsFull = props.highlightRange.startFrame === 0 && props.highlightRange.endFrameExclusive === props.frameCount;
 
   useEffect(() => {
-    if (highlightIsFull) setFocused(false);
-  }, [highlightIsFull]);
+    if (highlightIsFull && !highlightDrag) setFocused(false);
+  }, [highlightIsFull, highlightDrag]);
 
   function framePercent(frame: number): number {
     return (frame - viewRange.startFrame) / Math.max(1, viewFrameCount) * 100;
@@ -76,34 +135,76 @@ export function Timeline(props: Props) {
     const track = trackRef.current;
     if (!track) return 0;
     const rect = track.getBoundingClientRect();
-    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    return Math.max(viewRange.startFrame, Math.min(viewRange.endFrameExclusive - 1, viewRange.startFrame + Math.round(ratio * Math.max(0, viewFrameCount - 1))));
+    return frameAtPosition(clientX, rect.left, rect.width, viewRange);
+  }
+
+  function beginHighlightDrag(event: ReactPointerEvent<HTMLButtonElement>, edge: "start" | "end"): void {
+    event.preventDefault();
+    event.stopPropagation();
+    if (props.disabled || event.button !== 0 || !trackRef.current) return;
+    const original = { ...props.highlightRange };
+    const originFrame = edge === "start" ? original.startFrame : original.endFrameExclusive;
+    setHighlightDrag({ edge, range: { ...viewRange }, original, originX: event.clientX, originFrame, width: trackRef.current.getBoundingClientRect().width, previewFrame: props.currentFrame });
+    setHoverPreview(undefined);
+    setDragNotice(`${edge === "start" ? "Start" : "Last"} frame ${edge === "start" ? originFrame : originFrame - 1}`);
+    props.onSeek(edge === "start" ? originFrame : originFrame - 1);
+  }
+
+  function stepBoundary(event: ReactKeyboardEvent<HTMLButtonElement>, edge: "start" | "end"): void {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (props.disabled || highlightDrag) return;
+    const current = highlightRef.current;
+    const boundary = edge === "start" ? current.startFrame : current.endFrameExclusive;
+    const { range, snapped } = moveHighlightBoundary(current, edge, boundary + (event.key === "ArrowLeft" ? -1 : 1), props.frameCount, props.sections);
+    const frame = edge === "start" ? range.startFrame : range.endFrameExclusive - 1;
+    props.onSeek(frame);
+    setDragNotice(`${edge === "start" ? "Start" : "Last"} frame ${frame.toLocaleString()}${snapped ? " · Snapped to slow-section boundary" : ""}`);
+    if (range.startFrame === current.startFrame && range.endFrameExclusive === current.endFrameExclusive) return;
+    highlightRef.current = range;
+    props.onHighlightChange(range);
+    props.onHighlightCommit(range);
   }
 
   useEffect(() => {
     if (!highlightDrag) return;
     const move = (event: PointerEvent) => {
       const current = highlightRef.current;
-      let boundary = eventFrame(event.clientX) + (highlightDrag === "end" ? 1 : 0);
-      const containing = props.sections.find((section) => boundary > section.startFrame && boundary < section.endFrameExclusive);
-      if (containing) boundary = boundary - containing.startFrame < containing.endFrameExclusive - boundary ? containing.startFrame : containing.endFrameExclusive;
-      const next = highlightDrag === "start"
-        ? { startFrame: Math.max(0, Math.min(boundary, current.endFrameExclusive - 2)), endFrameExclusive: current.endFrameExclusive }
-        : { startFrame: current.startFrame, endFrameExclusive: Math.min(props.frameCount, Math.max(boundary, current.startFrame + 2)) };
+      const boundary = draggedBoundary(event.clientX, highlightDrag.originX, highlightDrag.originFrame, highlightDrag.width, highlightDrag.range);
+      const { range: next, snapped } = moveHighlightBoundary(current, highlightDrag.edge, boundary, props.frameCount, props.sections);
+      const frame = highlightDrag.edge === "start" ? next.startFrame : next.endFrameExclusive - 1;
       highlightRef.current = next;
       highlightCallbacksRef.current.onChange(next);
+      seekCallbacksRef.current.onSeek(frame);
+      setDragNotice(`${highlightDrag.edge === "start" ? "Start" : "Last"} frame ${frame.toLocaleString()}${snapped ? " · Snapped to slow-section boundary" : ""}`);
     };
-    const up = () => {
+    const up = (event: PointerEvent) => {
+      move(event);
       highlightCallbacksRef.current.onCommit(highlightRef.current);
       setHighlightDrag(undefined);
     };
+    const cancel = () => {
+      highlightRef.current = highlightDrag.original;
+      highlightCallbacksRef.current.onChange(highlightDrag.original);
+      seekCallbacksRef.current.onSeek(highlightDrag.previewFrame);
+      setHighlightDrag(undefined);
+      setDragNotice("Boundary edit cancelled.");
+    };
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); cancel(); }
+    };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up, { once: true });
+    window.addEventListener("pointercancel", cancel, { once: true });
+    window.addEventListener("keydown", keydown);
     return () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", cancel);
+      window.removeEventListener("keydown", keydown);
     };
-  }, [highlightDrag, props.frameCount, props.sections, viewRange]);
+  }, [highlightDrag, props.frameCount, props.sections]);
 
   function queuePreviewSeek(frame: number): void {
     pendingPreviewFrameRef.current = frame;
@@ -229,15 +330,18 @@ export function Timeline(props: Props) {
       <div className="timeline-toolbar">
         <span>{formatFrameTime(props.currentFrame, props.fps)}</span>
         <span className="frame-label">Frame {props.currentFrame.toLocaleString()} / {(props.frameCount - 1).toLocaleString()}</span>
-        <button className="timeline-focus-button" disabled={highlightIsFull} onClick={() => { setFocused((value) => !value); setZoom(1); }}>{focused ? "Show full video" : "Focus highlight"}</button>
+        <button className="timeline-focus-button" disabled={highlightIsFull || Boolean(highlightDrag)} onClick={() => { pendingAnchorRef.current = { frame: props.highlightRange.startFrame, pixel: 0 }; setFocused((value) => !value); setZoom(0); }}>{focused ? "Show full video" : "Focus highlight"}</button>
         <button className="timeline-focus-button" disabled={props.disabled || props.crowdGainPoints.some((point) => point.frame === props.currentFrame)} onClick={() => props.onAddCrowdGainPoint(props.currentFrame)}>Add crowd point</button>
-        <label>Zoom <input aria-label="Timeline zoom" type="range" min="1" max="12" step="1" value={zoom} onChange={(event) => setZoom(Number(event.target.value))} /></label>
+        <button className="timeline-focus-button" disabled={props.draftStartFrame === undefined || Boolean(highlightDrag)} onClick={() => props.draftStartFrame !== undefined && zoomToBoundary(props.draftStartFrame)}>Zoom to start</button>
+        <button className="timeline-focus-button" disabled={props.draftLastFrame === undefined || Boolean(highlightDrag)} onClick={() => props.draftLastFrame !== undefined && zoomToBoundary(props.draftLastFrame)}>Zoom to end</button>
+        <label>Zoom <input aria-label="Timeline zoom" type="range" min="0" max="100" step="1" value={zoom} disabled={Boolean(highlightDrag || drag || scrubbing || gainDragId)} onChange={(event) => changeZoom(Number(event.target.value))} /></label>
       </div>
-      <div className="timeline-scroll">
+      <output className="timeline-drag-notice" aria-live="polite">{dragNotice || "Drag a boundary to preview its frame. Escape cancels."}</output>
+      <div ref={scrollRef} className="timeline-scroll" onScroll={(event) => setViewport({ width: Math.max(1, event.currentTarget.clientWidth), left: event.currentTarget.scrollLeft })}>
         <div
           ref={trackRef}
           className={`timeline-track${scrubbing ? " is-scrubbing" : ""}`}
-          style={{ width: `${zoom * 100}%`, backgroundImage: props.waveformUrl ? `linear-gradient(90deg, rgba(13,16,22,.3), rgba(13,16,22,.3)), url(${props.waveformUrl})` : undefined }}
+          style={{ width: `${trackWidth}px`, backgroundImage: props.waveformUrl ? `linear-gradient(90deg, rgba(13,16,22,.3), rgba(13,16,22,.3)), url(${props.waveformUrl})` : undefined }}
           onPointerDown={(event) => {
             if (!props.disabled && event.button === 0) {
               event.preventDefault();
@@ -248,7 +352,7 @@ export function Timeline(props: Props) {
             }
           }}
           onPointerMove={(event) => {
-            if (event.pointerType === "touch") return;
+            if (event.pointerType === "touch" || highlightDrag) return;
             const track = trackRef.current;
             if (!track) return;
             const frame = eventFrame(event.clientX);
@@ -262,6 +366,7 @@ export function Timeline(props: Props) {
           }}
           onPointerLeave={() => setHoverPreview(undefined)}
         >
+          <div className="timeline-ruler" aria-hidden="true">{ticks.map((frame) => <span key={frame} style={{ left: `${framePercent(frame)}%` }}>{pixelsPerFrame >= 8 ? (frame % Math.ceil(64 / pixelsPerFrame) === 0 ? frame.toLocaleString() : "") : formatFrameTime(frame, props.fps)}</span>)}</div>
           {ordered.map((section, index) => {
             if (section.endFrameExclusive <= viewRange.startFrame || section.startFrame >= viewRange.endFrameExclusive) return null;
             const left = framePercent(section.startFrame);
@@ -281,8 +386,8 @@ export function Timeline(props: Props) {
           })}
           {props.highlightRange.startFrame > viewRange.startFrame && <div className="outside-highlight start" style={{ width: `${framePercent(props.highlightRange.startFrame)}%` }} />}
           {props.highlightRange.endFrameExclusive < viewRange.endFrameExclusive && <div className="outside-highlight end" style={{ left: `${framePercent(props.highlightRange.endFrameExclusive)}%` }} />}
-          <button className="highlight-handle start" aria-label="Move highlight start" disabled={props.disabled} style={{ left: `${framePercent(props.highlightRange.startFrame)}%` }} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); if (!props.disabled) setHighlightDrag("start"); }} />
-          <button className="highlight-handle end" aria-label="Move highlight end" disabled={props.disabled} style={{ left: `${framePercent(props.highlightRange.endFrameExclusive)}%` }} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); if (!props.disabled) setHighlightDrag("end"); }} />
+          <button className="highlight-handle start" aria-label="Move highlight start" title="Drag to preview start; Left/Right adjusts by one frame" disabled={props.disabled} style={{ left: `${framePercent(props.highlightRange.startFrame)}%` }} onPointerDown={(event) => beginHighlightDrag(event, "start")} onKeyDown={(event) => stepBoundary(event, "start")} />
+          <button className="highlight-handle end" aria-label="Move highlight end" title="Drag to preview last frame; Left/Right adjusts by one frame" disabled={props.disabled} style={{ left: `${framePercent(props.highlightRange.endFrameExclusive)}%` }} onPointerDown={(event) => beginHighlightDrag(event, "end")} onKeyDown={(event) => stepBoundary(event, "end")} />
           {props.currentFrame >= viewRange.startFrame && props.currentFrame < viewRange.endFrameExclusive && <div className="playhead" style={{ left: `${framePercent(props.currentFrame)}%` }} />}
           <div ref={gainLaneRef} className="crowd-gain-lane" onPointerDown={(event) => event.stopPropagation()}>
             <span className="crowd-gain-label">CROWD</span>

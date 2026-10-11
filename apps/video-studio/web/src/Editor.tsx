@@ -7,7 +7,6 @@ import {
   formatFrameTime,
   fpsValue,
   highlightContainsSection,
-  validateHighlightRange,
   type AudioSettings,
   type CrowdGainPoint,
   type Project,
@@ -17,6 +16,7 @@ import {
 } from "@remote-workspace/video-shared";
 import { cancelRender, createRender, getProject, patchProject, publishRemoteExport, uploadCrowd, type PublishedRemoteExport } from "./api.js";
 import { createSectionId } from "./sectionId.js";
+import { parseFrame, validateHighlightDraft } from "./highlightControls.js";
 import { Timeline } from "./Timeline.js";
 import { apiUrl } from "./urls.js";
 
@@ -33,8 +33,8 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
   const [audio, setAudio] = useState(initialProject.audio);
   const [highlightRange, setHighlightRange] = useState(() => effectiveHighlightRange(initialProject.source.frameCount, initialProject.highlightRange));
   const [currentFrame, setCurrentFrame] = useState(0);
-  const [highlightMarkIn, setHighlightMarkIn] = useState<number>();
-  const [highlightMarkOut, setHighlightMarkOut] = useState<number>();
+  const [highlightStart, setHighlightStart] = useState(() => String(highlightRange.startFrame));
+  const [highlightLast, setHighlightLast] = useState(() => String(highlightRange.endFrameExclusive - 1));
   const [markIn, setMarkIn] = useState<number>();
   const [markOut, setMarkOut] = useState<number>();
   const [playing, setPlaying] = useState(false);
@@ -65,12 +65,32 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
     setSections(initialProject.sections);
     setAudio(initialProject.audio);
     setHighlightRange(effectiveHighlightRange(initialProject.source.frameCount, initialProject.highlightRange));
-    setHighlightMarkIn(undefined);
-    setHighlightMarkOut(undefined);
+    const range = effectiveHighlightRange(initialProject.source.frameCount, initialProject.highlightRange);
+    setHighlightStart(String(range.startFrame));
+    setHighlightLast(String(range.endFrameExclusive - 1));
     setMarkIn(undefined);
     setMarkOut(undefined);
     setFitVideo(true);
-  }, [initialProject]);
+  }, [initialProject.id]);
+
+  // Only persisted boundary changes replace drafts; unrelated audio/section saves preserve them.
+  useEffect(() => {
+    const range = effectiveHighlightRange(project.source.frameCount, project.highlightRange);
+    setHighlightStart(String(range.startFrame));
+    setHighlightLast(String(range.endFrameExclusive - 1));
+  }, [project.id, project.highlightRange?.startFrame, project.highlightRange?.endFrameExclusive, project.source.frameCount]);
+
+  const highlightDraft = validateHighlightDraft(highlightStart, highlightLast, project.source.frameCount, sections);
+  const draftStartFrame = parseFrame(highlightStart, project.source.frameCount);
+  const draftLastFrame = parseFrame(highlightLast, project.source.frameCount);
+  const highlightUnchanged = highlightDraft.range?.startFrame === highlightRange.startFrame && highlightDraft.range?.endFrameExclusive === highlightRange.endFrameExclusive;
+
+  function seekFrame(frame: number): void {
+    videoRef.current?.pause();
+    crowdRef.current?.pause();
+    setPlaying(false);
+    setCurrentFrame(frame);
+  }
 
   useEffect(() => {
     if (!job) return;
@@ -104,7 +124,7 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
 
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
-      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
+      if (event.target instanceof HTMLElement && (event.target.closest("input, select, textarea, button") || event.target.isContentEditable)) return;
       if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
         event.preventDefault();
         const amount = event.shiftKey ? 10 : 1;
@@ -148,8 +168,11 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
     setSaving(true);
     setError(undefined);
     let succeeded = false;
+    let savingHighlight = false;
     const operation = saveChainRef.current.then(async () => {
       const currentProject = projectRef.current;
+      const persisted = effectiveHighlightRange(currentProject.source.frameCount, currentProject.highlightRange);
+      savingHighlight = persisted.startFrame !== nextHighlight.startFrame || persisted.endFrameExclusive !== nextHighlight.endFrameExclusive;
       const updated = await patchProject(currentProject.id, {
         expectedRevision: currentProject.revision,
         sections: nextSections,
@@ -173,7 +196,12 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
         setProject(refreshed);
         setSections(refreshed.sections);
         setAudio(refreshed.audio);
-        setHighlightRange(effectiveHighlightRange(refreshed.source.frameCount, refreshed.highlightRange));
+        const range = effectiveHighlightRange(refreshed.source.frameCount, refreshed.highlightRange);
+        setHighlightRange(range);
+        if (savingHighlight) {
+          setHighlightStart(String(range.startFrame));
+          setHighlightLast(String(range.endFrameExclusive - 1));
+        }
       }
     }).finally(() => {
       pendingSavesRef.current -= 1;
@@ -221,21 +249,10 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
     }
   }
 
-  function setHighlightFromMarks(): void {
-    if (highlightMarkIn === undefined || highlightMarkOut === undefined) {
-      setError("Set both In and Out marks before defining the highlight.");
-      return;
-    }
-    const next = { startFrame: Math.min(highlightMarkIn, highlightMarkOut - 1), endFrameExclusive: Math.max(highlightMarkIn + 1, highlightMarkOut) };
-    try {
-      validateHighlightRange(next, project.source.frameCount, sections);
-      setHighlightRange(next);
-      setHighlightMarkIn(undefined);
-      setHighlightMarkOut(undefined);
-      void commit(sections, audio, next);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "The highlight range is invalid.");
-    }
+  function applyHighlight(): void {
+    if (!highlightDraft.range || saving || highlightUnchanged) return;
+    setHighlightRange(highlightDraft.range);
+    void commit(sections, audio, highlightDraft.range);
   }
 
   function updateSection(id: string, patch: Partial<SlowSection>, save = true): void {
@@ -305,14 +322,20 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
             fps={project.source.fps}
             currentFrame={currentFrame}
             highlightRange={highlightRange}
+            draftStartFrame={draftStartFrame}
+            draftLastFrame={draftLastFrame}
             sections={sections}
             crowdGainPoints={audio.crowdGainPoints}
             waveformUrl={project.waveformFilename ? apiUrl(`/projects/${project.id}/media/waveform`) : undefined}
             disabled={saving}
-            onSeek={(frame) => { setPlaying(false); videoRef.current?.pause(); setCurrentFrame(frame); }}
+            onSeek={seekFrame}
             onScrubChange={setScrubbing}
             onHighlightChange={setHighlightRange}
-            onHighlightCommit={(next) => void commit(sections, audio, next)}
+            onHighlightCommit={(next) => {
+              setHighlightStart(String(next.startFrame));
+              setHighlightLast(String(next.endFrameExclusive - 1));
+              void commit(sections, audio, next);
+            }}
             onSectionsChange={setSections}
             onSectionsCommit={(next) => void commit(next, audio)}
             onCrowdGainPointsChange={(points) => setAudio({ ...audio, crowdGainPoints: points })}
@@ -327,15 +350,15 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
           <div className="edit-workflow">
             <section className="workflow-step highlight-step">
               <header><span className="step-number">1</span><div><h2>Choose the highlight</h2><p>Set the part of the source video that will be exported.</p></div></header>
-              <div className="workflow-marks">
-                <button onClick={() => setHighlightMarkIn(currentFrame)}>Set start</button>
-                <output>{highlightMarkIn === undefined ? "Start —" : `Start ${highlightMarkIn.toLocaleString()}`}</output>
-                <button onClick={() => setHighlightMarkOut(Math.min(project.source.frameCount, currentFrame + 1))}>Set end</button>
-                <output>{highlightMarkOut === undefined ? "End —" : `End ${(highlightMarkOut - 1).toLocaleString()}`}</output>
+              <div className="highlight-fields">
+                <HighlightBoundary label="Start frame" value={highlightStart} frameCount={project.source.frameCount} disabled={saving} invalid={Boolean(highlightDraft.error)} onChange={setHighlightStart} onSeek={seekFrame} onApply={applyHighlight} onSet={() => setHighlightStart(String(currentFrame))} />
+                <HighlightBoundary label="Last frame" value={highlightLast} frameCount={project.source.frameCount} disabled={saving} invalid={Boolean(highlightDraft.error)} onChange={setHighlightLast} onSeek={seekFrame} onApply={applyHighlight} onSet={() => setHighlightLast(String(currentFrame))} />
               </div>
+              <p className="active-range">Last frame is included. Frames start at 0. Type a frame or use ←/→ (Shift: 10 frames); Enter applies both fields.</p>
+              {highlightDraft.error && <p id="highlight-draft-error" className="inline-error" role="alert">{highlightDraft.error}</p>}
               <div className="workflow-actions">
-                <button className="primary-action" onClick={setHighlightFromMarks} disabled={saving || highlightMarkIn === undefined || highlightMarkOut === undefined}>Apply highlight</button>
-                <button onClick={() => { const next = { startFrame: 0, endFrameExclusive: project.source.frameCount }; setHighlightRange(next); void commit(sections, audio, next); }} disabled={saving || (highlightRange.startFrame === 0 && highlightRange.endFrameExclusive === project.source.frameCount)}>Use full video</button>
+                <button className="primary-action" onClick={applyHighlight} disabled={saving || !highlightDraft.range || highlightUnchanged}>Apply highlight</button>
+                <button onClick={() => { const next = { startFrame: 0, endFrameExclusive: project.source.frameCount }; setHighlightStart("0"); setHighlightLast(String(project.source.frameCount - 1)); setHighlightRange(next); void commit(sections, audio, next); }} disabled={saving || (highlightUnchanged && highlightRange.startFrame === 0 && highlightRange.endFrameExclusive === project.source.frameCount)}>Use full video</button>
               </div>
               <p className="active-range">Active · Frames {highlightRange.startFrame.toLocaleString()}–{(highlightRange.endFrameExclusive - 1).toLocaleString()}</p>
             </section>
@@ -428,4 +451,31 @@ function Gain({ label, value, min, max, disabled, onChange, onCommit }: { label:
 
 function CrowdPointEditor({ point, index, frameCount, disabled, onChange, onCommit, onRemove }: { point: CrowdGainPoint; index: number; frameCount: number; disabled: boolean; onChange: (patch: Partial<CrowdGainPoint>) => void; onCommit: () => void; onRemove: () => void }) {
   return <div className="crowd-point-editor"><span>Point {index + 1}</span><input aria-label={`Crowd point ${index + 1} frame`} type="number" min="0" max={frameCount - 1} value={point.frame} disabled={disabled} onChange={(event) => onChange({ frame: Number(event.target.value) })} onBlur={onCommit} /><input aria-label={`Crowd point ${index + 1} gain`} type="number" min="-60" max="0" value={point.gainDb} disabled={disabled} onChange={(event) => onChange({ gainDb: Number(event.target.value) })} onBlur={onCommit} /><button aria-label={`Remove crowd point ${index + 1}`} disabled={disabled} onClick={onRemove}>×</button></div>;
+}
+
+function HighlightBoundary({ label, value, frameCount, disabled, invalid, onChange, onSeek, onApply, onSet }: { label: string; value: string; frameCount: number; disabled: boolean; invalid: boolean; onChange: (value: string) => void; onSeek: (frame: number) => void; onApply: () => void; onSet: () => void }) {
+  const frame = parseFrame(value, frameCount);
+  function nudge(amount: number): void {
+    if (frame === undefined) return;
+    const next = Math.max(0, Math.min(frameCount - 1, frame + amount));
+    onChange(String(next));
+    onSeek(next);
+  }
+  return <div className="highlight-boundary">
+    <label>{label}<input type="text" inputMode="numeric" value={value} disabled={disabled} aria-invalid={invalid} aria-describedby={invalid ? "highlight-draft-error" : undefined} onChange={(event) => onChange(event.target.value)} onKeyDown={(event) => {
+      if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        event.preventDefault();
+        nudge((event.key === "ArrowLeft" ? -1 : 1) * (event.shiftKey ? 10 : 1));
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        onApply();
+      }
+    }} /></label>
+    <div className="boundary-actions">
+      <button aria-label={`${label}: previous frame`} disabled={disabled || frame === undefined || frame === 0} onClick={() => nudge(-1)}>−1</button>
+      <button aria-label={`${label}: next frame`} disabled={disabled || frame === undefined || frame === frameCount - 1} onClick={() => nudge(1)}>+1</button>
+      <button aria-label={`Go to ${label.toLowerCase()}`} disabled={disabled || frame === undefined} onClick={() => frame !== undefined && onSeek(frame)}>Go to</button>
+      <button onClick={onSet} disabled={disabled}>{label === "Start frame" ? "Set start" : "Set end"}</button>
+    </div>
+  </div>;
 }
