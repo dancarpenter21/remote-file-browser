@@ -44,6 +44,8 @@ docker compose --profile prod up -d --build
 
 Open `https://$RWS_HOSTNAME`. The root stack owns Traefik, its restricted Docker socket proxy, the application services, and their private networks. The TLS certificate must cover the configured hostname and be trusted by clients. By default, ingress binds only to `127.0.0.1`; set `INGRESS_BIND_ADDRESS` deliberately for remote access.
 
+Production builds the same application source and root npm lockfile used by development. Re-run the production command after source changes to rebuild the images and recreate outdated containers. Development uses Vite and mounted source for live updates; production serves built assets behind HTTPS. The Files server, provenance service, and database are shared by both profiles. Video Studio project data uses separate development and production volumes.
+
 Stop the stack without deleting application data:
 
 ```sh
@@ -77,10 +79,20 @@ Then rebuild with the normal production or development command above/below. Port
 The dev profile runs Files at `http://localhost:5173` and starts all app development servers behind its Vite proxy:
 
 ```sh
+docker compose --profile dev config --quiet
 RWS_SECURE_COOKIES=false docker compose --profile dev up --build
 ```
 
 One setup container installs the root npm lockfile into a shared named volume before the web services start. Set `RWS_DEV_PORT` to change the host port and `RWS_DEV_POLLING=true` when bind-mounted source events are unreliable.
+
+Stop development before switching to production:
+
+```sh
+docker compose --profile dev down
+docker compose --profile prod up -d --build
+```
+
+Stop development without deleting application data with `docker compose --profile dev down`. For the automation stack, use `docker compose -f compose.yaml -f compose.automation.yaml --profile prod down`.
 
 Host-side development uses Node.js 24+ and Rust:
 
