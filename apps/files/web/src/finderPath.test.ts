@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { columnScrollLeft, updateFinderPathForSelection } from './finderPath'
+import { columnScrollLeft, columnTrailingSpace, updateFinderPathForSelection } from './finderPath'
 
 const path = [{ id: 'documents' }, { id: 'projects' }, { id: 'current' }]
 
@@ -26,20 +26,60 @@ describe('updateFinderPathForSelection', () => {
 })
 
 describe('columnScrollLeft', () => {
-  it('reveals a newly opened column with only the needed scroll', () => {
-    expect(columnScrollLeft(3, 4, 150, 500, 960, 960)).toBe(460)
+  it('reveals an opened column with only the needed scroll', () => {
+    expect(columnScrollLeft(150, 500, 720, 960)).toBe(460)
   })
 
-  it('keeps the current position when a new column is already visible', () => {
-    expect(columnScrollLeft(2, 3, 100, 500, 720, 480)).toBe(100)
+  it('keeps already visible destinations stationary', () => {
+    expect(columnScrollLeft(100, 500, 240, 480)).toBe(100)
   })
 
-  it('only clamps the position when earlier navigation removes columns', () => {
-    expect(columnScrollLeft(6, 3, 960, 500, 720, 720)).toBe(220)
-    expect(columnScrollLeft(3, 1, 220, 500, 240, 240)).toBe(0)
+  it('keeps a partially visible ancestor stationary for pointer navigation', () => {
+    expect(columnScrollLeft(590, 850, 480, 720, false)).toBe(590)
+    expect(columnScrollLeft(590, 850, 720, 960, false)).toBe(590)
   })
 
-  it('reveals the new column when the viewport is narrower than it', () => {
-    expect(columnScrollLeft(1, 2, 0, 120, 480, 480)).toBe(360)
+  it('reveals an ancestor that is entirely offscreen, including root', () => {
+    expect(columnScrollLeft(590, 850, 240, 480, false)).toBe(240)
+    expect(columnScrollLeft(590, 850, 0, 240, false)).toBe(0)
+  })
+
+  it('reveals root explicitly while keeping a pointer-selected root column steady', () => {
+    expect(columnScrollLeft(210, 850, 0, 240)).toBe(0)
+    expect(columnScrollLeft(210, 850, 0, 240, false)).toBe(210)
+  })
+
+  it('fully reveals the keyboard destination even when partially visible', () => {
+    expect(columnScrollLeft(590, 850, 480, 720)).toBe(480)
+  })
+
+  it('handles a replacement at the same depth and unequal column widths', () => {
+    expect(columnScrollLeft(150, 500, 540, 1020)).toBe(520)
+  })
+
+  it('keeps the beginning readable when the column is wider than the viewport', () => {
+    expect(columnScrollLeft(0, 120, 240, 480)).toBe(240)
+  })
+})
+
+describe('columnTrailingSpace', () => {
+  it('prevents ancestor collapse from clamping the viewport', () => {
+    expect(columnTrailingSpace(960, 590, 850)).toBe(480)
+    expect(columnTrailingSpace(720, 590, 850)).toBe(720)
+  })
+
+  it('reclaims space while scrolling back and when opening new columns', () => {
+    expect(columnTrailingSpace(960, 350, 850)).toBe(240)
+    expect(columnTrailingSpace(960, 0, 850)).toBe(0)
+    expect(columnTrailingSpace(1440, 590, 850)).toBe(0)
+  })
+
+  it('accounts for viewport resizing, unequal widths, and fractional scrolling', () => {
+    expect(columnTrailingSpace(1020, 520, 700)).toBe(200)
+    expect(columnTrailingSpace(1020, 520.5, 700)).toBe(201)
+  })
+
+  it('does not add blank space when all columns fit', () => {
+    expect(columnTrailingSpace(240, 0, 850)).toBe(0)
   })
 })
