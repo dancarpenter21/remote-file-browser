@@ -1,10 +1,16 @@
 import type { Project, ProjectPatch, RenderJob, RenderKind } from "@remote-workspace/video-shared";
 import { apiUrl } from "./urls.js";
 
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
 async function responseJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const body = await response.json().catch(() => ({ error: response.statusText })) as { error?: string; message?: string };
-    throw new Error(body.error ?? body.message ?? response.statusText);
+    throw new ApiError(body.error ?? body.message ?? response.statusText, response.status);
   }
   return response.json() as Promise<T>;
 }
@@ -74,10 +80,13 @@ export async function cancelRender(id: string): Promise<RenderJob> {
 export interface PublishedRemoteExport {
   id: string;
   name: string;
+  path?: string;
 }
 
-export async function publishRemoteExport(sessionId: string, projectId: string): Promise<PublishedRemoteExport> {
+export async function publishRemoteExport(sessionId: string, projectId: string, outputName?: string): Promise<PublishedRemoteExport> {
   return responseJson(await fetch(apiUrl(`/handoffs/${encodeURIComponent(sessionId)}/projects/${encodeURIComponent(projectId)}/publish`), {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ outputName }),
   }));
 }

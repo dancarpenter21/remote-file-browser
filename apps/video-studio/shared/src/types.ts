@@ -5,11 +5,7 @@ export const rationalSchema = z.object({
   den: z.number().int().positive(),
 });
 
-export const slowSpeedSchema = z.union([
-  z.literal(0.5),
-  z.literal(0.25),
-  z.literal(0.125),
-]);
+export const slowSpeedSchema = z.number().finite().min(0.01).max(1);
 
 export const slowSectionSchema = z.object({
   id: z.string().min(1),
@@ -81,6 +77,8 @@ export const projectSchema = z.object({
   integration: z.object({
     provider: z.enum(["remote-workspace-files", "remote-file-browser"]),
     key: z.string().regex(/^[a-f0-9]{64}$/),
+    sourceId: z.string().min(1).optional(),
+    sourcePath: z.string().optional(),
   }).optional(),
 });
 

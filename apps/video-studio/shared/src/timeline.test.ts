@@ -37,6 +37,20 @@ describe("timeline compiler", () => {
     expect(map.outputFrameCount).toBe(110);
   });
 
+  it.each([0.01, 0.125, 0.25, 0.333, 0.5, 0.75, 1])("matches fractional speed %s to its FFmpeg timestamp expression", (speed) => {
+    for (const ramps of [0, 5]) {
+      const sections = [section({ speed, rampInFrames: ramps, rampOutFrames: ramps })];
+      const map = compileTimeline(90, fps, sections);
+      const expression = buildSetPtsFrameExpression(90, sections).replaceAll("\\,", ",").replaceAll("if(", "choose(");
+      const evaluate = new Function("N", "choose", "lt", `return ${expression}`) as (frame: number, choose: (test: boolean, yes: number, no: number) => number, lt: (a: number, b: number) => boolean) => number;
+      for (let frame = 0; frame <= 90; frame += 1) {
+        expect(evaluate(frame, (test, yes, no) => test ? yes : no, (a, b) => a < b)).toBeCloseTo(map.outputPositionBySourceFrame[frame]!, 7);
+      }
+      expect(map.outputFrameCount).toBe(Math.round(map.outputPositionBySourceFrame[90]!));
+      expect(map.durationSeconds).toBe(map.outputFrameCount / 30);
+    }
+  });
+
   it("caps default ramps to a quarter of the selection", () => {
     expect(defaultRampFrames(20, fps)).toBe(5);
     expect(defaultRampFrames(120, fps)).toBe(15);

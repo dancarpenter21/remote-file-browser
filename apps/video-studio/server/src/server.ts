@@ -8,6 +8,8 @@ import Fastify, { type FastifyReply } from "fastify";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import {
+  defaultOutputFilename,
+  outputFilenameSchema,
   projectPatchSchema,
   renderRequestSchema,
   effectiveHighlightRange,
@@ -89,7 +91,11 @@ function safeExtension(filename: string): string {
 async function sendRangedFile(requestRange: string | undefined, file: string, reply: FastifyReply, contentType: string, downloadName?: string): Promise<void> {
   const details = await stat(file);
   reply.header("Accept-Ranges", "bytes").header("Content-Type", contentType);
-  if (downloadName) reply.header("Content-Disposition", `attachment; filename="${downloadName.replaceAll('"', '')}"`);
+  if (downloadName) {
+    const fallback = downloadName.replaceAll(/[^\x20-\x7e]|["\\]/g, "_");
+    const encoded = encodeURIComponent(downloadName).replaceAll(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+    reply.header("Content-Disposition", `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`);
+  }
   if (!requestRange) {
     reply.header("Content-Length", details.size);
     return reply.send(createReadStream(file));
@@ -338,8 +344,8 @@ export async function buildServer() {
     const file = session.files[0];
     const existing = await findIntegratedProject(file.integrationKey);
     if (existing) {
-      if (existing.integration?.provider === "remote-file-browser") {
-        existing.integration.provider = "remote-workspace-files";
+      if (existing.integration?.provider !== "remote-workspace-files" || existing.integration.sourceId !== file.id || existing.integration.sourcePath !== file.path) {
+        existing.integration = { provider: "remote-workspace-files", key: file.integrationKey, sourceId: file.id, sourcePath: file.path };
         await saveProject(existing);
       }
       return { projectId: existing.id, reused: true };
@@ -348,7 +354,7 @@ export async function buildServer() {
     const storedName = `source${safeExtension(file.name)}`;
     const metadata = await inspectSource(source, file.name, storedName, await sha256File(source));
     const name = path.basename(file.name, path.extname(file.name)) || "Untitled video";
-    const project = await createProjectRecord(name, metadata, { provider: "remote-workspace-files", key: file.integrationKey });
+    const project = await createProjectRecord(name, metadata, { provider: "remote-workspace-files", key: file.integrationKey, sourceId: file.id, sourcePath: file.path });
     await link(source, projectFile(project.id, storedName));
     void markPreparation(project);
     return reply.code(202).send({ projectId: project.id, reused: false });
@@ -361,7 +367,8 @@ export async function buildServer() {
     const project = await readProject(request.params.id);
     if (project.integration?.key !== source.integrationKey) throw Object.assign(new Error("This project does not belong to the current Files handoff."), { statusCode: 403 });
     const exportFile = await readMediaFile(project, "export");
-    const name = `${project.name.replaceAll(/[^a-z0-9_-]+/gi, "-") || "video"}-edited.mp4`;
+    const body = request.body as { outputName?: unknown } | undefined;
+    const name = body?.outputName === undefined ? defaultOutputFilename(project.name) : outputFilenameSchema.parse(body.outputName);
     return publishRemoteOutput(session, source, exportFile, name);
   });
 
@@ -538,7 +545,10 @@ export async function buildServer() {
     if (!["proxy", "waveform", "preview", "export", "crowd"].includes(request.params.kind)) return reply.code(404).send();
     const file = await readMediaFile(project, request.params.kind);
     const isWaveform = request.params.kind === "waveform";
-    const download = request.params.kind === "export" ? `${project.name.replaceAll(/[^a-z0-9_-]+/gi, "-") || "video"}-edited.mp4` : undefined;
+    const requestedName = (request.query as { name?: unknown }).name;
+    const download = request.params.kind === "export"
+      ? requestedName === undefined ? defaultOutputFilename(project.name) : outputFilenameSchema.parse(requestedName)
+      : undefined;
     const contentType = isWaveform ? "image/png" : request.params.kind === "crowd" ? (project.audio.crowdSource === "custom" ? "audio/flac" : "audio/mpeg") : "video/mp4";
     return sendRangedFile(request.headers.range, file, reply, contentType, download);
   });

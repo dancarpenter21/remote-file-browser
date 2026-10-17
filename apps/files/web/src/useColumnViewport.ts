@@ -53,7 +53,7 @@ export function useColumnViewport(directoryIds: string[], widths: number[], curr
     const left = widths.slice(0, index).reduce((sum, width) => sum + width, 0)
     const target = columnScrollLeft(container.scrollLeft, container.clientWidth, left, left + widths[index], Boolean(focus) || openedColumn || navigation?.directoryId === '')
     container.scrollTo({ left: target, behavior: dragging || matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth' })
-  }, [pathKey, currentDirectoryId, focusRequest, navigationRequest])
+  }, [pathKey, currentDirectoryId, focusRequest, navigationRequest, contentWidth])
 
   return {
     scroller, columnRefs,

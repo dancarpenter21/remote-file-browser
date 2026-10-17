@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { formatFrameTime, fpsValue, highlightContainsSection, highlightIntersectsSection, type CrowdGainPoint, type HighlightRange, type Rational, type SlowSection } from "@remote-workspace/video-shared";
+import { crowdGainAtFrame, formatFrameTime, fpsValue, highlightContainsSection, highlightIntersectsSection, type CrowdGainPoint, type HighlightRange, type Rational, type SlowSection } from "@remote-workspace/video-shared";
 import { draggedBoundary, frameAtPosition, moveHighlightBoundary } from "./highlightControls.js";
 import { apiUrl } from "./urls.js";
 
@@ -12,7 +12,10 @@ interface Props {
   draftStartFrame?: number;
   draftLastFrame?: number;
   sections: SlowSection[];
+  selectedSectionId?: string;
+  onSelectSection: (id: string) => void;
   crowdGainPoints: CrowdGainPoint[];
+  crowdGainDb: number;
   waveformUrl?: string;
   disabled?: boolean;
   onSeek: (frame: number) => void;
@@ -23,7 +26,7 @@ interface Props {
   onSectionsCommit: (sections: SlowSection[]) => void;
   onCrowdGainPointsChange: (points: CrowdGainPoint[]) => void;
   onCrowdGainPointsCommit: (points: CrowdGainPoint[]) => void;
-  onAddCrowdGainPoint: (frame: number) => void;
+  onAddCrowdGainPoint: (frame: number, gainDb?: number) => void;
 }
 
 type Drag = { sectionId: string; edge: "start" | "end" | "rampIn" | "rampOut" };
@@ -41,7 +44,7 @@ export function Timeline(props: Props) {
   const [viewport, setViewport] = useState({ width: 1, left: 0 });
   const pendingAnchorRef = useRef<{ frame: number; pixel: number } | undefined>(undefined);
   const [dragNotice, setDragNotice] = useState("");
-  const [focused, setFocused] = useState(false);
+  const [focused, setFocused] = useState(() => props.highlightRange.startFrame > 0 || props.highlightRange.endFrameExclusive < props.frameCount);
   const [drag, setDrag] = useState<Drag>();
   const [highlightDrag, setHighlightDrag] = useState<HighlightDrag>();
   const [scrubbing, setScrubbing] = useState(false);
@@ -94,6 +97,34 @@ export function Timeline(props: Props) {
       pendingAnchorRef.current = undefined;
     }
   }, [zoom, focused, viewRange.startFrame, viewRange.endFrameExclusive, pixelsPerFrame]);
+
+  useEffect(() => {
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    const wheel = (event: WheelEvent) => {
+      // Leave horizontal gestures available for panning the zoomed timeline.
+      if (event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY) || event.deltaY === 0) return;
+      event.preventDefault();
+      if (highlightDrag || drag || scrubbing || gainDragId || maxZoom <= 1) return;
+      const track = trackRef.current;
+      if (!track) return;
+      const scrollRect = scroll.getBoundingClientRect();
+      const trackRect = track.getBoundingClientRect();
+      const pixel = Math.max(0, Math.min(scroll.clientWidth, event.clientX - scrollRect.left));
+      pendingAnchorRef.current = {
+        frame: viewRange.startFrame + (event.clientX - trackRect.left) / trackRect.width * (viewRange.endFrameExclusive - viewRange.startFrame),
+        pixel,
+      };
+      const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? scroll.clientHeight : 1;
+      const delta = Math.max(-120, Math.min(120, event.deltaY * unit)) * 0.2 / Math.log(maxZoom);
+      setZoom((previous) => Math.max(0, Math.min(100, previous - delta)));
+      setHoverPreview(undefined);
+    };
+    // React's delegated wheel handlers are passive, so use a native listener
+    // to suppress page scrolling while zooming the timeline.
+    scroll.addEventListener("wheel", wheel, { passive: false });
+    return () => scroll.removeEventListener("wheel", wheel);
+  }, [viewRange.startFrame, viewRange.endFrameExclusive, highlightDrag, drag, scrubbing, gainDragId, maxZoom]);
 
   function changeZoom(next: number): void {
     const pixel = (props.currentFrame - viewRange.startFrame) * pixelsPerFrame - viewport.left;
@@ -336,7 +367,7 @@ export function Timeline(props: Props) {
         <button className="timeline-focus-button" disabled={props.draftLastFrame === undefined || Boolean(highlightDrag)} onClick={() => props.draftLastFrame !== undefined && zoomToBoundary(props.draftLastFrame)}>Zoom to end</button>
         <label>Zoom <input aria-label="Timeline zoom" type="range" min="0" max="100" step="1" value={zoom} disabled={Boolean(highlightDrag || drag || scrubbing || gainDragId)} onChange={(event) => changeZoom(Number(event.target.value))} /></label>
       </div>
-      <output className="timeline-drag-notice" aria-live="polite">{dragNotice || "Drag a boundary to preview its frame. Escape cancels."}</output>
+      <output className="timeline-drag-notice" aria-live="polite">{dragNotice || "Wheel to zoom at the pointer. Shift+wheel to scroll. Drag a boundary to preview; Escape cancels."}</output>
       <div ref={scrollRef} className="timeline-scroll" onScroll={(event) => setViewport({ width: Math.max(1, event.currentTarget.clientWidth), left: event.currentTarget.scrollLeft })}>
         <div
           ref={trackRef}
@@ -375,8 +406,8 @@ export function Timeline(props: Props) {
             const rampOut = section.rampOutFrames / (section.endFrameExclusive - section.startFrame) * 100;
             const active = highlightContainsSection(props.highlightRange, section);
             return (
-              <div className={`timeline-section speed-${String(section.speed).replace(".", "-")}${active ? "" : " inactive"}`} key={section.id} style={{ left: `${left}%`, width: `${width}%` }}>
-                <span className="section-caption">{index + 1} · {section.speed}×</span>
+              <div className={`timeline-section${props.selectedSectionId === section.id ? " selected" : ""}${active ? "" : " inactive"}`} onPointerDownCapture={() => props.onSelectSection(section.id)} key={section.id} style={{ left: `${left}%`, width: `${width}%` }}>
+                <button className="section-caption" aria-label={`Select section ${index + 1}`} aria-pressed={props.selectedSectionId === section.id} onPointerDown={(event) => event.stopPropagation()} onClick={() => props.onSelectSection(section.id)}>{index + 1} · {section.speed}×</button>
                 <button className="edge-handle start" aria-label={`Move start of section ${index + 1}`} disabled={props.disabled} onPointerDown={(event) => { event.stopPropagation(); if (!props.disabled) setDrag({ sectionId: section.id, edge: "start" }); }} />
                 <button className="ramp-handle in" aria-label={`Adjust ramp in for section ${index + 1}`} disabled={props.disabled} style={{ left: `${rampIn}%` }} onPointerDown={(event) => { event.stopPropagation(); if (!props.disabled) setDrag({ sectionId: section.id, edge: "rampIn" }); }} />
                 <button className="ramp-handle out" aria-label={`Adjust ramp out for section ${index + 1}`} disabled={props.disabled} style={{ right: `${rampOut}%` }} onPointerDown={(event) => { event.stopPropagation(); if (!props.disabled) setDrag({ sectionId: section.id, edge: "rampOut" }); }} />
@@ -389,9 +420,16 @@ export function Timeline(props: Props) {
           <button className="highlight-handle start" aria-label="Move highlight start" title="Drag to preview start; Left/Right adjusts by one frame" disabled={props.disabled} style={{ left: `${framePercent(props.highlightRange.startFrame)}%` }} onPointerDown={(event) => beginHighlightDrag(event, "start")} onKeyDown={(event) => stepBoundary(event, "start")} />
           <button className="highlight-handle end" aria-label="Move highlight end" title="Drag to preview last frame; Left/Right adjusts by one frame" disabled={props.disabled} style={{ left: `${framePercent(props.highlightRange.endFrameExclusive)}%` }} onPointerDown={(event) => beginHighlightDrag(event, "end")} onKeyDown={(event) => stepBoundary(event, "end")} />
           {props.currentFrame >= viewRange.startFrame && props.currentFrame < viewRange.endFrameExclusive && <div className="playhead" style={{ left: `${framePercent(props.currentFrame)}%` }} />}
-          <div ref={gainLaneRef} className="crowd-gain-lane" onPointerDown={(event) => event.stopPropagation()}>
+          <div ref={gainLaneRef} className="crowd-gain-lane" title="Double-click to add a volume point; drag points to shape crowd audio" onPointerDown={(event) => event.stopPropagation()} onDoubleClick={event => {
+            event.stopPropagation();
+            if (props.disabled || (event.target as HTMLElement).closest('button')) return;
+            const rect = event.currentTarget.getBoundingClientRect();
+            const frame = Math.max(0, Math.min(props.frameCount - 1, Math.round(viewRange.startFrame + (event.clientX - rect.left) / rect.width * viewFrameCount)));
+            const gainDb = Math.round(Math.max(-60, Math.min(0, -60 * (event.clientY - rect.top) / rect.height)));
+            props.onAddCrowdGainPoint(frame, gainDb);
+          }}>
             <span className="crowd-gain-label">CROWD</span>
-            <svg aria-hidden="true" preserveAspectRatio="none" viewBox="0 0 100 60"><polyline points={props.crowdGainPoints.filter((point) => point.frame >= viewRange.startFrame && point.frame < viewRange.endFrameExclusive).map((point) => `${framePercent(point.frame)},${-point.gainDb}`).join(" ")} /></svg>
+            <svg aria-hidden="true" preserveAspectRatio="none" viewBox="0 0 100 60"><polyline points={[{ frame: viewRange.startFrame, gainDb: crowdGainAtFrame(props.crowdGainPoints, props.crowdGainDb, viewRange.startFrame) }, ...props.crowdGainPoints.filter(point => point.frame > viewRange.startFrame && point.frame < viewRange.endFrameExclusive), { frame: viewRange.endFrameExclusive, gainDb: crowdGainAtFrame(props.crowdGainPoints, props.crowdGainDb, viewRange.endFrameExclusive) }].map(point => `${framePercent(point.frame)},${-point.gainDb}`).join(" ")} /></svg>
             {props.crowdGainPoints.map((point, index) => point.frame >= viewRange.startFrame && point.frame < viewRange.endFrameExclusive ? <button key={point.id} className="crowd-gain-point" aria-label={`Adjust crowd volume point ${index + 1}`} title={`${point.gainDb} dB at frame ${point.frame}`} disabled={props.disabled} style={{ left: `${framePercent(point.frame)}%`, top: `${(-point.gainDb / 60) * 100}%` }} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); if (!props.disabled) setGainDragId(point.id); }} /> : null)}
           </div>
         </div>

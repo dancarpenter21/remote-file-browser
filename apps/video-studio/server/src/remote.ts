@@ -110,14 +110,14 @@ export async function ensureLocalSource(session: RemoteSession, file: RemoteFile
   return target;
 }
 
-export async function publishRemoteOutput(session: RemoteSession, source: RemoteFile, file: string, name: string): Promise<{ id: string; name: string }> {
+export async function publishRemoteOutput(session: RemoteSession, source: RemoteFile, file: string, name: string): Promise<{ id: string; name: string; path?: string }> {
   const form = new FormData();
   form.append("file", await openAsBlob(file), path.basename(file));
   const url = `${filesApi}/delegated/sessions/${encodeURIComponent(session.sessionId)}/outputs?sourceRef=${encodeURIComponent(source.reference)}&name=${encodeURIComponent(name)}`;
   const response = await remoteFetch(session, url, { method: "POST", headers: { "x-app-csrf-token": session.csrfToken }, body: form });
-  const result = await response.json().catch(() => ({ message: response.statusText })) as { id?: string; name?: string; message?: string };
+  const result = await response.json().catch(() => ({ message: response.statusText })) as { id?: string; name?: string; path?: string; message?: string };
   if (!response.ok || !result.id || !result.name) throw Object.assign(new Error(result.message ?? "Files could not save the output."), { statusCode: response.status });
-  return { id: result.id, name: result.name };
+  return { id: result.id, name: result.name, ...(result.path ? { path: result.path } : {}) };
 }
 
 export function localReadStream(file: string) {

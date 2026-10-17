@@ -6,6 +6,7 @@ import { Player } from "./Player.js";
 import { Concatenate } from "./Concatenate.js";
 import { exchangeHandoff, ticketFromHash, type Capability } from "./handoff.js";
 import { apiUrl, appUrl } from "./urls.js";
+import { recalledProjectHandoff, rememberProjectHandoff } from "./projectHandoff.js";
 
 export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -38,6 +39,7 @@ export function App() {
     exchangeHandoff(ticket).then(async capability => {
       if (capability.action === 'edit') {
         const opened = await openRemoteProject(capability.localId);
+        rememberProjectHandoff(opened.projectId, capability.localId);
         setRemoteSessionId(capability.localId);
         await refresh(); setActiveId(opened.projectId);
       } else setHandoff(capability);
@@ -53,7 +55,7 @@ export function App() {
     return <main className="library-page"><section className="library-hero"><span className="eyebrow">Remote Workspace</span><h1>Opening Video Studio…</h1><p>Receiving the scoped file handoff from Files.</p></section></main>;
   }
 
-  if (handoff?.action === 'play') return <Player capability={handoff} onEdit={async () => { const opened = await openRemoteProject(handoff.localId); setRemoteSessionId(handoff.localId); await refresh(); setHandoff(undefined); setActiveId(opened.projectId); }} />;
+  if (handoff?.action === 'play') return <Player capability={handoff} onEdit={async () => { const opened = await openRemoteProject(handoff.localId); rememberProjectHandoff(opened.projectId, handoff.localId); setRemoteSessionId(handoff.localId); await refresh(); setHandoff(undefined); setActiveId(opened.projectId); }} />;
   if (handoff?.action === 'concatenate') return <Concatenate capability={handoff} />;
 
   if (activeId && (loading || !active || active.status === "importing")) {
@@ -61,7 +63,7 @@ export function App() {
   }
 
   if (active?.status === "ready") {
-    return <Editor initialProject={active} remoteSessionId={remoteSessionId} onBack={() => { history.replaceState(null, "", appUrl()); setActiveId(undefined); setRemoteSessionId(undefined); }} onProjectChange={(updated) => setProjects((all) => all.map((project) => project.id === updated.id ? updated : project))} />;
+    return <Editor initialProject={active} remoteSessionId={remoteSessionId ?? recalledProjectHandoff(active.id)} onBack={() => { history.replaceState(null, "", appUrl()); setActiveId(undefined); setRemoteSessionId(undefined); }} onProjectChange={(updated) => setProjects((all) => all.map((project) => project.id === updated.id ? updated : project))} />;
   }
 
   return (

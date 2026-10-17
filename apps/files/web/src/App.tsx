@@ -884,8 +884,38 @@ function ColumnBrowser({ root, navigationRequest, currentDirectoryId, path, page
   const hoverTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const edgeDirection = useRef<-1 | 0 | 1>(0)
   const edgeFrame = useRef<number | undefined>(undefined)
-  const widths = columns.map(column => Math.min(480, Math.max(180, columnWidths[column.directoryId || '__root__'] || defaultColumnWidth)))
+  const [leafWidths, setLeafWidths] = useState<Record<string, number>>({})
+  const isLeaf = (column: BrowserColumn) => Boolean(column.page && column.page.entries.length === column.page.total && !column.page.entries.some(entry => entry.kind === 'directory'))
+  const widths = columns.map(column => {
+    const key = column.directoryId || '__root__'
+    const manualWidth = columnWidths[key]
+    if (manualWidth) return Math.min(480, Math.max(180, manualWidth))
+    return isLeaf(column) ? Math.max(defaultColumnWidth, leafWidths[key] || 0) : defaultColumnWidth
+  })
   const { scroller, columnRefs, trailingSpace, rememberViewport, cancelScroll, focusColumn } = useColumnViewport(columns.map(column => column.directoryId), widths, currentDirectoryId, Boolean(dragPath), navigationRequest)
+  // Measure rendered text with a Range so clipped names still report their full width.
+  useLayoutEffect(() => {
+    const next: Record<string, number> = {}
+    columns.forEach((column, index) => {
+      const element = columnRefs.current[index]
+      if (!element || !isLeaf(column)) return
+      let width = 180
+      element.querySelectorAll<HTMLElement>('.column-row').forEach(row => {
+        const name = row.querySelector<HTMLElement>(':scope > span:not(.file-glyph)')
+        if (!name) return
+        const range = document.createRange()
+        range.selectNodeContents(name)
+        const style = getComputedStyle(row)
+        const siblings = Array.from(row.children).filter(child => child !== name)
+        const chrome = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight)
+          + siblings.reduce((sum, child) => sum + child.getBoundingClientRect().width, 0)
+          + (parseFloat(style.columnGap) || 0) * siblings.length
+        width = Math.max(width, Math.ceil(range.getBoundingClientRect().width + chrome + element.offsetWidth - element.clientWidth))
+      })
+      next[column.directoryId || '__root__'] = width
+    })
+    setLeafWidths(previous => Object.keys(previous).length === Object.keys(next).length && Object.keys(next).every(key => previous[key] === next[key]) ? previous : next)
+  })
   const previousColumns = useRef(columns.map(column => column.directoryId))
   const columnKey = JSON.stringify(columns.map(column => column.directoryId))
   const cancelSpringOpen = (targetId?: string) => {

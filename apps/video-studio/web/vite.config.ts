@@ -1,9 +1,13 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 export default defineConfig({
   plugins: [react()],
   base: "/apps/video/",
+  // The source bind mount can contain root-owned workspace dependencies.
+  cacheDir: join(tmpdir(), "remote-workspace-video-studio-vite"),
   build: { emptyOutDir: true },
   server: {
     port: 5173,

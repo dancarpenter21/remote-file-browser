@@ -144,21 +144,24 @@ function escapeFilterPath(value: string): string {
   return value.replaceAll("\\", "\\\\").replaceAll(":", "\\:").replaceAll("'", "\\'");
 }
 
-function buildTempoCommands(frameCount: number, fps: Rational, sections: SlowSection[]): string {
+// Seven stages keep every factor at or above 0.5, including 0.01× speed.
+const tempoStages = Array.from({ length: 7 }, (_, index) => `tempo${index + 1}`);
+
+export function buildTempoCommands(frameCount: number, fps: Rational, sections: SlowSection[]): string {
   const timeline = compileTimeline(frameCount, fps, sections);
   const commands: string[] = [];
   let previous = Number.NaN;
   for (let frame = 0; frame < timeline.frameExpansion.length; frame += 1) {
-    const factor = Math.cbrt(1 / timeline.frameExpansion[frame]!);
+    const factor = (1 / timeline.frameExpansion[frame]!) ** (1 / tempoStages.length);
     if (!Number.isFinite(previous) || Math.abs(factor - previous) > 1e-6) {
       const time = frameToSeconds(frame, fps).toFixed(9);
       const value = factor.toFixed(9);
-      for (const name of ["tempo1", "tempo2", "tempo3"]) commands.push(`${time} atempo@${name} tempo ${value};`);
+      for (const name of tempoStages) commands.push(`${time} atempo@${name} tempo ${value};`);
       previous = factor;
     }
   }
   const end = frameToSeconds(frameCount, fps).toFixed(9);
-  for (const name of ["tempo1", "tempo2", "tempo3"]) commands.push(`${end} atempo@${name} tempo 1;`);
+  for (const name of tempoStages) commands.push(`${end} atempo@${name} tempo 1;`);
   return `${commands.join("\n")}\n`;
 }
 
@@ -219,7 +222,7 @@ export async function renderProject(project: Project, options: RenderOptions): P
   const highlightStartSeconds = frameToSeconds(highlight.startFrame, project.source.fps);
   const highlightEndSeconds = frameToSeconds(highlight.endFrameExclusive, project.source.fps);
   const sourceAudio = project.source.hasAudio && project.audio.useOriginalAudio
-    ? `[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=start=${highlightStartSeconds.toFixed(9)}:end=${highlightEndSeconds.toFixed(9)},asetpts=PTS-STARTPTS,asendcmd=f='${escapeFilterPath(commandFile)}',atempo@tempo1=1,atempo@tempo2=1,atempo@tempo3=1,apad,atrim=duration=${timeline.durationSeconds.toFixed(9)},volume=${project.audio.sourceGainDb}dB[sourceaudio];`
+    ? `[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=start=${highlightStartSeconds.toFixed(9)}:end=${highlightEndSeconds.toFixed(9)},asetpts=PTS-STARTPTS,asendcmd=f='${escapeFilterPath(commandFile)}',${tempoStages.map((name) => `atempo@${name}=1`).join(",")},apad,atrim=duration=${timeline.durationSeconds.toFixed(9)},volume=${project.audio.sourceGainDb}dB[sourceaudio];`
     : `anullsrc=r=48000:cl=stereo,atrim=duration=${timeline.durationSeconds.toFixed(9)}[sourceaudio];`;
   const crowdVolume = buildCrowdVolumeExpression(project, highlight, timeline);
   const filter = [
