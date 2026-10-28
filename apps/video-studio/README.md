@@ -33,6 +33,9 @@ screens, settings appear below the timeline.
 Scroll the mouse wheel over the timeline to zoom around the frame under the
 pointer: scroll up to zoom in and down to zoom out. Shift+wheel or horizontal
 trackpad gestures scroll the zoomed timeline. The zoom slider remains available.
+Projects open with the complete source video visible, including projects with a
+saved highlight. Choose **Focus highlight** to inspect that range, or **Reset
+zoom** to fit the complete source again without changing your edits or playhead.
 
 Playback speed accepts decimal multipliers from `0.01` to `1`, including values
 such as `0.333` and `0.75`. A value of `0.3` means 30% speed; `0.01` means 1%

@@ -44,7 +44,7 @@ export function Timeline(props: Props) {
   const [viewport, setViewport] = useState({ width: 1, left: 0 });
   const pendingAnchorRef = useRef<{ frame: number; pixel: number } | undefined>(undefined);
   const [dragNotice, setDragNotice] = useState("");
-  const [focused, setFocused] = useState(() => props.highlightRange.startFrame > 0 || props.highlightRange.endFrameExclusive < props.frameCount);
+  const [focused, setFocused] = useState(false);
   const [drag, setDrag] = useState<Drag>();
   const [highlightDrag, setHighlightDrag] = useState<HighlightDrag>();
   const [scrubbing, setScrubbing] = useState(false);
@@ -125,6 +125,18 @@ export function Timeline(props: Props) {
     scroll.addEventListener("wheel", wheel, { passive: false });
     return () => scroll.removeEventListener("wheel", wheel);
   }, [viewRange.startFrame, viewRange.endFrameExclusive, highlightDrag, drag, scrubbing, gainDragId, maxZoom]);
+
+  function resetZoom(): void {
+    pendingAnchorRef.current = undefined;
+    setFocused(false);
+    setZoom(0);
+    setHoverPreview(undefined);
+    const scroll = scrollRef.current;
+    if (scroll) {
+      scroll.scrollLeft = 0;
+      setViewport({ width: Math.max(1, scroll.clientWidth), left: 0 });
+    }
+  }
 
   function changeZoom(next: number): void {
     const pixel = (props.currentFrame - viewRange.startFrame) * pixelsPerFrame - viewport.left;
@@ -361,6 +373,7 @@ export function Timeline(props: Props) {
       <div className="timeline-toolbar">
         <span>{formatFrameTime(props.currentFrame, props.fps)}</span>
         <span className="frame-label">Frame {props.currentFrame.toLocaleString()} / {(props.frameCount - 1).toLocaleString()}</span>
+        <button className="timeline-focus-button" disabled={Boolean(highlightDrag || drag || scrubbing || gainDragId)} onClick={resetZoom}>Reset zoom</button>
         <button className="timeline-focus-button" disabled={highlightIsFull || Boolean(highlightDrag)} onClick={() => { pendingAnchorRef.current = { frame: props.highlightRange.startFrame, pixel: 0 }; setFocused((value) => !value); setZoom(0); }}>{focused ? "Show full video" : "Focus highlight"}</button>
         <button className="timeline-focus-button" disabled={props.disabled || props.crowdGainPoints.some((point) => point.frame === props.currentFrame)} onClick={() => props.onAddCrowdGainPoint(props.currentFrame)}>Add crowd point</button>
         <button className="timeline-focus-button" disabled={props.draftStartFrame === undefined || Boolean(highlightDrag)} onClick={() => props.draftStartFrame !== undefined && zoomToBoundary(props.draftStartFrame)}>Zoom to start</button>

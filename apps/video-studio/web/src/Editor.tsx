@@ -503,6 +503,7 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
         </aside>
         <section className="timeline-panel" aria-label="Timeline editing">
           <Timeline
+            key={project.id}
             projectId={project.id}
             frameCount={project.source.frameCount}
             fps={project.source.fps}
