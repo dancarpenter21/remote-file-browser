@@ -30,6 +30,11 @@ highlight, mark a slow-motion range, then select that section on the timeline or
 in the Section tab. Audio and Export settings have their own tabs. On smaller
 screens, settings appear below the timeline.
 
+To remove slow motion, select a section on the timeline or in the Section tab,
+then choose **Remove selected slow section** beside the add controls, or
+**Remove section** in its settings. The change saves automatically and restores
+normal speed for that range without removing any footage.
+
 Scroll the mouse wheel over the timeline to zoom around the frame under the
 pointer: scroll up to zoom in and down to zoom out. Shift+wheel or horizontal
 trackpad gestures scroll the zoomed timeline. The zoom slider remains available.

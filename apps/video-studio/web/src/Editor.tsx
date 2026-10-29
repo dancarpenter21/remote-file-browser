@@ -297,6 +297,15 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
     if (save) void commit(next, audio);
   }
 
+  function removeSection(id: string): void {
+    if (saving) return;
+    const next = sections.filter((section) => section.id !== id);
+    setSections(next);
+    if (selectedSectionId === id) setSelectedSectionId(undefined);
+    clearSpeedDraft(id);
+    void commit(next, audio);
+  }
+
   function selectSection(id: string): void {
     if (id !== selectedSectionId && selectedSection) applySpeedDraft(selectedSection);
     setSelectedSectionId(id || undefined);
@@ -434,7 +443,7 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
               const length = section.endFrameExclusive - section.startFrame;
               const active = highlightContainsSection(highlightRange, section);
               return <article className={`section-card${active ? "" : " inactive"}`} key={section.id}>
-                <div className="section-card-title"><strong>Section {index + 1}{active ? "" : " · Outside highlight"}</strong><button aria-label={`Delete section ${index + 1}`} onClick={() => { const next = sections.filter((item) => item.id !== section.id); setSections(next); setSelectedSectionId(undefined); clearSpeedDraft(section.id); void commit(next, audio); }}>Remove</button></div>
+                <div className="section-card-title"><strong>Section {index + 1}{active ? "" : " · Outside highlight"}</strong><button aria-label={`Remove slow-motion section ${index + 1}`} disabled={saving} onClick={() => removeSection(section.id)}>Remove section</button></div>
                 <label>Playback speed (×)<input type="number" inputMode="decimal" min="0.01" max="1" step="any" value={speedDrafts[section.id] ?? String(section.speed)} aria-invalid={speedDrafts[section.id] !== undefined && parseSpeedDraft(speedDrafts[section.id]!) === undefined} aria-describedby={speedDrafts[section.id] !== undefined && parseSpeedDraft(speedDrafts[section.id]!) === undefined ? "speed-help speed-error" : "speed-help"} onChange={(event) => setSpeedDrafts((drafts) => ({ ...drafts, [section.id]: event.target.value }))} onBlur={() => applySpeedDraft(section)} onKeyDown={(event) => {
                   if (event.key === "Enter") { event.preventDefault(); event.currentTarget.blur(); }
                   if (event.key === "Escape") { event.preventDefault(); clearSpeedDraft(section.id); }
@@ -561,7 +570,11 @@ export function Editor({ initialProject, remoteSessionId, onBack, onProjectChang
                 <button onClick={() => setMarkOut(Math.min(project.source.frameCount, currentFrame + 1))}>Mark Out <kbd>O</kbd></button>
                 <output>{markOut === undefined ? "Out —" : `Out ${(markOut - 1).toLocaleString()}`}</output>
               </div>
-              <div className="workflow-actions"><button className="primary-action" onClick={() => void addSection()} disabled={saving || hasPartialSlowMarks} title={hasPartialSlowMarks ? "Set the other mark to complete the range." : undefined}>{hasCompleteSlowMarks ? "Add marked slow section" : "Add 1-second slow section"}</button></div>
+              <div className="workflow-actions">
+                <button className="primary-action" onClick={() => void addSection()} disabled={saving || hasPartialSlowMarks} title={hasPartialSlowMarks ? "Set the other mark to complete the range." : undefined}>{hasCompleteSlowMarks ? "Add marked slow section" : "Add 1-second slow section"}</button>
+                <button disabled={saving || !selectedSection} onClick={() => selectedSection && removeSection(selectedSection.id)}>Remove selected slow section</button>
+              </div>
+              {sections.length > 0 && <p className="control-help">Select a section on the timeline or in the Section tab to remove it. Removing restores normal speed and keeps the footage.</p>}
               <p className="active-range">{activeSectionCount} active slow-motion {activeSectionCount === 1 ? "section" : "sections"}</p>
             </section>
           </div>
